@@ -1,11 +1,11 @@
-From adecb709ede5fcaca5a1dfdc9a3b4eb4959c1e4d Mon Sep 17 00:00:00 2001
+From b283ee1088725715ed79ffa4064cf412d5638cea Mon Sep 17 00:00:00 2001
 From: Benjy <123623302+brrock@users.noreply.github.com>
 Date: Thu, 27 Aug 2026 15:04:04 +0100
 Subject: [PATCH] feat(providers): add Pi coding agent
 
 ---
  apps/server/src/provider/Drivers/PiDriver.ts  | 194 ++++++++
- apps/server/src/provider/Layers/PiAdapter.ts  | 342 +++++++++++++
+ apps/server/src/provider/Layers/PiAdapter.ts  | 366 ++++++++++++++
  .../src/provider/Layers/PiProvider.test.ts    |  80 ++++
  apps/server/src/provider/Layers/PiProvider.ts | 450 ++++++++++++++++++
  .../Layers/piThinkingCapabilities.test.ts     |  30 ++
@@ -15,7 +15,7 @@ Subject: [PATCH] feat(providers): add Pi coding agent
  apps/server/src/provider/builtInDrivers.ts    |   5 +-
  .../components/settings/providerDriverMeta.ts |  18 +-
  packages/contracts/src/settings.ts            |  40 ++
- 11 files changed, 1739 insertions(+), 2 deletions(-)
+ 11 files changed, 1763 insertions(+), 2 deletions(-)
  create mode 100644 apps/server/src/provider/Drivers/PiDriver.ts
  create mode 100644 apps/server/src/provider/Layers/PiAdapter.ts
  create mode 100644 apps/server/src/provider/Layers/PiProvider.test.ts
@@ -227,10 +227,10 @@ index 00000000..f69a940e
 +};
 diff --git a/apps/server/src/provider/Layers/PiAdapter.ts b/apps/server/src/provider/Layers/PiAdapter.ts
 new file mode 100644
-index 00000000..26155e4d
+index 00000000..3aaa5f38
 --- /dev/null
 +++ b/apps/server/src/provider/Layers/PiAdapter.ts
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,366 @@
 +import {
 +  EventId,
 +  type PiSettings,
@@ -274,6 +274,7 @@ index 00000000..26155e4d
 +  readonly connection: PiRpcConnection;
 +  session: ProviderSession;
 +  activeTurnId: TurnId | undefined;
++  assistantItemId: string | undefined;
 +}
 +
 +function piLaunchArgs(settings: PiSettings): ReadonlyArray<string> {
@@ -358,9 +359,22 @@ index 00000000..26155e4d
 +            text !== undefined &&
 +            (deltaType === "text_delta" || deltaType === "thinking_delta")
 +          ) {
++            const itemId = context.assistantItemId ?? `pi-assistant-${turnId}`;
++            if (context.assistantItemId === undefined) {
++              context.assistantItemId = itemId;
++              yield* emit({
++                ...(yield* eventBase(context.session.threadId, turnId)),
++                type: "item.started",
++                itemId: itemId as never,
++                payload: {
++                  itemType: deltaType === "thinking_delta" ? "reasoning" : "assistant_message",
++                },
++              });
++            }
 +            yield* emit({
 +              ...(yield* eventBase(context.session.threadId, turnId)),
 +              type: "content.delta",
++              itemId: itemId as never,
 +              payload: {
 +                streamKind: deltaType === "thinking_delta" ? "reasoning_text" : "assistant_text",
 +                delta: text,
@@ -395,7 +409,16 @@ index 00000000..26155e4d
 +              },
 +            });
 +        } else if (type === "agent_settled" && turnId !== undefined) {
++          const itemId = context.assistantItemId;
 +          context.activeTurnId = undefined;
++          context.assistantItemId = undefined;
++          if (itemId !== undefined)
++            yield* emit({
++              ...(yield* eventBase(context.session.threadId, turnId)),
++              type: "item.completed",
++              itemId: itemId as never,
++              payload: { itemType: "assistant_message", status: "completed" },
++            });
 +          yield* emit({
 +            ...(yield* eventBase(context.session.threadId, turnId)),
 +            type: "turn.completed",
@@ -458,6 +481,7 @@ index 00000000..26155e4d
 +      connection: started.value,
 +      session,
 +      activeTurnId: undefined,
++      assistantItemId: undefined,
 +    };
 +    sessions.set(input.threadId, context);
 +    yield* startPump(context);

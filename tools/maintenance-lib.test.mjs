@@ -19,7 +19,7 @@ test("direct Pi baseline records the current-tree base and its patch series", as
   const directory = new URL("../patches/base/current-main-a6797b3b97dca6b6941574ff062d069c45c89b9a/", import.meta.url);
   const baseline = JSON.parse(await readFile(new URL("manifest.json", directory), "utf8"));
   const patches = (await readdir(directory)).filter((name) => name.endsWith(".patch")).sort();
-  assert.equal(baseline.sourceCommit, "adecb709ede5fcaca5a1dfdc9a3b4eb4959c1e4d");
+  assert.equal(baseline.sourceCommit, "b283ee1088725715ed79ffa4064cf412d5638cea");
   assert.equal(baseline.baseCommit, "a6797b3b97dca6b6941574ff062d069c45c89b9a");
   assert.equal(baseline.status, "baseline");
   assert.equal(patches.length, 1);
