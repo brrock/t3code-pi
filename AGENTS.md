@@ -5,7 +5,7 @@ This repository stores the Pi adaptation of `pingdotgg/t3code`; it is not a T3 C
 ## Channels and patch history
 
 - `patches/stable/<tag>` tracks non-prerelease GitHub Releases. Pi is deferred on stable until Orchestrator v2 is present; do not pretend a v1 release supports Pi.
-- `patches/nightly/<tag>` tracks GitHub prereleases. The initial series comes from upstream PR #7211 and requires commit `2d623ac6b41ad1ed25c0473474699866083e0b65` (the Orchestrator-v2 base).
+- `patches/nightly/<tag>` tracks GitHub prereleases. The initial series is a direct Pi provider port for the current tree and requires its recorded current-tree base commit.
 - Each directory has an ordered `git format-patch` series and `manifest.json`. Never edit a patch in place or overwrite an old directory. Resolve a new upstream version by producing its own directory.
 - `manifest.json` status is `applied`, `deferred`, or `conflict`. A conflict is not handled and must make the maintenance run fail.
 

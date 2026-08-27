@@ -15,14 +15,14 @@ const releases = [
   { tag_name: "v0.0.2", prerelease: false, draft: true, published_at: "2026-01-04T00:00:00Z", target_commitish: "b2" }
 ];
 
-test("PR #7211 baseline records the Orchestrator-v2 base and all ordered patches", async () => {
-  const directory = new URL("../patches/nightly/orchestrator-v2-pr-7211/", import.meta.url);
+test("direct Pi baseline records the current-tree base and its patch series", async () => {
+  const directory = new URL("../patches/nightly/current-main-a6797b3b97dca6b6941574ff062d069c45c89b9a/", import.meta.url);
   const baseline = JSON.parse(await readFile(new URL("manifest.json", directory), "utf8"));
   const patches = (await readdir(directory)).filter((name) => name.endsWith(".patch")).sort();
-  assert.equal(baseline.sourceHead, "7441f732709f8f4d7f83f11c57d94205807a094a");
-  assert.equal(baseline.baseCommit, "2d623ac6b41ad1ed25c0473474699866083e0b65");
+  assert.equal(baseline.sourceCommit, "67a4ca69");
+  assert.equal(baseline.baseCommit, "a6797b3b97dca6b6941574ff062d069c45c89b9a");
   assert.equal(baseline.status, "baseline");
-  assert.equal(patches.length, 55);
+  assert.equal(patches.length, 1);
   assert.deepEqual(baseline.patches, patches);
 });
 
