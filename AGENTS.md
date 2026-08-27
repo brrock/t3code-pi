@@ -4,14 +4,15 @@ This repository stores the Pi adaptation of `pingdotgg/t3code`; it is not a T3 C
 
 ## Channels and patch history
 
-- `patches/stable/<tag>` tracks non-prerelease GitHub Releases. Pi is deferred on stable until Orchestrator v2 is present; do not pretend a v1 release supports Pi.
-- `patches/nightly/<tag>` tracks GitHub prereleases. The initial series is a direct Pi provider port for the current tree and requires its recorded current-tree base commit.
+- `patches/base/<base>` holds the immutable direct Pi port for its recorded upstream base. It is the seed series, not a release history entry.
+- `patches/stable/<tag>` tracks non-prerelease GitHub Releases. Pi is deferred until the direct base has been carried forward and tested on a stable release.
+- `patches/nightly/<tag>` tracks GitHub prereleases.
 - Each directory has an ordered `git format-patch` series and `manifest.json`. Never edit a patch in place or overwrite an old directory. Resolve a new upstream version by producing its own directory.
 - `manifest.json` status is `applied`, `deferred`, or `conflict`. A conflict is not handled and must make the maintenance run fail.
 
 ## Agent maintenance contract
 
-Run `node tools/maintain-upstream.mjs --dry-run` first, then run it without `--dry-run` only from a clean maintenance checkout. It uses `gh api` to enumerate **GitHub Releases**: non-prereleases for stable and prereleases for nightly. It handles missed releases in published order. Committed manifests are the durable completion history; ignored `.state/releases.json` is only a local checkpoint.
+On the **first run**, preserve and use the configured `patches/base/<base>` series as the source for the first compatible nightly; do not create a release folder by copying an old V2 series. Run `node tools/maintain-upstream.mjs --dry-run` first, then run it without `--dry-run` only from a clean maintenance checkout. It uses `gh api` to enumerate **GitHub Releases**: non-prereleases for stable and prereleases for nightly. It handles missed releases in published order. Committed manifests are the durable completion history; ignored `.state/releases.json` is only a local checkpoint.
 
 The maintenance agent commits patch directories and docs/config changes itself. There is intentionally no scheduled GitHub maintenance workflow. Do not commit `clones/` or `.state/`.
 

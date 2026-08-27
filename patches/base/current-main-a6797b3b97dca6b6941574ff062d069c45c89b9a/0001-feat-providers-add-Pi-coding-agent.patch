@@ -1,21 +1,21 @@
-From 67a4ca69c095462458a7bad64b0e8693d5155796 Mon Sep 17 00:00:00 2001
+From adecb709ede5fcaca5a1dfdc9a3b4eb4959c1e4d Mon Sep 17 00:00:00 2001
 From: Benjy <123623302+brrock@users.noreply.github.com>
 Date: Thu, 27 Aug 2026 15:04:04 +0100
 Subject: [PATCH] feat(providers): add Pi coding agent
 
 ---
  apps/server/src/provider/Drivers/PiDriver.ts  | 194 ++++++++
- apps/server/src/provider/Layers/PiAdapter.ts  | 343 ++++++++++++++
+ apps/server/src/provider/Layers/PiAdapter.ts  | 342 +++++++++++++
  .../src/provider/Layers/PiProvider.test.ts    |  80 ++++
- apps/server/src/provider/Layers/PiProvider.ts | 448 ++++++++++++++++++
+ apps/server/src/provider/Layers/PiProvider.ts | 450 ++++++++++++++++++
  .../Layers/piThinkingCapabilities.test.ts     |  30 ++
  .../provider/Layers/piThinkingCapabilities.ts | 115 +++++
  apps/server/src/provider/PiCommands.ts        |  71 +++
- apps/server/src/provider/PiRpc.ts             | 396 ++++++++++++++++
+ apps/server/src/provider/PiRpc.ts             | 396 +++++++++++++++
  apps/server/src/provider/builtInDrivers.ts    |   5 +-
  .../components/settings/providerDriverMeta.ts |  18 +-
  packages/contracts/src/settings.ts            |  40 ++
- 11 files changed, 1738 insertions(+), 2 deletions(-)
+ 11 files changed, 1739 insertions(+), 2 deletions(-)
  create mode 100644 apps/server/src/provider/Drivers/PiDriver.ts
  create mode 100644 apps/server/src/provider/Layers/PiAdapter.ts
  create mode 100644 apps/server/src/provider/Layers/PiProvider.test.ts
@@ -227,10 +227,10 @@ index 00000000..f69a940e
 +};
 diff --git a/apps/server/src/provider/Layers/PiAdapter.ts b/apps/server/src/provider/Layers/PiAdapter.ts
 new file mode 100644
-index 00000000..7700e0d3
+index 00000000..26155e4d
 --- /dev/null
 +++ b/apps/server/src/provider/Layers/PiAdapter.ts
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,342 @@
 +import {
 +  EventId,
 +  type PiSettings,
@@ -295,7 +295,8 @@ index 00000000..7700e0d3
 +/**
 + * Direct current-orchestrator Pi adapter. It deliberately speaks Pi's public
 + * JSONL RPC protocol instead of importing an in-process Pi SDK, so users keep
-+ * their own Pi installation, credentials, extensions and subagents.
++ * their own Pi installation and credentials. Extension dialogs, T3 MCP/browser
++ * injection, and native subagent projection require explicit bridge support.
 + */
 +export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 +  settings: PiSettings,
@@ -492,19 +493,17 @@ index 00000000..7700e0d3
 +        `pi-turn-${yield* crypto.randomUUIDv4.pipe(Effect.mapError((cause) => new ProviderAdapterRequestError({ provider: PROVIDER, method: "crypto/randomUUIDv4", detail: String(cause), cause })))}`,
 +      );
 +    context.activeTurnId = turnId;
-+    yield* context.connection
-+      .send({ type: "prompt", message: text })
-+      .pipe(
-+        Effect.mapError(
-+          (cause) =>
-+            new ProviderAdapterRequestError({
-+              provider: PROVIDER,
-+              method: "prompt",
-+              detail: cause.message,
-+              cause,
-+            }),
-+        ),
-+      );
++    yield* context.connection.send({ type: "prompt", message: text }).pipe(
++      Effect.mapError(
++        (cause) =>
++          new ProviderAdapterRequestError({
++            provider: PROVIDER,
++            method: "prompt",
++            detail: cause.message,
++            cause,
++          }),
++      ),
++    );
 +    yield* emit({
 +      ...(yield* eventBase(input.threadId, turnId)),
 +      type: "turn.started",
@@ -662,10 +661,10 @@ index 00000000..4f7a6f6a
 +});
 diff --git a/apps/server/src/provider/Layers/PiProvider.ts b/apps/server/src/provider/Layers/PiProvider.ts
 new file mode 100644
-index 00000000..35592807
+index 00000000..c88a71fb
 --- /dev/null
 +++ b/apps/server/src/provider/Layers/PiProvider.ts
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,450 @@
 +/**
 + * PiProvider — snapshot/probe layer for the Pi coding agent.
 + *
@@ -762,7 +761,7 @@ index 00000000..35592807
 +
 +const PI_DEFAULT_MODEL: ServerProviderModel = {
 +  slug: "default",
-+  name: "Pi default",
++  name: "[Pi] default",
 +  isCustom: false,
 +  capabilities: EMPTY_PI_MODEL_CAPABILITIES,
 +};
@@ -800,7 +799,9 @@ index 00000000..35592807
 +    seen.add(slug);
 +    parsed.push({
 +      slug,
-+      name: recordString(model, "name") ?? slug,
++      // Pi can expose OpenAI, Anthropic, local, and user-defined providers in
++      // one picker. Keep its provider visible even when model names collide.
++      name: `[${provider}] ${recordString(model, "name") ?? id}`,
 +      isCustom: false,
 +      capabilities: thinkingCapabilitiesForPiModel(model, defaultThinkingLevel),
 +    });
