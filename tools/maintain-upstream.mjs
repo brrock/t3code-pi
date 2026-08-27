@@ -67,7 +67,7 @@ for (const [channel, channelConfig] of Object.entries(config.channels)) {
       await writeManifest(destination, data);
       record(state, channel, release.tag_name, { status: data.status, patchDirectory: relative(root, destination), targetCommitish: data.targetCommitish, publishedAt: data.publishedAt, reason: data.reason });
       known = state.channels[channel];
-      console.log(`${channel} ${release.tag_name}: deferred (missing Orchestrator v2 base)`);
+      console.log(`${channel} ${release.tag_name}: deferred (missing direct Pi base)`);
       continue;
     }
     try {

@@ -11,7 +11,6 @@ const root = resolve(import.meta.dirname, "..");
 const directory = join(root, "patches", channel, upstreamTag);
 const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
 if (manifest.channel !== channel || manifest.tag !== upstreamTag) throw new Error("Release manifest does not match the requested channel and upstream tag.");
-if (channel === "nightly" && manifest.status !== "applied") throw new Error("A nightly Pi release requires an applied patch series, not a deferred or conflicted manifest.");
-if (channel === "stable" && !["applied", "deferred"].includes(manifest.status)) throw new Error("Stable release manifest is conflicted or invalid.");
+if (manifest.status !== "applied") throw new Error(`${channel} Pi release requires an applied patch series, not a deferred or conflicted manifest.`);
 for (const patch of manifest.patches) await access(join(directory, patch), constants.R_OK);
 console.log(`Verified ${channel} release for ${upstreamTag}: ${manifest.status}`);

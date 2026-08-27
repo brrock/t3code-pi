@@ -5,7 +5,7 @@ This repository stores the Pi adaptation of `pingdotgg/t3code`; it is not a T3 C
 ## Channels and patch history
 
 - `patches/base/<base>` holds the immutable direct Pi port for its recorded upstream base. It is the seed series, not a release history entry.
-- `patches/stable/<tag>` tracks non-prerelease GitHub Releases. Pi is deferred until the direct base has been carried forward and tested on a stable release.
+- `patches/stable/<tag>` tracks non-prerelease GitHub Releases once they contain the direct-base commit.
 - `patches/nightly/<tag>` tracks GitHub prereleases.
 - Each directory has an ordered `git format-patch` series and `manifest.json`. Never edit a patch in place or overwrite an old directory. Resolve a new upstream version by producing its own directory.
 - `manifest.json` status is `applied`, `deferred`, or `conflict`. A conflict is not handled and must make the maintenance run fail.
@@ -24,6 +24,6 @@ The direct base supports Pi RPC sessions, prompts, streamed text/reasoning, nati
 
 ## Releases and updater assets
 
-After the agent has committed and pushed a verified patch directory, it may manually dispatch `.github/workflows/release.yml`. The workflow validates the exact manifest and publishes a normal release for stable or a GitHub prerelease for nightly.
+After the agent has committed and pushed a verified applied patch directory, dispatch `.github/workflows/release.yml` with its channel, upstream tag, and an exact semver version. It builds the patched source, applies the fork identity from `release.config.json`, publishes the `@brrock/t3-pi` npm CLI under `latest` or `nightly`, builds unsigned Electron installers/updater manifests, then creates the matching GitHub release.
 
-The workflow always attaches the patched source archive. To support Electron auto-update, provide signed platform installers, blockmaps, and updater manifests (`latest-*.yml`) through its `assets` input. Those assets must use the fork release version/tag and be signed with the fork's updater signing configuration; unsigned source archives are not desktop updater assets. Never publish a nightly manifest that is deferred or conflicted.
+Configure npm **trusted publishing** for `@brrock/t3-pi` to trust this repository's `release.yml` workflow; the workflow uses GitHub OIDC and deliberately has no `NPM_TOKEN`. This fork intentionally publishes unsigned Electron builds, so users may have to bypass their OS trust prompt on first install. The server updater installs the fork npm package; desktop clients use the fork GitHub Release feed. Never publish a manifest that is deferred or conflicted.

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "githubRepository": "brrock/t3code-pi",
+  "npmPackage": "@brrock/t3-pi",
+  "desktopAppId": "codes.brrock.t3code.pi",
+  "desktopProductName": "T3 Code Pi"
+}

@@ -4,70 +4,187 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: Source release channel already maintained and committed by the agent
+        description: Maintained upstream release channel
         required: true
         type: choice
         options: [stable, nightly]
       upstream_tag:
-        description: Exact pingdotgg/t3code GitHub Release tag recorded in patches/<channel>/
+        description: Exact upstream tag recorded in patches/<channel>/
         required: true
         type: string
-      fork_tag:
-        description: Fork GitHub Release tag (for example pi-v0.0.36-nightly.20260827.1205)
+      version:
+        description: Exact semver version to publish to npm and desktop updaters
         required: true
-        type: string
-      assets:
-        description: Glob of already-built, signed updater assets to upload; leave blank for source-only release
-        required: false
-        default: release-assets/*
         type: string
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: pi-release-${{ inputs.channel }}
   cancel-in-progress: false
 
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      npm_tag: ${{ steps.version.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Verify agent-maintained patch manifest
+      - name: Verify release input and patch manifest
         env:
           CHANNEL: ${{ inputs.channel }}
           UPSTREAM_TAG: ${{ inputs.upstream_tag }}
-        run: node tools/verify-release.mjs "$CHANNEL" "$UPSTREAM_TAG"
-      - name: Build patched source archive
-        env:
-          CHANNEL: ${{ inputs.channel }}
-          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
-          FORK_TAG: ${{ inputs.fork_tag }}
-        shell: bash
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$UPSTREAM_TAG" https://github.com/pingdotgg/t3code.git source
+          node tools/verify-release.mjs "$CHANNEL" "$UPSTREAM_TAG"
+          node -e 'if (!/^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(process.argv[1])) process.exit(1)' "$VERSION" || { echo "version must be semver" >&2; exit 1; }
+      - id: version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          version="${VERSION#v}"
+          echo "release_tag=pi-v$version" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=$([[ "$CHANNEL" == nightly ]] && echo nightly || echo latest)" >> "$GITHUB_OUTPUT"
+      - name: Create patched, fork-branded source tree
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$UPSTREAM_TAG" "https://github.com/$UPSTREAM_REPOSITORY.git" source
           mapfile -t patches < <(find "patches/$CHANNEL/$UPSTREAM_TAG" -maxdepth 1 -name '*.patch' -print | sort)
-          if ((${#patches[@]})); then git -C source am "${patches[@]/#/$GITHUB_WORKSPACE/}"; fi
-          tar -C source -czf "t3code-pi-source-$FORK_TAG.tar.gz" --exclude=.git .
-      - name: Create GitHub release
+          ((${#patches[@]})) || { echo "No patch series for this release" >&2; exit 1; }
+          git -C source am "${patches[@]/#/$GITHUB_WORKSPACE/}"
+          node tools/prepare-release-source.mjs source
+      - uses: actions/upload-artifact@v8
+        with:
+          name: prepared-source
+          path: source
+          retention-days: 1
+
+  publish_npm:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: prepared-source
+          path: source
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: source/package.json
+          run-install: false
+      - name: Set release version and build CLI
+        working-directory: source
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "${VERSION#v}"
+          vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
+          vp run --filter t3 build
+      - name: Publish fork CLI
+        working-directory: source
+        env:
+          NPM_TAG: ${{ needs.prepare.outputs.npm_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # npm trusted publishing exchanges this job's GitHub OIDC token for
+          # a short-lived publish credential; no long-lived NPM_TOKEN exists.
+          node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --app-version "${VERSION#v}" --provenance --verbose
+
+  desktop:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: mac
+            target: dmg
+            arch: arm64
+          - runner: macos-15-intel
+            platform: mac
+            target: dmg
+            arch: x64
+          - runner: ubuntu-24.04
+            platform: linux
+            target: AppImage
+            arch: x64
+          - runner: windows-2025
+            platform: win
+            target: nsis
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: prepared-source
+          path: source
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: source/package.json
+          run-install: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install ImageMagick
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: Install build dependencies
+        working-directory: source
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+      # This fork intentionally publishes unsigned builds. Users may need to
+      # bypass OS trust prompts on first install; GitHub updater metadata still
+      # provides in-app version discovery and downloads.
+      - name: Build unsigned desktop updater assets
+        working-directory: source
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: brrock/t3code-pi
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "${VERSION#v}"
+          args=(--platform "${{ matrix.platform }}" --target "${{ matrix.target }}" --arch "${{ matrix.arch }}" --build-version "${VERSION#v}" --verbose)
+          vp run dist:desktop:artifact "${args[@]}"
+      - uses: actions/upload-artifact@v8
+        with:
+          name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            source/release/*.dmg
+            source/release/*.zip
+            source/release/*.AppImage
+            source/release/*.exe
+            source/release/*.blockmap
+            source/release/*.yml
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, publish_npm, desktop]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: assets
+      - name: Publish signed updater release
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ inputs.channel }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
           UPSTREAM_TAG: ${{ inputs.upstream_tag }}
-          FORK_TAG: ${{ inputs.fork_tag }}
-          ASSET_GLOB: ${{ inputs.assets }}
-        shell: bash
         run: |
           set -euo pipefail
           prerelease=()
           [[ "$CHANNEL" == nightly ]] && prerelease=(--prerelease)
-          assets=("t3code-pi-source-$FORK_TAG.tar.gz")
-          shopt -s nullglob
-          for asset in $ASSET_GLOB; do assets+=("$asset"); done
-          gh release create "$FORK_TAG" "${assets[@]}" "${prerelease[@]}" \
-            --title "T3 Code Pi $FORK_TAG" \
-            --notes "Pi fork of pingdotgg/t3code $UPSTREAM_TAG. Patch manifest: patches/$CHANNEL/$UPSTREAM_TAG/manifest.json"
+          gh release create "$TAG" assets/* "${prerelease[@]}" --title "T3 Code Pi $TAG" --notes "Pi fork of $UPSTREAM_REPOSITORY $UPSTREAM_TAG. npm and desktop updater release."
