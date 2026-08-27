@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "upstream": "pingdotgg/t3code",
+  "channels": {
+    "stable": {
+      "preRelease": false,
+      "clone": "clones/stable",
+      "baseline": null,
+      "policy": "Pi requires Orchestrator v2 and is intentionally deferred on stable until a stable release contains the nightly baseline commit."
+    },
+    "nightly": {
+      "preRelease": true,
+      "clone": "clones/nightly",
+      "baseline": "patches/nightly/orchestrator-v2-pr-7211",
+      "requiresCommit": "2d623ac6b41ad1ed25c0473474699866083e0b65",
+      "policy": "Apply only when the upstream release includes the Orchestrator v2 base required by the Pi patch series."
+    }
+  }
+}

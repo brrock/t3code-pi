@@ -1,0 +1,295 @@
+From 65803ddc695470e5a2992d74efeb2d35e8e8f788 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 11:49:21 +0200
+Subject: [PATCH] fix(pi): harden command ordering
+
+---
+ .../Adapters/PiAdapterV2.test.ts              | 35 +++++++++++++-
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 46 ++++++++++++++-----
+ .../Adapters/piT3McpInjection.test.ts         |  7 ++-
+ .../Adapters/piT3McpInjection.ts              | 10 +++-
+ 4 files changed, 82 insertions(+), 16 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 5ad46d692..5157110c3 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -384,7 +384,10 @@ describe("PiAdapterV2", () => {
+       const switchRequest = yield* fake.takeRequest("switch_session");
+       assert.equal(switchRequest["sessionPath"], FAKE_SESSION_FILE);
+ 
+-      yield* startTurn(runtime, providerThread);
++      yield* startTurn(runtime, providerThread, "anthropic/claude-sonnet");
++      const setModel = yield* fake.takeRequest("set_model");
++      assert.equal(setModel["provider"], "anthropic");
++      assert.equal(runtime.providerSession.model, "anthropic/claude-sonnet");
+       yield* fake.takeRequest("prompt");
+       const error = yield* runtime.resumeThread({ providerThread }).pipe(Effect.flip);
+       assert.equal(error._tag, "ProviderAdapterResumeThreadError");
+@@ -484,6 +487,9 @@ describe("PiAdapterV2", () => {
+       // user dialog, so the prompt must carry no correlation id to await.
+       assert.equal(prompt["id"], undefined);
+ 
++      // A normal prompt ack only confirms that Pi accepted the command. Agent
++      // activity may follow it, so the adapter must still wait for settlement.
++      yield* fake.emit({ type: "response", command: "prompt", success: true });
+       yield* fake.emit({ type: "agent_start" });
+       yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
+       yield* fake.emit({
+@@ -585,6 +591,11 @@ describe("PiAdapterV2", () => {
+       yield* startTurn(runtime, providerThread);
+       yield* fake.takeRequest("prompt");
+       yield* fake.emit({ type: "agent_start" });
++      fake.queueStats({
++        tokens: { input: 9_000, output: 500, total: 9_500 },
++        contextUsage: { tokens: 9_500, contextWindow: 200_000 },
++      });
++      fake.holdNextStats();
+       yield* fake.emit({ type: "agent_settled" });
+       const finalTurn = yield* takeEvent(
+         (event) =>
+@@ -626,6 +637,10 @@ describe("PiAdapterV2", () => {
+       const fork = yield* fake.takeRequest("fork");
+       assert.equal(fork["entryId"], "u2");
+       assert.equal(rollbackSnapshot.providerThread.contextUsage?.usedTokens, 2_100);
++      yield* fake.releaseStats;
++      yield* Effect.yieldNow;
++      const afterStaleStats = yield* runtime.readThreadSnapshot({ providerThread });
++      assert.equal(afterStaleStats.providerThread.contextUsage?.usedTokens, 2_100);
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
+@@ -730,7 +745,7 @@ describe("PiAdapterV2", () => {
+         modelSelection: modelSelection("default"),
+         runtimePolicy,
+       });
+-      yield* startTurn(runtime, providerThread);
++      yield* startTurn(runtime, providerThread, "default", [], "/command-only");
+       yield* fake.takeRequest("prompt");
+       // A pure extension command: dialog + notify, then the deferred ack —
+       // pi emits no agent_start/agent_settled at all.
+@@ -886,6 +901,22 @@ describe("PiAdapterV2", () => {
+       });
+       const steer = yield* fake.takeRequest("steer");
+       assert.equal(steer["message"], "Focus on tests");
++
++      yield* runtime.steerTurn({
++        threadId: THREAD_ID,
++        runId: RunId.make("run:thread-pi-test:1"),
++        providerThread,
++        providerTurnId: providerTurnId!,
++        message: {
++          messageId: "message:thread-pi-test:command" as never,
++          text: "/my-command",
++          attachments: [],
++          createdBy: "user",
++          creationSource: "web",
++        },
++      });
++      const command = yield* fake.takeRequest("prompt");
++      assert.equal(command["message"], "/my-command");
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ });
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index dde8594f4..7efbe9120 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -296,6 +296,10 @@ interface ActivePiTurn {
+    * the turn instead.
+    */
+   sawAgentActivity: boolean;
++  /** Only slash-command prompts can complete without starting an agent run. */
++  readonly promptMayBeCommandOnly: boolean;
++  /** Pi's id-less prompt responses are ordered, so retain why each prompt was sent. */
++  readonly pendingPromptResponses: Array<"turn_start" | "steer">;
+   /** Pi reports context as unknown immediately after compaction; keep its estimate for the meter. */
+   latestCompactionAfterTokens: number | null;
+   failure: ReturnType<typeof makeProviderFailure> | null;
+@@ -444,6 +448,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       let baselineModel: { provider: string; modelId: string } | null = null;
+       let baselineThinking: string | null = null;
+       let autoCompactionEnabled: boolean | undefined;
++      // Invalidates optional post-turn stats reads when rollback changes the
++      // active branch before an older read completes.
++      let contextUsageGeneration = 0;
+ 
+       const emit = (event: ProviderAdapterV2Event) =>
+         Queue.offer(events, event).pipe(Effect.asVoid);
+@@ -1169,11 +1176,13 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         };
+       });
+ 
+-      const refreshContextUsageAfterTurn = (state: PiThreadState, turn: ActivePiTurn) =>
+-        readContextUsage(turn.latestCompactionAfterTokens).pipe(
++      const refreshContextUsageAfterTurn = (state: PiThreadState, turn: ActivePiTurn) => {
++        const generation = ++contextUsageGeneration;
++        return readContextUsage(turn.latestCompactionAfterTokens).pipe(
+           Effect.flatMap((contextUsage) => {
+             const currentState = threadState;
+             return contextUsage === undefined ||
++              generation !== contextUsageGeneration ||
+               currentState === null ||
+               currentState.providerThread.id !== state.providerThread.id
+               ? Effect.void
+@@ -1181,6 +1190,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           }),
+           Effect.forkIn(scope),
+         );
++      };
+ 
+       const finalizeTurn = Effect.fnUntraced(function* (
+         state: PiThreadState,
+@@ -1418,16 +1428,22 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           }
+           case "response": {
+             // Correlated responses never reach the pump; an id-less response
+-            // is the deferred ack of a fire-and-forget prompt/steer. A
+-            // rejection here means the turn never started on the Pi side.
++            // is the deferred ack of a fire-and-forget prompt/steer.
+             const command = recordString(event, "command");
++            const promptKind =
++              command === "prompt" ? turn?.pendingPromptResponses.shift() : undefined;
+             if (event["success"] === true) {
+               // Deferred success ack. Command-only prompts (pure extension
+               // slash commands) never start an agent run and never emit
+               // `agent_settled`, so probe for idleness. The probe result is
+               // re-queued behind any events Pi emitted before answering
+               // get_state, which keeps the check stream-ordered.
+-              if (command === "prompt" && turn !== null && !turn.sawAgentActivity) {
++              if (
++                promptKind === "turn_start" &&
++                turn !== null &&
++                turn.promptMayBeCommandOnly &&
++                !turn.sawAgentActivity
++              ) {
+                 const providerTurnId = turn.providerTurn.id;
+                 yield* request({ type: "get_state" }).pipe(
+                   Effect.matchEffect({
+@@ -1454,7 +1470,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               return;
+             }
+             if (event["success"] !== false) return;
+-            if (command === "steer") {
++            if (command === "steer" || promptKind === "steer") {
+               // A rejected steer only means that one message was refused. The
+               // turn it was aimed at is still running on Pi, so terminalizing
+               // here would report a failure while output keeps streaming.
+@@ -1770,7 +1786,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         instanceId: options.instanceId,
+         driver: PI_PROVIDER,
+         providerSessionId: input.providerSessionId,
+-        providerSession: sessionEntity,
++        get providerSession() {
++          return sessionEntity;
++        },
+         events: Stream.fromQueue(events),
+         ensureThread: (threadInput) =>
+           registerThread(threadInput).pipe(
+@@ -1866,6 +1884,8 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               toolStartedAt: new Map(),
+               interrupted: false,
+               sawAgentActivity: false,
++              promptMayBeCommandOnly: payload.message.trimStart().startsWith("/"),
++              pendingPromptResponses: ["turn_start"],
+               latestCompactionAfterTokens: null,
+               failure: null,
+             };
+@@ -1929,19 +1949,22 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               steerInput.message.text,
+               steerInput.message.attachments,
+             );
+-            // Same fire-and-forget contract as `prompt`: a steer that expands
+-            // a slash command must not block on the ack. The final active-turn
+-            // check lives inside the permit so settlement cannot overtake it.
++            // Pi only accepts extension slash commands through `prompt`; plain
++            // text uses its native steering queue. Neither path waits on its
++            // deferred ack. The final active-turn check lives inside the permit
++            // so settlement cannot overtake it.
+             yield* sessionEventPermit.withPermits(1)(
+               Effect.gen(function* () {
+                 if (threadState?.activeTurn !== turn) {
+                   return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
+                 }
++                const type = payload.message.trimStart().startsWith("/") ? "prompt" : "steer";
+                 yield* connection.send({
+-                  type: "steer",
++                  type,
+                   message: payload.message,
+                   ...(payload.images.length === 0 ? {} : { images: payload.images }),
+                 });
++                if (type === "prompt") turn.pendingPromptResponses.push("steer");
+               }),
+             );
+           }).pipe(
+@@ -2134,6 +2157,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             if (forkEntryId === undefined) {
+               return yield* protocolError("Pi rollback target has no captured session-tree entry");
+             }
++            contextUsageGeneration += 1;
+             const forkData = yield* request({ type: "fork", entryId: forkEntryId });
+             if (recordField(forkData, "cancelled") === true) {
+               return yield* protocolError("A Pi extension cancelled the session fork");
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+index ff39311b9..679ea024a 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+@@ -31,7 +31,7 @@ const mcpSession = {
+ describe("pi T3 MCP injection", () => {
+   it("always adds the permission bridge and configures MCP when available", () => {
+     const resolvedArgs = resolvePiLaunchArgs(
+-      "--extension=/home/user/.pi/agent/extensions/demo.ts --session-dir=/tmp/pi-sessions --provider=anthropic --model=claude-sonnet --extension-flag=kept",
++      "--extension=/home/user/.pi/agent/extensions/demo.ts --session-dir=/tmp/pi-sessions --provider=anthropic --model=claude-sonnet --tools='' --name=-review --extension-flag=kept",
+     );
+     assert.isTrue(resolvedArgs.ok);
+     if (!resolvedArgs.ok) return;
+@@ -53,6 +53,10 @@ describe("pi T3 MCP injection", () => {
+       "anthropic",
+       "--model",
+       "claude-sonnet",
++      "--tools",
++      "",
++      "--name",
++      "-review",
+       "--extension-flag=kept",
+       "--extension",
+       "/tmp/cache/pi-t3-mcp-extension.ts",
+@@ -118,6 +122,7 @@ describe("pi T3 MCP injection", () => {
+     });
+     assert.deepInclude(resolvePiLaunchArgs("--session old.jsonl"), { ok: false });
+     assert.deepInclude(resolvePiLaunchArgs("prompt pi immediately"), { ok: false });
++    assert.deepInclude(resolvePiLaunchArgs("--plan @instructions.md"), { ok: false });
+   });
+ 
+   it.effect("materializes the MCP bridge with namespaced tool registration", () =>
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+index c63cdd583..165d630bd 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+@@ -129,7 +129,7 @@ export function resolvePiLaunchArgs(launchArgs: string): PiLaunchArgsResolution
+     }
+     if (PI_ARGUMENTS_WITH_VALUES.has(arg)) {
+       const value = args[index + 1];
+-      if (value === undefined || value.length === 0 || value.startsWith("-")) {
++      if (value === undefined) {
+         return { ok: false, message: `Pi launch argument '${arg}' requires a value.` };
+       }
+       index += 1;
+@@ -141,7 +141,13 @@ export function resolvePiLaunchArgs(launchArgs: string): PiLaunchArgsResolution
+     if (arg.startsWith("--")) {
+       // Pi extensions may register arbitrary long flags. Treat one following
+       // non-flag token as that extension flag's value.
+-      if (args[index + 1] !== undefined && !args[index + 1]!.startsWith("-")) index += 1;
++      if (
++        args[index + 1] !== undefined &&
++        !args[index + 1]!.startsWith("-") &&
++        !args[index + 1]!.startsWith("@")
++      ) {
++        index += 1;
++      }
+       continue;
+     }
+     if (arg.startsWith("-")) {
+-- 
+2.50.1 (Apple Git-155)
+

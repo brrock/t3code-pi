@@ -1,0 +1,57 @@
+From acc044c9f9262f64436423aabf9d66622017e002 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 16:11:37 +0200
+Subject: [PATCH] fix(providers): clear the Pi leaf cursor flag when the tree
+ is re-baselined
+
+`leafCursorStale` was only cleared inside `captureTurnTreeRefs`, but
+`registerThread` and `rollbackThread` also re-baseline `lastKnownLeaf` from
+a full `get_entries`. After one failed capture the flag therefore stuck, so
+later turns kept skipping their `nativeTurnRef` and rollback across them
+failed with no captured session-tree entry.
+
+Both re-baseline sites now clear the flag, and only leave it set when the
+listing itself failed. An empty tree is a success with no leafId.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/Adapters/PiAdapterV2.ts | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index cf056e0a4..99548c943 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -1309,11 +1309,14 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         threadState = { providerThread, activeTurn: null };
+         // Baseline the session-tree leaf so the first turn's user entry can
+         // be located with a `since` cursor instead of a full entry scan.
+-        lastKnownLeaf =
+-          recordString(
+-            yield* request({ type: "get_entries" }).pipe(Effect.orElseSucceed(() => undefined)),
+-            "leafId",
+-          ) ?? null;
++        const baselineEntries = yield* request({ type: "get_entries" }).pipe(
++          Effect.orElseSucceed(() => undefined),
++        );
++        lastKnownLeaf = recordString(baselineEntries, "leafId") ?? null;
++        // A successful full baseline makes the cursor trustworthy again. Only
++        // a failed one leaves it stale, so a recovered session does not keep
++        // skipping turn refs. An empty tree is a success with no leafId.
++        leafCursorStale = baselineEntries === undefined;
+         yield* emit({
+           type: "provider_thread.updated",
+           driver: PI_PROVIDER,
+@@ -1679,6 +1682,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             );
+             const leafId = recordString(entriesData, "leafId") ?? null;
+             lastKnownLeaf = leafId;
++            // The fork re-baselined the tree, so the cursor is trustworthy
++            // again unless this listing itself failed.
++            leafCursorStale = entriesData === undefined;
+             yield* updateProviderThread(state, {
+               nativeConversationHeadRef: leafId === null ? null : providerRef(leafId),
+             });
+-- 
+2.50.1 (Apple Git-155)
+

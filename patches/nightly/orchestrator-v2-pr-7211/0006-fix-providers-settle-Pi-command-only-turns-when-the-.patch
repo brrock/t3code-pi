@@ -1,0 +1,77 @@
+From 2311c999caca5d8393d06e6cd95a88c206df3d92 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 15:39:40 +0200
+Subject: [PATCH] fix(providers): settle Pi command-only turns when the idle
+ probe fails
+
+The command-only settle probe dropped a failed `get_state` on the floor.
+Pi emits no agent events for a pure extension command, so the turn stayed
+active and the session rejected every later turn until restart.
+
+The probe now queues a `probeFailed` record instead of swallowing the
+error, so the same ordered handler settles the turn. The existing
+no-agent-activity guard still keeps a genuinely running turn open.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 33 ++++++++++++++-----
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index ffa5abd90..b19db1aed 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -1064,13 +1064,23 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               if (command === "prompt" && turn !== null && !turn.sawAgentActivity) {
+                 const providerTurnId = turn.providerTurn.id;
+                 yield* request({ type: "get_state" }).pipe(
+-                  Effect.flatMap((data) =>
+-                    Queue.offer(connection.events, {
+-                      type: "t3.settle_probe",
+-                      providerTurnId,
+-                      data,
+-                    }),
+-                  ),
++                  Effect.matchEffect({
++                    onSuccess: (data) =>
++                      Queue.offer(connection.events, {
++                        type: "t3.settle_probe",
++                        providerTurnId,
++                        data,
++                      }),
++                    // A failed probe still has to reach the pump. Dropping it
++                    // would leave a command-only turn active forever, because
++                    // Pi never emits agent events for one.
++                    onFailure: () =>
++                      Queue.offer(connection.events, {
++                        type: "t3.settle_probe",
++                        providerTurnId,
++                        probeFailed: true,
++                      }),
++                  }),
+                   Effect.ignore,
+                   Effect.forkIn(scope),
+                 );
+@@ -1102,12 +1112,17 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             // already been processed, so an untouched turn that reports
+             // no streaming and no pending messages is genuinely done.
+             const data = event["data"];
++            // A probe that could not be answered settles the turn too: the
++            // prompt was acked, and the no-agent-activity guard below still
++            // keeps a genuinely running turn open.
++            const probeFailed = event["probeFailed"] === true;
+             if (
+               turn !== null &&
+               turn.providerTurn.id === event["providerTurnId"] &&
+               !turn.sawAgentActivity &&
+-              recordField(data, "isStreaming") !== true &&
+-              (recordNumber(data, "pendingMessageCount") ?? 0) === 0
++              (probeFailed ||
++                (recordField(data, "isStreaming") !== true &&
++                  (recordNumber(data, "pendingMessageCount") ?? 0) === 0))
+             ) {
+               if (state !== null) yield* finalizeTurn(state);
+             }
+-- 
+2.50.1 (Apple Git-155)
+

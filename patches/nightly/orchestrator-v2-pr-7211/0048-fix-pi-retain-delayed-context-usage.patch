@@ -1,0 +1,189 @@
+From b1588fde0b4ec5b85a18071c4794394fd6e83cb7 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 09:44:53 +0200
+Subject: [PATCH] fix(pi): retain delayed context usage
+
+---
+ .../Adapters/PiAdapterV2.test.ts              | 82 ++++++++++++++++++-
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 17 ++--
+ 2 files changed, 88 insertions(+), 11 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 6816a42a4..0285791f3 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -78,6 +78,9 @@ interface FakePi {
+   readonly queueState: (data: unknown) => void;
+   /** Data returned by the next `get_session_stats` acks, consumed in order. */
+   readonly queueStats: (data: unknown) => void;
++  /** Hold the next stats response until `releaseStats` is called. */
++  readonly holdNextStats: () => void;
++  readonly releaseStats: Effect.Effect<void>;
+   /** Data returned by the next `get_commands` acks, consumed in order. */
+   readonly queueCommands: (data: unknown) => void;
+   /** Make the next `get_commands` ack fail. */
+@@ -102,6 +105,8 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   const statsQueue: Array<unknown> = [];
+   const commandsQueue: Array<{ readonly success: boolean; readonly data?: unknown }> = [];
+   let vetoSwitch = false;
++  let holdStats = false;
++  let pendingStatsResponse: PiRpcRecord | null = null;
+   let stdinBuffer = "";
+ 
+   const emit = (record: PiRpcRecord) =>
+@@ -139,6 +144,11 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+       case "get_entries":
+         return { ...base, data: entriesQueue.shift() ?? { entries: [], leafId: null } };
+       case "get_session_stats":
++        if (holdStats) {
++          holdStats = false;
++          pendingStatsResponse = { ...base, data: statsQueue.shift() ?? {} };
++          return null;
++        }
+         return { ...base, data: statsQueue.shift() ?? {} };
+       case "get_commands":
+         return { ...base, ...(commandsQueue.shift() ?? { data: { commands: [] } }) };
+@@ -211,6 +221,14 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+     },
+     queueState: (data) => stateQueue.push(data),
+     queueStats: (data) => statsQueue.push(data),
++    holdNextStats: () => {
++      holdStats = true;
++    },
++    releaseStats: Effect.suspend(() => {
++      const response = pendingStatsResponse;
++      pendingStatsResponse = null;
++      return response === null ? Effect.void : emit(response);
++    }),
+     queueCommands: (data) => commandsQueue.push({ success: true, data }),
+     failNextCommands: () => commandsQueue.push({ success: false }),
+     closeStdout: Queue.end(stdout),
+@@ -218,13 +236,13 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   } satisfies FakePi;
+ });
+ 
+-const makeAdapter = Effect.fnUntraced(function* (fake: FakePi) {
++const makeAdapter = Effect.fnUntraced(function* (fake: FakePi, launchArgs = "") {
+   const idAllocator = yield* IdAllocatorV2;
+   const serverConfig = yield* ServerConfig;
+   const fileSystem = yield* FileSystem.FileSystem;
+   return makePiAdapterV2({
+     instanceId: PI_INSTANCE_ID,
+-    settings: { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
++    settings: { enabled: true, binaryPath: "pi", launchArgs, customModels: [] },
+     environment: {},
+     spawner: fake.spawner,
+     fileSystem,
+@@ -342,6 +360,26 @@ describe("PiAdapterV2", () => {
+     ),
+   );
+ 
++  it.effect("reports reserved launch arguments as a protocol validation error", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const adapter = yield* makeAdapter(fake, "--resume");
++      const error = yield* adapter
++        .openSession({
++          threadId: THREAD_ID,
++          providerSessionId: SESSION_ID,
++          modelSelection: modelSelection("default"),
++          runtimePolicy,
++        })
++        .pipe(Effect.flip);
++      if (error._tag !== "ProviderAdapterProtocolError") {
++        assert.fail(`expected protocol error, received ${error._tag}`);
++        return;
++      }
++      assert.include(error.detail, "controlled by T3 Code");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("registers the thread from get_state and resumes via switch_session", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+@@ -622,6 +660,46 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
++  it.effect("retains post-terminal context usage when the same thread resumes immediately", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      fake.queueStats({
++        tokens: { input: 2_000, output: 400, cacheRead: 100, cacheWrite: 0, total: 2_500 },
++        contextUsage: { tokens: 2_500, contextWindow: 200_000, percent: 1.25 },
++      });
++      fake.holdNextStats();
++      yield* fake.emit({ type: "agent_settled" });
++      yield* takeEvent((event) => event.type === "turn.terminal");
++      yield* fake.takeRequest("get_session_stats");
++
++      // The next turn can re-register the same provider row before optional
++      // stats return. The late response must update that replacement state.
++      const resumed = yield* runtime.resumeThread({ providerThread });
++      assert.equal(resumed.id, providerThread.id);
++      yield* fake.releaseStats;
++      const usage = yield* takeEvent(
++        (event) =>
++          event.type === "provider_thread.updated" &&
++          event.providerThread.id === providerThread.id &&
++          event.providerThread.contextUsage?.usedTokens === 2_500,
++      );
++      assert.equal(
++        usage.type === "provider_thread.updated"
++          ? usage.providerThread.contextUsage?.totalProcessedTokens
++          : null,
++        2_500,
++      );
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("syncs the thread title into pi's session name before prompting", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index 9baa05637..334299f19 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -353,11 +353,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             );
+       const resolvedLaunchArgs = resolvePiLaunchArgs(options.settings.launchArgs);
+       if (!resolvedLaunchArgs.ok) {
+-        return yield* new ProviderAdapterOpenSessionError({
+-          driver: PI_PROVIDER,
+-          providerSessionId: input.providerSessionId,
+-          cause: new Error(resolvedLaunchArgs.message),
+-        });
++        return yield* protocolError(resolvedLaunchArgs.message);
+       }
+       const launch = buildPiRpcLaunch({
+         launchArgs: resolvedLaunchArgs.args,
+@@ -1178,11 +1174,14 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+ 
+       const refreshContextUsageAfterTurn = (state: PiThreadState, turn: ActivePiTurn) =>
+         readContextUsage(turn).pipe(
+-          Effect.flatMap((contextUsage) =>
+-            contextUsage === undefined || threadState !== state
++          Effect.flatMap((contextUsage) => {
++            const currentState = threadState;
++            return contextUsage === undefined ||
++              currentState === null ||
++              currentState.providerThread.id !== state.providerThread.id
+               ? Effect.void
+-              : updateProviderThread(state, { contextUsage }),
+-          ),
++              : updateProviderThread(currentState, { contextUsage });
++          }),
+           Effect.forkIn(scope),
+         );
+ 
+-- 
+2.50.1 (Apple Git-155)
+

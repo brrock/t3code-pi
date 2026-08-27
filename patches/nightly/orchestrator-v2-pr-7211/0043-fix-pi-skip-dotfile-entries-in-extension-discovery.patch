@@ -1,0 +1,54 @@
+From bb196768355e43c6d7011bc87f4ae45a0c00211f Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 13:40:56 +0200
+Subject: [PATCH] fix(pi): skip dotfile entries in extension discovery
+
+discoverPiUserExtensions passed any *.ts/*.js directory entry as an
+explicit --extension path, including macOS AppleDouble sidecars like
+"._name.ts". Pi treats a parse failure on an explicit extension path as
+fatal, so one stale sidecar in ~/.pi/agent/extensions killed every Pi
+turn with an opaque "pi process closed stdout" error while interactive
+pi kept working. Skip dot entries, matching pi's own loader.
+
+Reported by @astarktc in #7211.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/Adapters/piT3McpInjection.test.ts   | 5 +++++
+ .../server/src/orchestration-v2/Adapters/piT3McpInjection.ts | 4 ++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+index bc974cac3..b153c98a5 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+@@ -122,6 +122,11 @@ describe("pi T3 MCP injection", () => {
+       yield* fs.makeDirectory(`${filteredDir}/src`, { recursive: true });
+       yield* fs.makeDirectory(packageSubagentDir, { recursive: true });
+       yield* fs.writeFileString(`${extensionsDir}/demo.ts`, "export default () => {}");
++      // Dot entries (macOS AppleDouble sidecars) parse-fail as explicit
++      // `--extension` paths and abort the pi spawn; discovery must skip them.
++      yield* fs.writeFileString(`${extensionsDir}/._demo.ts`, "junk");
++      yield* fs.makeDirectory(`${extensionsDir}/.hidden`, { recursive: true });
++      yield* fs.writeFileString(`${extensionsDir}/.hidden/index.ts`, "export default () => {}");
+       yield* fs.writeFileString(`${extensionsDir}/subagent.ts`, "export default () => {}");
+       yield* fs.writeFileString(`${extensionsDir}/subagent.js`, "export default () => {}");
+       yield* fs.writeFileString(`${extensionsDir}/todos/index.ts`, "export default () => {}");
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+index b2ff8b1a0..619aedd19 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+@@ -260,6 +260,10 @@ export const discoverPiUserExtensions = Effect.fn("discoverPiUserExtensions")(fu
+       .readDirectory(root)
+       .pipe(Effect.orElseSucceed(() => [] as Array<string>));
+     for (const entry of entries.toSorted()) {
++      // Pi's own discovery skips dotfiles, and a parse failure on an explicit
++      // `--extension` path aborts the spawn, so stray dot entries (macOS
++      // AppleDouble `._*.ts` sidecars) must never be passed along.
++      if (entry.startsWith(".")) continue;
+       if (entry === "subagent" || entry === "subagent.ts" || entry === "subagent.js") continue;
+       const path = `${root}/${entry}`;
+       if (entry.endsWith(".ts") || entry.endsWith(".js")) {
+-- 
+2.50.1 (Apple Git-155)
+

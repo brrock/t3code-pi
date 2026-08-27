@@ -1,0 +1,33 @@
+From a857db55b9c649ebb149394d20abaa02263e0758 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 15:46:33 +0200
+Subject: [PATCH] fix(providers): build the Pi snapshot error from its own
+ attributes
+
+`ProviderDriverError.message` is derived from `detail`, so interpolating
+`cause.message` duplicated the underlying failure into the wrapper message
+while the cause already carried it. The sibling mapping in this same file
+("Failed to build Pi orchestration adapter.") already used the bounded
+form, so the two wrappers now match.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ apps/server/src/provider/Drivers/PiDriver.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/apps/server/src/provider/Drivers/PiDriver.ts b/apps/server/src/provider/Drivers/PiDriver.ts
+index 1d6bb08d6..b8252b8b1 100644
+--- a/apps/server/src/provider/Drivers/PiDriver.ts
++++ b/apps/server/src/provider/Drivers/PiDriver.ts
+@@ -160,7 +160,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
+             new ProviderDriverError({
+               driver: DRIVER_KIND,
+               instanceId,
+-              detail: `Failed to build Pi snapshot: ${cause.message ?? String(cause)}`,
++              detail: "Failed to build Pi snapshot.",
+               cause,
+             }),
+         ),
+-- 
+2.50.1 (Apple Git-155)
+

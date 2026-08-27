@@ -1,0 +1,9 @@
+{
+  "name": "t3code-pi-maintenance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "maintain": "node tools/maintain-upstream.mjs",
+    "test": "node --test tools/*.test.mjs"
+  }
+}

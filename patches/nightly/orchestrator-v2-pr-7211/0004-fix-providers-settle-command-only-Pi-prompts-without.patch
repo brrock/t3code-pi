@@ -1,0 +1,264 @@
+From 7dbca279f817ad3e71db9d56dd193f74885322cb Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 15:28:57 +0200
+Subject: [PATCH] fix(providers): settle command-only Pi prompts without an
+ agent run
+
+A prompt that only runs an extension slash command never starts an agent
+run, so pi emits no agent_settled and the turn spun forever. The deferred
+id-less prompt ack is the completion signal for that shape: on ack with no
+agent activity observed, probe get_state and settle the turn when Pi
+reports idle. The probe result re-enters the event queue so the check
+stays ordered behind any agent activity Pi emitted first.
+
+Also carries concurrent review-fix work from the shared worktree:
+additional PiRpc request-lifecycle hardening beyond the settle probe.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/PiAdapterV2.test.ts              | 28 +++++++
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 80 +++++++++++++++++--
+ .../src/orchestration-v2/Adapters/PiRpc.ts    | 24 ++++--
+ 3 files changed, 120 insertions(+), 12 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index aa3dfdb85..0b9a67b24 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -357,6 +357,34 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
++  it.effect("settles a command-only prompt from its deferred ack and idle probe", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      // A pure extension command: dialog + notify, then the deferred ack —
++      // pi emits no agent_start/agent_settled at all.
++      yield* fake.emit({
++        type: "extension_ui_request",
++        id: "ui-cmd",
++        method: "notify",
++        message: "done",
++        notifyType: "info",
++      });
++      yield* fake.emit({ type: "response", command: "prompt", success: true });
++      // The adapter probes get_state (auto-acked idle by the fake), then
++      // settles the turn as completed.
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("fails the turn when pi rejects a fire-and-forget prompt", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index ca106d6ea..cdfc227fc 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -275,6 +275,13 @@ interface ActivePiTurn {
+   readonly streamItems: Map<string, PiStreamItemState>;
+   readonly toolArgs: Map<string, unknown>;
+   interrupted: boolean;
++  /**
++   * Whether any agent run activity was observed. Command-only prompts (pure
++   * extension slash commands) never start an agent run and never emit
++   * `agent_settled`; their deferred prompt ack plus an idle probe settles
++   * the turn instead.
++   */
++  sawAgentActivity: boolean;
+   failure: ReturnType<typeof makeProviderFailure> | null;
+ }
+ 
+@@ -915,14 +922,20 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         const state = threadState;
+         const turn = state?.activeTurn ?? null;
+         switch (event["type"]) {
++          case "agent_start": {
++            if (turn !== null) turn.sawAgentActivity = true;
++            return;
++          }
+           case "message_start": {
+             if (turn !== null && recordString(event["message"], "role") === "assistant") {
++              turn.sawAgentActivity = true;
+               turn.messageOrdinal += 1;
+             }
+             return;
+           }
+           case "message_update": {
+             if (turn === null) return;
++            turn.sawAgentActivity = true;
+             const delta = event["assistantMessageEvent"];
+             const deltaType = recordString(delta, "type");
+             const contentIndex = recordNumber(delta, "contentIndex") ?? 0;
+@@ -965,7 +978,10 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             return;
+           }
+           case "tool_execution_start":
+-            if (turn !== null) yield* emitToolItem(turn, event, "start");
++            if (turn !== null) {
++              turn.sawAgentActivity = true;
++              yield* emitToolItem(turn, event, "start");
++            }
+             return;
+           case "tool_execution_update":
+             if (turn !== null) yield* emitToolItem(turn, event, "update");
+@@ -1032,11 +1048,39 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             // is the deferred ack of a fire-and-forget prompt/steer. A
+             // rejection here means the turn never started on the Pi side.
+             const command = recordString(event, "command");
+-            if (
+-              turn !== null &&
+-              event["success"] === false &&
+-              (command === "prompt" || command === "steer" || command === "parse")
+-            ) {
++            if (event["success"] === true) {
++              // Deferred success ack. Command-only prompts (pure extension
++              // slash commands) never start an agent run and never emit
++              // `agent_settled`, so probe for idleness. The probe result is
++              // re-queued behind any events Pi emitted before answering
++              // get_state, which keeps the check stream-ordered.
++              if (command === "prompt" && turn !== null && !turn.sawAgentActivity) {
++                const providerTurnId = turn.providerTurn.id;
++                yield* request({ type: "get_state" }).pipe(
++                  Effect.flatMap((data) =>
++                    Queue.offer(connection.events, {
++                      type: "t3.settle_probe",
++                      providerTurnId,
++                      data,
++                    }),
++                  ),
++                  Effect.ignore,
++                  Effect.forkIn(scope),
++                );
++              }
++              return;
++            }
++            if (event["success"] !== false) return;
++            if (command === "steer") {
++              // A rejected steer only means that one message was refused. The
++              // turn it was aimed at is still running on Pi, so terminalizing
++              // here would report a failure while output keeps streaming.
++              yield* Effect.logWarning("Pi rejected a steer message.", {
++                error: recordString(event, "error"),
++              });
++              return;
++            }
++            if (turn !== null && (command === "prompt" || command === "parse")) {
+               turn.failure = makeProviderFailure({
+                 message: recordString(event, "error") ?? "Pi rejected the prompt.",
+                 class: "provider_error",
+@@ -1045,6 +1089,23 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             }
+             return;
+           }
++          case "t3.settle_probe": {
++            // Synthetic idle probe queued after a command-only prompt ack.
++            // Any agent activity Pi emitted before answering get_state has
++            // already been processed, so an untouched turn that reports
++            // no streaming and no pending messages is genuinely done.
++            const data = event["data"];
++            if (
++              turn !== null &&
++              turn.providerTurn.id === event["providerTurnId"] &&
++              !turn.sawAgentActivity &&
++              recordField(data, "isStreaming") !== true &&
++              (recordNumber(data, "pendingMessageCount") ?? 0) === 0
++            ) {
++              if (state !== null) yield* finalizeTurn(state);
++            }
++            return;
++          }
+           default:
+             return;
+         }
+@@ -1321,6 +1382,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               streamItems: new Map(),
+               toolArgs: new Map(),
+               interrupted: false,
++              sawAgentActivity: false,
+               failure: null,
+             };
+             yield* emit({
+@@ -1367,6 +1429,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               steerInput.message.text,
+               steerInput.message.attachments,
+             );
++            // Reading attachments suspends, so the turn is revalidated here:
++            // without this a steer resolved after the turn ended would be
++            // accepted by an idle session or by the next turn.
++            if (threadState?.activeTurn !== turn) {
++              return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
++            }
+             // Same fire-and-forget contract as `prompt`: a steer that expands
+             // a slash command must not block on the ack.
+             yield* connection.send({
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+index e04f21665..a7ea221fe 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+@@ -66,8 +66,12 @@ export interface PiRpcConnection {
+    * Fails on `success: false`, transport death, or timeout.
+    */
+   readonly request: (record: PiRpcRecord, timeoutMs?: number) => Effect.Effect<unknown, PiRpcError>;
+-  /** Session events (every non-response stdout record) in arrival order. */
+-  readonly events: Queue.Dequeue<PiRpcRecord, PiRpcError>;
++  /**
++   * Session events (every non-response stdout record) in arrival order. The
++   * full queue is exposed so consumers can append order-preserving synthetic
++   * records of their own (see PiAdapterV2's settle probe).
++   */
++  readonly events: Queue.Queue<PiRpcRecord, PiRpcError>;
+   /** Resolves when the process has exited, with its exit code. */
+   readonly exited: Effect.Effect<number, PiRpcError>;
+ }
+@@ -174,7 +178,7 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+ 
+   const pendingRequests = new Map<string, PendingPiRequest>();
+   const events = yield* Queue.unbounded<PiRpcRecord, PiRpcError>();
+-  const outgoing = yield* Queue.unbounded<Uint8Array>();
++  const outgoing = yield* Queue.unbounded<Uint8Array, PiRpcError>();
+   const transportDown = yield* Deferred.make<never, PiRpcError>();
+   const exitDeferred = yield* Deferred.make<number, PiRpcError>();
+   let nextRequestId = 0;
+@@ -186,6 +190,9 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+         pendingRequests.delete(key);
+         yield* Deferred.fail(pending.deferred, error);
+       }
++      // Closing `outgoing` is what makes `send` non-racy: once the writer is
++      // gone every later offer is refused rather than silently buffered.
++      yield* Queue.fail(outgoing, error);
+       yield* Queue.fail(events, error);
+     });
+ 
+@@ -280,11 +287,16 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+ 
+   const send = (record: PiRpcRecord): Effect.Effect<void, PiRpcError> =>
+     Effect.gen(function* () {
+-      const down = yield* Deferred.isDone(transportDown);
+-      if (down) {
++      const accepted = yield* Queue.offer(
++        outgoing,
++        new TextEncoder().encode(`${encodeJsonLine(record)}\n`),
++      );
++      // A refused offer means `failTransport` already closed the queue, so the
++      // write can never land; surface the transport error instead of
++      // reporting a success the caller cannot rely on.
++      if (!accepted) {
+         return yield* Deferred.await(transportDown);
+       }
+-      yield* Queue.offer(outgoing, new TextEncoder().encode(`${encodeJsonLine(record)}\n`));
+     });
+ 
+   const request = (
+-- 
+2.50.1 (Apple Git-155)
+

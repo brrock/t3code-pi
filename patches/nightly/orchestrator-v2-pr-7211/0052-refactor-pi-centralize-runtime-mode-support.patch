@@ -1,0 +1,373 @@
+From 90a33c754c9acfe404bff98ab69ccd516a22f530 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 11:22:06 +0200
+Subject: [PATCH] refactor(pi): centralize runtime mode support
+
+---
+ .../features/threads/ThreadSettingsSheet.tsx  | 22 +++---
+ .../threads/thread-settings-options.ts        | 17 +++--
+ apps/mobile/src/lib/modelOptions.ts           |  5 ++
+ apps/server/src/provider/Layers/PiProvider.ts |  1 +
+ apps/server/src/provider/providerSnapshot.ts  |  5 ++
+ apps/web/src/components/chat/ChatComposer.tsx | 74 ++++++++++++-------
+ .../chat/CompactComposerControlsMenu.tsx      | 17 ++---
+ packages/contracts/src/server.test.ts         |  2 +
+ packages/contracts/src/server.ts              |  2 +
+ 9 files changed, 91 insertions(+), 54 deletions(-)
+
+diff --git a/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx b/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
+index 7c37f4dc5..978a859de 100644
+--- a/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
++++ b/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
+@@ -54,8 +54,8 @@ import {
+   NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED,
+ } from "../layout/native-mail-search-toolbar";
+ import {
+-  compatibleRuntimeModeForProvider,
+-  runtimeModeChoicesForProvider,
++  compatibleRuntimeModeForChoices,
++  runtimeModeChoicesForSupportedModes,
+   selectableChoices,
+ } from "./thread-settings-options";
+ import {
+@@ -338,7 +338,7 @@ export function useExistingThreadSettingsRoutePresentation() {
+ type ThreadSettingsSessionValue = {
+   readonly providerGroups: ReadonlyArray<ProviderGroup>;
+   readonly runtimeMode: RuntimeMode;
+-  readonly runtimeModeChoices: ReturnType<typeof runtimeModeChoicesForProvider>;
++  readonly runtimeModeChoices: ReturnType<typeof runtimeModeChoicesForSupportedModes>;
+   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
+   readonly displayedDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
+   readonly providerExpansionOverrides: ReadonlySet<string>;
+@@ -399,17 +399,19 @@ function ThreadSettingsSessionProvider(
+         : props.optionDescriptors,
+     [pendingModel, props.optionDescriptors],
+   );
+-  const displayedProviderDriver = useMemo(
++  const displayedModel = useMemo(
+     () =>
+-      pendingModel?.providerDriver ??
+-      props.providerGroups.flatMap((group) => group.models).find((option) => isApplied(option))
+-        ?.providerDriver,
++      pendingModel ??
++      props.providerGroups.flatMap((group) => group.models).find((option) => isApplied(option)) ??
++      null,
+     [isApplied, pendingModel, props.providerGroups],
+   );
+-  const runtimeModeChoices = runtimeModeChoicesForProvider(displayedProviderDriver);
+-  const compatibleRuntimeMode = compatibleRuntimeModeForProvider(
++  const runtimeModeChoices = runtimeModeChoicesForSupportedModes(
++    displayedModel?.supportedRuntimeModes,
++  );
++  const compatibleRuntimeMode = compatibleRuntimeModeForChoices(
+     props.runtimeMode,
+-    displayedProviderDriver,
++    runtimeModeChoices,
+   );
+ 
+   const hasLegacyModels = useMemo(
+diff --git a/apps/mobile/src/features/threads/thread-settings-options.ts b/apps/mobile/src/features/threads/thread-settings-options.ts
+index 7a2ce58fa..c3a078d84 100644
+--- a/apps/mobile/src/features/threads/thread-settings-options.ts
++++ b/apps/mobile/src/features/threads/thread-settings-options.ts
+@@ -35,17 +35,22 @@ export const RUNTIME_MODE_CHOICES: ReadonlyArray<{
+     description: "Allow commands and edits without prompts.",
+   },
+ ];
+-const PI_RUNTIME_MODE_CHOICES = RUNTIME_MODE_CHOICES.filter((choice) => choice.mode !== "auto");
+ 
+-export function runtimeModeChoicesForProvider(providerDriver: string | undefined) {
+-  return providerDriver === "pi" ? PI_RUNTIME_MODE_CHOICES : RUNTIME_MODE_CHOICES;
++export function runtimeModeChoicesForSupportedModes(
++  supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
++) {
++  return supportedRuntimeModes
++    ? RUNTIME_MODE_CHOICES.filter((choice) => supportedRuntimeModes.includes(choice.mode))
++    : RUNTIME_MODE_CHOICES;
+ }
+ 
+-export function compatibleRuntimeModeForProvider(
++export function compatibleRuntimeModeForChoices(
+   runtimeMode: RuntimeMode,
+-  providerDriver: string | undefined,
++  choices: ReadonlyArray<{ readonly mode: RuntimeMode }>,
+ ): RuntimeMode {
+-  return providerDriver === "pi" && runtimeMode === "auto" ? "approval-required" : runtimeMode;
++  return choices.some((choice) => choice.mode === runtimeMode)
++    ? runtimeMode
++    : (choices[0]?.mode ?? runtimeMode);
+ }
+ 
+ export function selectableChoices(
+diff --git a/apps/mobile/src/lib/modelOptions.ts b/apps/mobile/src/lib/modelOptions.ts
+index f601956e8..633219614 100644
+--- a/apps/mobile/src/lib/modelOptions.ts
++++ b/apps/mobile/src/lib/modelOptions.ts
+@@ -2,6 +2,7 @@ import type { MenuAction } from "@react-native-menu/menu";
+ import type {
+   ModelCapabilities,
+   ModelSelection,
++  RuntimeMode,
+   ServerConfig as T3ServerConfig,
+ } from "@t3tools/contracts";
+ import {
+@@ -16,6 +17,7 @@ export type ModelOption = {
+   readonly providerKey: string;
+   readonly providerLabel: string;
+   readonly providerDriver: string;
++  readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+   readonly isDefault: boolean;
+   readonly isLegacy: boolean;
+   readonly capabilities: ModelCapabilities | null;
+@@ -127,6 +129,9 @@ export function buildModelOptions(
+         providerKey: provider.instanceId,
+         providerLabel,
+         providerDriver: provider.driver,
++        ...(provider.supportedRuntimeModes === undefined
++          ? {}
++          : { supportedRuntimeModes: provider.supportedRuntimeModes }),
+         isDefault: model.isDefault === true,
+         isLegacy: model.isLegacy === true,
+         capabilities: model.capabilities,
+diff --git a/apps/server/src/provider/Layers/PiProvider.ts b/apps/server/src/provider/Layers/PiProvider.ts
+index ea701383c..7eb2aac73 100644
+--- a/apps/server/src/provider/Layers/PiProvider.ts
++++ b/apps/server/src/provider/Layers/PiProvider.ts
+@@ -51,6 +51,7 @@ const PI_PRESENTATION = {
+   displayName: "Pi",
+   badgeLabel: "Early Access",
+   showInteractionModeToggle: false,
++  supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
+   requiresNewThreadForModelChange: false,
+ } as const;
+ 
+diff --git a/apps/server/src/provider/providerSnapshot.ts b/apps/server/src/provider/providerSnapshot.ts
+index 03b4cf4a3..3bf1e590e 100644
+--- a/apps/server/src/provider/providerSnapshot.ts
++++ b/apps/server/src/provider/providerSnapshot.ts
+@@ -1,6 +1,7 @@
+ import type {
+   ProviderDriverKind,
+   ModelCapabilities,
++  RuntimeMode,
+   ServerProvider,
+   ServerProviderAuth,
+   ServerProviderSkill,
+@@ -56,6 +57,7 @@ export interface ServerProviderPresentation {
+   readonly displayName: string;
+   readonly badgeLabel?: string;
+   readonly showInteractionModeToggle?: boolean;
++  readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+   readonly requiresNewThreadForModelChange?: boolean;
+ }
+ 
+@@ -236,6 +238,9 @@ export function buildServerProvider(input: {
+     ...(typeof input.presentation.showInteractionModeToggle === "boolean"
+       ? { showInteractionModeToggle: input.presentation.showInteractionModeToggle }
+       : {}),
++    ...(input.presentation.supportedRuntimeModes === undefined
++      ? {}
++      : { supportedRuntimeModes: [...input.presentation.supportedRuntimeModes] }),
+     ...(typeof input.presentation.requiresNewThreadForModelChange === "boolean"
+       ? { requiresNewThreadForModelChange: input.presentation.requiresNewThreadForModelChange }
+       : {}),
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 4849ccab3..0bfad597a 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -241,34 +241,41 @@ import { searchProviderSkills } from "../../providerSkillSearch";
+ import { useMediaQuery } from "../../hooks/useMediaQuery";
+ import type { ReviewCommentContext } from "../../reviewCommentContext";
+ 
+-const runtimeModeConfig: Record<
+-  RuntimeMode,
+-  { label: string; description: string; icon: LucideIcon }
+-> = {
+-  "approval-required": {
+-    label: "Supervised",
+-    description: "Ask before commands and file changes.",
+-    icon: LockIcon,
+-  },
+-  "auto-accept-edits": {
++type RuntimeModeOption = {
++  readonly mode: RuntimeMode;
++  readonly label: string;
++  readonly description: string;
++  readonly icon: LucideIcon;
++};
++
++const supervisedRuntimeModeOption = {
++  mode: "approval-required",
++  label: "Supervised",
++  description: "Ask before commands and file changes.",
++  icon: LockIcon,
++} satisfies RuntimeModeOption;
++
++const runtimeModeOptions = [
++  supervisedRuntimeModeOption,
++  {
++    mode: "auto-accept-edits",
+     label: "Auto-accept edits",
+     description: "Auto-approve edits, ask before other actions.",
+     icon: PenLineIcon,
+   },
+-  auto: {
++  {
++    mode: "auto",
+     label: "Auto",
+     description: "An AI reviewer approves routine actions; risky ones still ask.",
+     icon: SparklesIcon,
+   },
+-  "full-access": {
++  {
++    mode: "full-access",
+     label: "Full access",
+     description: "Allow commands and edits without prompts.",
+     icon: LockOpenIcon,
+   },
+-};
+-
+-const runtimeModeOptions = Object.keys(runtimeModeConfig) as RuntimeMode[];
+-const piRuntimeModeOptions = runtimeModeOptions.filter((mode) => mode !== "auto");
++] satisfies ReadonlyArray<RuntimeModeOption>;
+ const COMPOSER_FLOATING_LAYER_SELECTOR = [
+   '[data-slot="popover-popup"]',
+   '[data-slot="menu-popup"]',
+@@ -313,12 +320,14 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
+   showInteractionModeToggle: boolean;
+   interactionMode: ProviderInteractionMode;
+   runtimeMode: RuntimeMode;
+-  runtimeModeOptions: ReadonlyArray<RuntimeMode>;
++  runtimeModeOptions: ReadonlyArray<RuntimeModeOption>;
+   showPlanToggle: boolean;
+   onToggleInteractionMode: () => void;
+   onRuntimeModeChange: (mode: RuntimeMode) => void;
+ }) {
+-  const runtimeModeOption = runtimeModeConfig[props.runtimeMode];
++  const runtimeModeOption =
++    runtimeModeOptions.find((option) => option.mode === props.runtimeMode) ??
++    supervisedRuntimeModeOption;
+   const RuntimeModeIcon = runtimeModeOption.icon;
+   const interactionModeTooltip =
+     props.interactionMode === "plan"
+@@ -373,11 +382,15 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
+             <SelectValue>{runtimeModeOption.label}</SelectValue>
+           </TooltipTrigger>
+           <SelectPopup alignItemWithTrigger={false}>
+-            {props.runtimeModeOptions.map((mode) => {
+-              const option = runtimeModeConfig[mode];
++            {props.runtimeModeOptions.map((option) => {
+               const OptionIcon = option.icon;
+               return (
+-                <SelectItem key={mode} value={mode} hideIndicator className="min-w-64 py-2">
++                <SelectItem
++                  key={option.mode}
++                  value={option.mode}
++                  hideIndicator
++                  className="min-w-64 py-2"
++                >
+                   <div className="flex min-w-0 items-center gap-3">
+                     <div className="grid min-w-0 flex-1 gap-0.5">
+                       <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
+@@ -883,13 +896,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   // disabled.
+   const selectedProvider: ProviderDriverKind =
+     selectedProviderEntry?.driverKind ?? requestedDriverKind;
+-  const compatibleRuntimeModeOptions =
+-    selectedProvider === "pi" ? piRuntimeModeOptions : runtimeModeOptions;
+-  // Old Pi threads may have persisted Auto before Pi's supported modes were
+-  // narrowed. Pi enforces that legacy value as Supervised, so display the
+-  // behavior users actually get without offering Auto for new selections.
+-  const compatibleRuntimeMode =
+-    selectedProvider === "pi" && runtimeMode === "auto" ? "approval-required" : runtimeMode;
++  const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
++  const compatibleRuntimeModeOptions = supportedRuntimeModes
++    ? runtimeModeOptions.filter((option) => supportedRuntimeModes.includes(option.mode))
++    : runtimeModeOptions;
++  // Older threads can contain a mode their current provider no longer offers.
++  // Display the provider's first supported mode, which is also its safe legacy
++  // fallback, without mutating persisted state until the user makes a choice.
++  const compatibleRuntimeMode = compatibleRuntimeModeOptions.some(
++    (option) => option.mode === runtimeMode,
++  )
++    ? runtimeMode
++    : (compatibleRuntimeModeOptions[0]?.mode ?? runtimeMode);
+ 
+   const { modelOptions: composerModelOptions, selectedModel } = useEffectiveComposerModelState({
+     threadRef: composerDraftTarget,
+diff --git a/apps/web/src/components/chat/CompactComposerControlsMenu.tsx b/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
+index 604596e53..5e096700f 100644
+--- a/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
++++ b/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
+@@ -14,7 +14,10 @@ import {
+ export const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(props: {
+   interactionMode: ProviderInteractionMode;
+   runtimeMode: RuntimeMode;
+-  runtimeModeOptions: ReadonlyArray<RuntimeMode>;
++  runtimeModeOptions: ReadonlyArray<{
++    readonly mode: RuntimeMode;
++    readonly label: string;
++  }>;
+   showInteractionModeToggle: boolean;
+   traitsMenuContent?: ReactNode;
+   onToggleInteractionMode: () => void;
+@@ -65,15 +68,9 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+             props.onRuntimeModeChange(value as RuntimeMode);
+           }}
+         >
+-          {props.runtimeModeOptions.map((mode) => (
+-            <MenuRadioItem key={mode} value={mode}>
+-              {mode === "approval-required"
+-                ? "Supervised"
+-                : mode === "auto-accept-edits"
+-                  ? "Auto-accept edits"
+-                  : mode === "auto"
+-                    ? "Auto"
+-                    : "Full access"}
++          {props.runtimeModeOptions.map((option) => (
++            <MenuRadioItem key={option.mode} value={option.mode}>
++              {option.label}
+             </MenuRadioItem>
+           ))}
+         </MenuRadioGroup>
+diff --git a/packages/contracts/src/server.test.ts b/packages/contracts/src/server.test.ts
+index 23e4a43bf..6f326d8ab 100644
+--- a/packages/contracts/src/server.test.ts
++++ b/packages/contracts/src/server.test.ts
+@@ -38,11 +38,13 @@ describe("ServerProvider", () => {
+         status: "authenticated",
+       },
+       checkedAt: "2026-04-10T00:00:00.000Z",
++      supportedRuntimeModes: ["approval-required", "future-mode", "full-access"],
+       models: [],
+     });
+ 
+     expect(parsed.slashCommands).toEqual([]);
+     expect(parsed.skills).toEqual([]);
++    expect(parsed.supportedRuntimeModes).toEqual(["approval-required", "full-access"]);
+     expect(parsed.versionAdvisory).toBeUndefined();
+     expect(parsed.updateState).toBeUndefined();
+   });
+diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
+index a24cd4219..f8a05243a 100644
+--- a/packages/contracts/src/server.ts
++++ b/packages/contracts/src/server.ts
+@@ -19,6 +19,7 @@ import {
+ } from "./keybindings.ts";
+ import { EditorId, RemoteOpenTarget } from "./editor.ts";
+ import { ModelCapabilities } from "./model.ts";
++import { RuntimeMode } from "./providerPolicy.ts";
+ import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+ import { ServerSettings } from "./settings.ts";
+ 
+@@ -170,6 +171,7 @@ export const ServerProvider = Schema.Struct({
+   badgeLabel: Schema.optional(TrimmedNonEmptyString),
+   continuation: Schema.optional(ServerProviderContinuation),
+   showInteractionModeToggle: Schema.optional(Schema.Boolean),
++  supportedRuntimeModes: Schema.optional(ForwardCompatibleArray(RuntimeMode)),
+   requiresNewThreadForModelChange: Schema.optional(Schema.Boolean),
+   enabled: Schema.Boolean,
+   installed: Schema.Boolean,
+-- 
+2.50.1 (Apple Git-155)
+

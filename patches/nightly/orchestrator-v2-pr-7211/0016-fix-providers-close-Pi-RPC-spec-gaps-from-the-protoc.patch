@@ -1,0 +1,275 @@
+From a5f1ebbef909924007616a5c00a8e12cd6a67889 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 19:49:03 +0200
+Subject: [PATCH] fix(providers): close Pi RPC spec gaps from the protocol
+ cross-check
+
+Five spec-fidelity fixes against pi's rpc.md:
+- a session_before_switch extension veto now fails the resume instead of
+  silently adopting whichever session stayed active
+- failed compactions surface as a failed compaction item with the error
+  instead of disappearing
+- empty input/editor dialog answers deliver as values (the spec's
+  'extension receives ""'), no longer converted to cancels
+- editor dialogs show their prefill inside the question text so the user
+  is not editing blind
+- text generation passes --no-extensions so an unanswerable extension
+  dialog cannot stall commit-message generation until its timeout
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/PiAdapterV2.test.ts              | 104 +++++++++++++++++-
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  |  44 +++++++-
+ .../src/textGeneration/PiTextGeneration.ts    |  11 +-
+ 3 files changed, 152 insertions(+), 7 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 2c920d978..b3495c47e 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -73,6 +73,8 @@ interface FakePi {
+   readonly takeRequest: (type: string) => Effect.Effect<PiRpcRecord>;
+   /** Data returned by the next `get_entries` acks, consumed in order. */
+   readonly queueEntries: (data: unknown) => void;
++  /** Make the next `switch_session` ack report an extension veto. */
++  readonly vetoNextSwitch: () => void;
+ }
+ 
+ /**
+@@ -83,6 +85,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   const stdout = yield* Queue.unbounded<Uint8Array>();
+   const requests = yield* Queue.unbounded<PiRpcRecord>();
+   const entriesQueue: Array<unknown> = [];
++  let vetoSwitch = false;
+   let stdinBuffer = "";
+ 
+   const emit = (record: PiRpcRecord) =>
+@@ -111,8 +114,11 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+             sessionId: "abc",
+           },
+         };
+-      case "switch_session":
+-        return { ...base, data: { cancelled: false } };
++      case "switch_session": {
++        const cancelled = vetoSwitch;
++        vetoSwitch = false;
++        return { ...base, data: { cancelled } };
++      }
+       case "get_entries":
+         return { ...base, data: entriesQueue.shift() ?? { entries: [], leafId: null } };
+       case "fork":
+@@ -169,6 +175,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+     emit,
+     takeRequest,
+     queueEntries: (data) => entriesQueue.push(data),
++    vetoNextSwitch: () => {
++      vetoSwitch = true;
++    },
+   } satisfies FakePi;
+ });
+ 
+@@ -490,6 +499,97 @@ describe("PiAdapterV2", () => {
+     );
+   });
+ 
++  it.effect("fails a resume when an extension vetoes the session switch", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      fake.vetoNextSwitch();
++      const error = yield* runtime.resumeThread({ providerThread }).pipe(Effect.flip);
++      assert.equal(error._tag, "ProviderAdapterResumeThreadError");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("delivers empty dialog answers as values and shows editor prefill", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({
++        type: "extension_ui_request",
++        id: "ui-editor",
++        method: "editor",
++        title: "Edit the note",
++        prefill: "line one\nline two",
++      });
++      const pending = yield* takeEvent(
++        (event) =>
++          event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending",
++      );
++      const requestId =
++        pending.type === "runtime_request.updated" ? pending.runtimeRequest.id : undefined;
++      const requestItem = yield* takeEvent(
++        (event) =>
++          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
++      );
++      assert.isTrue(
++        requestItem.type === "turn_item.updated" &&
++          requestItem.turnItem.type === "user_input_request" &&
++          requestItem.turnItem.questions[0]!.question.includes("Current value:\nline one"),
++      );
++      // An empty string clears the note; it must arrive as a value, not a cancel.
++      yield* runtime.respondToRuntimeRequest({
++        requestId: requestId!,
++        answers: { "ui-editor": "" },
++      });
++      const uiResponse = yield* fake.takeRequest("extension_ui_response");
++      assert.equal(uiResponse["value"], "");
++      assert.notProperty(uiResponse, "cancelled");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("shows failed compactions instead of dropping them", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({
++        type: "compaction_end",
++        reason: "threshold",
++        result: null,
++        aborted: false,
++        errorMessage: "API quota exceeded",
++      });
++      const compaction = yield* takeEvent(
++        (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
++      );
++      assert.isTrue(
++        compaction.type === "turn_item.updated" &&
++          compaction.turnItem.type === "compaction" &&
++          compaction.turnItem.status === "failed" &&
++          compaction.turnItem.summary === "API quota exceeded",
++      );
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("presents tools aborted by Stop as interrupted, not failed", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index a2e471e96..ebd8a7c73 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -1188,7 +1188,27 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             if (turn === null) return;
+             const emittedAt = yield* DateTime.now;
+             const result = event["result"];
+-            if (result === null || result === undefined) return;
++            if (result === null || result === undefined) {
++              // Aborted compactions vanish silently; failed ones carry an
++              // errorMessage and deserve a visible failed compaction item.
++              const errorMessage = recordString(event, "errorMessage");
++              if (event["aborted"] === true || errorMessage === undefined) return;
++              const failedItemId = `compaction:${turn.nextItemOrdinal}`;
++              yield* emit({
++                type: "turn_item.updated",
++                driver: PI_PROVIDER,
++                turnItem: {
++                  ...baseItemFields(turn, failedItemId, emittedAt, emittedAt),
++                  status: "failed",
++                  title: null,
++                  completedAt: emittedAt,
++                  type: "compaction",
++                  driver: PI_PROVIDER,
++                  summary: errorMessage.slice(0, 1_000),
++                },
++              });
++              return;
++            }
+             const nativeItemId = `compaction:${turn.nextItemOrdinal}`;
+             yield* emit({
+               type: "turn_item.updated",
+@@ -1362,10 +1382,16 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       ) {
+         const existing = threadInput.existingProviderThread;
+         if (existing?.nativeThreadRef?.nativeId != null) {
+-          yield* request({
++          const switchData = yield* request({
+             type: "switch_session",
+             sessionPath: existing.nativeThreadRef.nativeId,
+           });
++          // A session_before_switch extension handler can veto the switch.
++          // Proceeding would silently adopt whatever session is active and
++          // write the wrong thread's turns into it.
++          if (recordField(switchData, "cancelled") === true) {
++            return yield* protocolError("A Pi extension cancelled the session switch");
++          }
+           // These caches describe the session we just left. Clearing them
+           // stops the next turn from treating this session as already
+           // configured and skipping set_model or set_session_name.
+@@ -1903,10 +1929,18 @@ function piQuestion(
+           .filter((option): option is string => typeof option === "string")
+           .map((option) => ({ label: option, description: option }))
+       : [];
++  // The user-input contract has no prefill field, so an editor dialog's
++  // prefill is surfaced inside the question text; without it the user would
++  // edit blind against content they cannot see.
++  const prefill = method === "editor" ? recordString(event, "prefill") : undefined;
++  const question = recordString(event, "message") ?? recordString(event, "placeholder") ?? title;
+   return {
+     id: questionId,
+     header: title,
+-    question: recordString(event, "message") ?? recordString(event, "placeholder") ?? title,
++    question:
++      prefill === undefined || prefill.length === 0
++        ? question
++        : `${question}\n\nCurrent value:\n${prefill.slice(0, 2_000)}`,
+     options,
+   };
+ }
+@@ -1922,7 +1956,9 @@ function piUiResponse(
+     return { cancelled: true };
+   }
+   const answer = answers?.[pending.questionId];
+-  if (typeof answer === "string" && answer.length > 0) return { value: answer };
++  // An empty string is a valid dialog value per the RPC spec (the extension
++  // receives ""), distinct from cancelling (the extension receives undefined).
++  if (typeof answer === "string") return { value: answer };
+   return { cancelled: true };
+ }
+ 
+diff --git a/apps/server/src/textGeneration/PiTextGeneration.ts b/apps/server/src/textGeneration/PiTextGeneration.ts
+index ce86ee2d3..b849728e5 100644
+--- a/apps/server/src/textGeneration/PiTextGeneration.ts
++++ b/apps/server/src/textGeneration/PiTextGeneration.ts
+@@ -59,7 +59,16 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function*
+     Effect.gen(function* () {
+       const connection = yield* makePiRpcConnection({
+         command: piSettings.binaryPath || "pi",
+-        args: ["--mode", "rpc", "--no-session", ...tokenizeCliArgs(piSettings.launchArgs)],
++        // --no-extensions is deliberate: an extension raising a dialog here
++        // would stall commit-message generation until the timeout, and no
++        // one is present to answer it. User model config and auth still apply.
++        args: [
++          "--mode",
++          "rpc",
++          "--no-session",
++          "--no-extensions",
++          ...tokenizeCliArgs(piSettings.launchArgs),
++        ],
+         cwd,
+         env: environment,
+       }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,251 @@
+From 56a57b29039dfc029f8293af42b476f52dc7f0f3 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 07:53:37 +0200
+Subject: [PATCH] feat(server): restore pi user extensions and give subagent
+ children T3 tools
+
+The T3 subagent override spawns pi with --no-extensions, which silently
+cost users every other extension they had installed. Re-discover the
+user's extensions (agent dir, plus project .pi/extensions only under
+standing trust) and re-add them with explicit --extension flags. Child
+subagent spawns now also attach the T3 MCP extension so t3_thread_*
+tools survive the nested spawn.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/piT3McpInjection.test.ts         | 74 ++++++++++++++++++
+ .../Adapters/piT3McpInjection.ts              | 77 +++++++++++++++++++
+ .../Adapters/piT3SubagentExtensionSource.ts   |  4 +
+ 3 files changed, 155 insertions(+)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+index f3e449714..039daf4cd 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+@@ -16,7 +16,9 @@ import {
+ import {
+   bearerTokenFromAuthorizationHeader,
+   buildPiRpcLaunch,
++  discoverPiUserExtensions,
+   isConflictingPiSubagentExtensionPath,
++  T3_PI_MCP_EXTENSION_PATH_ENV,
+   materializePiT3McpExtension,
+   materializePiT3SubagentExtension,
+   piChildSessionRootFromLaunchArgs,
+@@ -160,7 +162,79 @@ describe("pi T3 MCP injection", () => {
+       assert.include(source, "export default function t3SubagentExtension");
+       assert.include(source, "--session");
+       assert.include(source, T3_PI_CHILD_SESSION_ROOT_ENV);
++      // Children re-attach the T3 MCP extension so t3_thread_* tools survive
++      // the nested spawn (T3_MCP_* env is inherited from the parent).
++      assert.include(source, T3_PI_MCP_EXTENSION_PATH_ENV);
+       assert.isFalse(source.includes("--no-session"));
+     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+   );
++
++  it("re-adds discovered user extensions around the --no-extensions spawn", () => {
++    const launch = buildPiRpcLaunch({
++      launchArgs: "--session-dir /tmp/pi-sessions",
++      environment: { PATH: "/usr/bin" },
++      mcpSession,
++      extensionPath: "/tmp/cache/pi-t3-mcp-extension.ts",
++      subagentExtensionPath: "/tmp/cache/pi-t3-subagent-extension.ts",
++      discoveredExtensionPaths: ["/home/user/.pi/agent/extensions/demo.ts"],
++    });
++    assert.deepEqual(launch.args, [
++      "--mode",
++      "rpc",
++      "--no-extensions",
++      "--extension",
++      "/tmp/cache/pi-t3-subagent-extension.ts",
++      "--extension",
++      "/home/user/.pi/agent/extensions/demo.ts",
++      "--session-dir",
++      "/tmp/pi-sessions",
++      "--extension",
++      "/tmp/cache/pi-t3-mcp-extension.ts",
++    ]);
++    assert.equal(launch.env[T3_PI_MCP_EXTENSION_PATH_ENV], "/tmp/cache/pi-t3-mcp-extension.ts");
++  });
++
++  it.effect("discovers user extensions from the agent dir and skips the subagent", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-home-" });
++      const extensionsDir = `${home}/.pi/agent/extensions`;
++      yield* fs.makeDirectory(`${extensionsDir}/todos`, { recursive: true });
++      yield* fs.makeDirectory(`${extensionsDir}/subagent`, { recursive: true });
++      yield* fs.writeFileString(`${extensionsDir}/demo.ts`, "export default () => {}");
++      yield* fs.writeFileString(`${extensionsDir}/subagent.ts`, "export default () => {}");
++      yield* fs.writeFileString(`${extensionsDir}/todos/index.ts`, "export default () => {}");
++      yield* fs.writeFileString(`${extensionsDir}/subagent/index.ts`, "export default () => {}");
++      const found = yield* discoverPiUserExtensions({
++        environment: { HOME: home },
++        cwd: undefined,
++      });
++      assert.deepEqual(found, [`${extensionsDir}/demo.ts`, `${extensionsDir}/todos/index.ts`]);
++    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
++  );
++
++  it.effect("includes project extensions only under standing project trust", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-home-" });
++      const project = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-project-" });
++      yield* fs.makeDirectory(`${home}/.pi/agent`, { recursive: true });
++      yield* fs.makeDirectory(`${project}/.pi/extensions`, { recursive: true });
++      yield* fs.writeFileString(`${project}/.pi/extensions/local.ts`, "export default () => {}");
++      const untrusted = yield* discoverPiUserExtensions({
++        environment: { HOME: home },
++        cwd: project,
++      });
++      assert.deepEqual(untrusted, []);
++      yield* fs.writeFileString(
++        `${home}/.pi/agent/settings.json`,
++        '{ "defaultProjectTrust": "always" }',
++      );
++      const trusted = yield* discoverPiUserExtensions({
++        environment: { HOME: home },
++        cwd: project,
++      });
++      assert.deepEqual(trusted, [`${project}/.pi/extensions/local.ts`]);
++    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
++  );
+ });
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+index 0637de2ca..b29840991 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+@@ -1,5 +1,6 @@
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
++import * as Schema from "effect/Schema";
+ import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+ 
+ import type { McpProviderSessionConfig } from "../../mcp/McpProviderSession.ts";
+@@ -23,10 +24,76 @@ export {
+   T3_PI_CHILD_SESSION_ROOT_ENV,
+ };
+ 
++/** Env var telling the T3 subagent override where the MCP extension lives. */
++export const T3_PI_MCP_EXTENSION_PATH_ENV = "T3_PI_MCP_EXTENSION_PATH";
++
+ export function bearerTokenFromAuthorizationHeader(header: string): string {
+   return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : header;
+ }
+ 
++const decodeJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
++
++function piDefaultProjectTrust(settingsRaw: string): string | undefined {
++  try {
++    const parsed = decodeJson(settingsRaw);
++    if (typeof parsed !== "object" || parsed === null) return undefined;
++    const value = (parsed as Record<string, unknown>)["defaultProjectTrust"];
++    return typeof value === "string" ? value : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/**
++ * Re-discover the user's pi extensions for a `--no-extensions` spawn: the
++ * subagent override forces discovery off (a second `subagent` registration
++ * aborts pi), which must not cost the user every other extension they have.
++ * Mirrors pi's own discovery roots: `<agent dir>/extensions/*.ts` and
++ * `<agent dir>/extensions/<dir>/index.ts`, plus the project-local
++ * `.pi/extensions` only when the user's `defaultProjectTrust` is `always` —
++ * explicit `--extension` paths bypass pi's trust prompt, so anything short
++ * of standing trust must not be silently loaded. Entries named `subagent`
++ * are skipped in favor of the T3 override.
++ */
++export const discoverPiUserExtensions = Effect.fn("discoverPiUserExtensions")(function* (input: {
++  readonly environment: NodeJS.ProcessEnv;
++  readonly cwd: string | undefined;
++}) {
++  const fs = yield* FileSystem.FileSystem;
++  const home = input.environment["HOME"] ?? input.environment["USERPROFILE"];
++  const agentDir =
++    input.environment["PI_CODING_AGENT_DIR"] ??
++    (home === undefined ? undefined : `${normalizePiPath(home)}/.pi/agent`);
++  const roots: Array<string> = [];
++  if (agentDir !== undefined) roots.push(`${normalizePiPath(agentDir)}/extensions`);
++  if (agentDir !== undefined && input.cwd !== undefined) {
++    const settingsRaw = yield* fs
++      .readFileString(`${normalizePiPath(agentDir)}/settings.json`)
++      .pipe(Effect.orElseSucceed(() => ""));
++    if (piDefaultProjectTrust(settingsRaw) === "always") {
++      roots.push(`${normalizePiPath(input.cwd)}/.pi/extensions`);
++    }
++  }
++  const found: Array<string> = [];
++  for (const root of roots) {
++    const entries = yield* fs
++      .readDirectory(root)
++      .pipe(Effect.orElseSucceed(() => [] as Array<string>));
++    for (const entry of entries.toSorted()) {
++      if (entry === "subagent" || entry === "subagent.ts") continue;
++      const path = `${root}/${entry}`;
++      if (entry.endsWith(".ts")) {
++        found.push(path);
++        continue;
++      }
++      const indexPath = `${path}/index.ts`;
++      const hasIndex = yield* fs.exists(indexPath).pipe(Effect.orElseSucceed(() => false));
++      if (hasIndex) found.push(indexPath);
++    }
++  }
++  return found;
++});
++
+ export function piT3McpExtensionDestPath(cacheDir: string): string {
+   return `${cacheDir.replace(/\\/g, "/")}/${PI_T3_MCP_EXTENSION_FILENAME}`;
+ }
+@@ -121,6 +188,8 @@ export function buildPiRpcLaunch(input: {
+   readonly mcpSession: McpProviderSessionConfig | undefined;
+   readonly extensionPath: string | undefined;
+   readonly subagentExtensionPath?: string | undefined;
++  /** User extensions re-added around the `--no-extensions` subagent spawn. */
++  readonly discoveredExtensionPaths?: ReadonlyArray<string> | undefined;
+ }): {
+   readonly args: ReadonlyArray<string>;
+   readonly env: NodeJS.ProcessEnv;
+@@ -136,6 +205,9 @@ export function buildPiRpcLaunch(input: {
+       args.push("--no-extensions");
+     }
+     args = appendExtensionArg(args, input.subagentExtensionPath);
++    for (const discovered of input.discoveredExtensionPaths ?? []) {
++      args = appendExtensionArg(args, discovered);
++    }
+     args = [...args, ...stripConflictingPiSubagentExtensionArgs(userArgs)];
+   } else {
+     args = [...args, ...userArgs];
+@@ -158,6 +230,11 @@ export function buildPiRpcLaunch(input: {
+             [T3_MCP_BEARER_ENV]: bearerTokenFromAuthorizationHeader(
+               input.mcpSession.authorizationHeader,
+             ),
++            // The subagent override passes this through to child spawns so
++            // native children get the T3 tools too (env is inherited).
++            ...(input.extensionPath === undefined
++              ? {}
++              : { [T3_PI_MCP_EXTENSION_PATH_ENV]: input.extensionPath }),
+           }
+         : {}),
+     },
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts b/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts
+index 3b32dfd83..d2a2ae57f 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts
+@@ -231,6 +231,10 @@ async function runSingleAgent(
+     "--name",
+     \`t3-subagent \${agentName}\`,
+   ];
++  // Children inherit T3_MCP_URL / T3_MCP_BEARER_TOKEN from this process, so
++  // loading the same T3 MCP extension gives them delegate_task / t3_thread_*.
++  const t3McpExtension = process.env["T3_PI_MCP_EXTENSION_PATH"];
++  if (t3McpExtension) args.push("--extension", t3McpExtension);
+   const model = agent.model ?? defaults.model;
+   if (model) args.push("--model", model);
+   if (!agent.model && defaults.thinkingLevel) args.push("--thinking", defaults.thinkingLevel);
+-- 
+2.50.1 (Apple Git-155)
+

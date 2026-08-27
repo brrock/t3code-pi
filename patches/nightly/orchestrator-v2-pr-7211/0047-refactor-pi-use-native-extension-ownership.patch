@@ -1,0 +1,3141 @@
+From 07aceab345eed620ee35043d4fe05153b95d4f92 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 09:34:47 +0200
+Subject: [PATCH] refactor(pi): use native extension ownership
+
+---
+ .../Adapters/PiAdapterV2.test.ts              | 216 ++-----
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 583 ++++--------------
+ .../Adapters/piT3McpExtensionSource.ts        |   5 +-
+ .../Adapters/piT3McpInjection.test.ts         | 214 ++-----
+ .../Adapters/piT3McpInjection.ts              | 548 +++++-----------
+ .../Adapters/piT3SubagentExtensionSource.ts   | 556 -----------------
+ .../src/provider/Layers/PiProvider.test.ts    |  90 +++
+ apps/server/src/provider/Layers/PiProvider.ts |  99 ++-
+ .../src/textGeneration/PiTextGeneration.ts    |  31 +-
+ docs/internals/providers.md                   |  12 +-
+ .../orchestrator-mcp-server.md                |  20 +-
+ docs/user/providers-pi.md                     |  28 +-
+ 12 files changed, 588 insertions(+), 1814 deletions(-)
+ delete mode 100644 apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts
+ create mode 100644 apps/server/src/provider/Layers/PiProvider.test.ts
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 8e54c8510..6816a42a4 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -331,7 +331,7 @@ describe("PiAdapterV2", () => {
+       const extensions = spawn.args.flatMap((arg, index) =>
+         arg === "--extension" ? [spawn.args[index + 1]] : [],
+       );
+-      assert.isTrue(extensions.some((path) => path?.endsWith("pi-t3-subagent-extension.ts")));
++      assert.isFalse(spawn.args.includes("--no-extensions"));
+       assert.isTrue(extensions.some((path) => path?.endsWith("pi-t3-mcp-extension.ts")));
+       assert.equal(spawn.env.T3_MCP_URL, "http://127.0.0.1:43123/mcp");
+       assert.equal(spawn.env.T3_MCP_BEARER_TOKEN, "secret-pi-token");
+@@ -353,13 +353,7 @@ describe("PiAdapterV2", () => {
+       });
+       assert.equal(providerThread.nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
+       assert.equal(providerThread.driver, PI_PROVIDER);
+-      const spawn = fake.lastSpawn();
+-      assert.isTrue(
+-        spawn.args.some(
+-          (arg, index) =>
+-            arg === "--extension" && spawn.args[index + 1]?.endsWith("pi-t3-subagent-extension.ts"),
+-        ),
+-      );
++      assert.isFalse(fake.lastSpawn().args.includes("--no-extensions"));
+ 
+       yield* runtime.resumeThread({ providerThread });
+       const switchRequest = yield* fake.takeRequest("switch_session");
+@@ -587,6 +581,8 @@ describe("PiAdapterV2", () => {
+           assistantItem.turnItem.type === "assistant_message" &&
+           assistantItem.turnItem.text === "Hello",
+       );
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+       const usage = yield* takeEvent(
+         (event) =>
+           event.type === "provider_thread.updated" &&
+@@ -605,9 +601,6 @@ describe("PiAdapterV2", () => {
+           compactsAutomatically: true,
+         },
+       );
+-      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+-      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+-
+       // An acknowledged stats request can still omit usable window values.
+       // Keep the last good snapshot instead of making the meter disappear.
+       yield* startTurn(runtime, providerThread);
+@@ -845,7 +838,7 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
+-  it.effect("projects the subagent extension's tasks as native subagents", () =>
++  it.effect("observes official subagent results without inventing child threads", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+       const { runtime, takeEvent } = yield* openRuntime(fake);
+@@ -857,12 +850,6 @@ describe("PiAdapterV2", () => {
+       yield* startTurn(runtime, providerThread);
+       yield* fake.takeRequest("prompt");
+       yield* fake.emit({ type: "agent_start" });
+-      yield* fake.emit({
+-        type: "tool_execution_start",
+-        toolCallId: "call_sub",
+-        toolName: "subagent",
+-        args: { tasks: [{ agent: "scout", task: "map the repo" }] },
+-      });
+       yield* fake.emit({
+         type: "tool_execution_update",
+         toolCallId: "call_sub",
+@@ -870,49 +857,22 @@ describe("PiAdapterV2", () => {
+         partialResult: {
+           content: [{ type: "text", text: "(running...)" }],
+           details: {
+-            mode: "parallel",
++            mode: "single",
+             results: [
+               {
+                 agent: "scout",
+                 task: "map the repo",
+-                finished: false,
+                 exitCode: 0,
+-                stopReason: "toolUse",
+                 stderr: "",
+-                sessionFile: "/tmp/pi-children/scout.jsonl",
++                sessionFile: "/ignored/custom-extension-session.jsonl",
+                 messages: [
+                   { role: "assistant", content: [{ type: "text", text: "scanning files" }] },
+                 ],
+               },
+-              {
+-                agent: "worker",
+-                task: "broken task",
+-                finished: false,
+-                exitCode: -1,
+-                stderr: "",
+-                messages: [],
+-              },
+             ],
+           },
+         },
+       });
+-      const childThread = yield* takeEvent((event) => event.type === "app_thread.created");
+-      if (childThread.type !== "app_thread.created") {
+-        assert.fail("expected app_thread.created");
+-        return;
+-      }
+-      const childThreadId = childThread.appThread.id;
+-      const childProviderThread = yield* takeEvent(
+-        (event) =>
+-          event.type === "provider_thread.updated" &&
+-          event.providerThread.appThreadId === childThreadId,
+-      );
+-      assert.isTrue(
+-        childProviderThread.type === "provider_thread.updated" &&
+-          childProviderThread.providerThread.nativeThreadRef?.nativeId ===
+-            "/tmp/pi-children/scout.jsonl" &&
+-          childProviderThread.providerThread.providerSessionId === null,
+-      );
+       const running = yield* takeEvent(
+         (event) => event.type === "subagent.updated" && event.subagent.status === "running",
+       );
+@@ -921,14 +881,9 @@ describe("PiAdapterV2", () => {
+           running.subagent.title === "scout" &&
+           running.subagent.prompt === "map the repo" &&
+           running.subagent.progress === "scanning files" &&
+-          running.subagent.childThreadId === childThreadId,
+-      );
+-      const queuedSibling = yield* takeEvent(
+-        (event) => event.type === "subagent.updated" && event.subagent.title === "worker",
+-      );
+-      assert.isTrue(
+-        queuedSibling.type === "subagent.updated" && queuedSibling.subagent.status === "running",
++          running.subagent.childThreadId === null,
+       );
++
+       yield* fake.emit({
+         type: "tool_execution_end",
+         toolCallId: "call_sub",
+@@ -937,28 +892,18 @@ describe("PiAdapterV2", () => {
+         result: {
+           content: [{ type: "text", text: "done" }],
+           details: {
+-            mode: "parallel",
++            mode: "single",
+             results: [
+               {
+                 agent: "scout",
+                 task: "map the repo",
+-                finished: true,
+                 exitCode: 0,
+                 stopReason: "stop",
+                 stderr: "",
+-                sessionFile: "/tmp/pi-children/scout.jsonl",
+                 messages: [
+                   { role: "assistant", content: [{ type: "text", text: "repo has one file" }] },
+                 ],
+               },
+-              {
+-                agent: "worker",
+-                task: "broken task",
+-                finished: true,
+-                exitCode: 1,
+-                stderr: "boom",
+-                messages: [],
+-              },
+             ],
+           },
+         },
+@@ -969,10 +914,8 @@ describe("PiAdapterV2", () => {
+       assert.isTrue(
+         doneCard.type === "subagent.updated" &&
+           doneCard.subagent.result === "repo has one file" &&
+-          doneCard.subagent.childThreadId === childThreadId,
++          doneCard.subagent.childThreadId === null,
+       );
+-      // Completed turn_item is emitted immediately after the completed card;
+-      // waiting for the failed card first would consume it.
+       const subagentItem = yield* takeEvent(
+         (event) =>
+           event.type === "turn_item.updated" &&
+@@ -982,16 +925,7 @@ describe("PiAdapterV2", () => {
+       assert.isTrue(
+         subagentItem.type === "turn_item.updated" &&
+           subagentItem.turnItem.type === "subagent" &&
+-          subagentItem.turnItem.childThreadId === childThreadId,
+-      );
+-      const failedCard = yield* takeEvent(
+-        (event) => event.type === "subagent.updated" && event.subagent.status === "failed",
+-      );
+-      assert.isTrue(
+-        failedCard.type === "subagent.updated" &&
+-          failedCard.subagent.title === "worker" &&
+-          failedCard.subagent.result === "boom" &&
+-          failedCard.subagent.childThreadId === null,
++          subagentItem.turnItem.childThreadId === null,
+       );
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+@@ -1226,6 +1160,8 @@ describe("PiAdapterV2", () => {
+         contextUsage: { tokens: null, contextWindow: 200_000, percent: null },
+       });
+       yield* fake.emit({ type: "agent_settled" });
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+       const usage = yield* takeEvent(
+         (event) =>
+           event.type === "provider_thread.updated" &&
+@@ -1237,8 +1173,6 @@ describe("PiAdapterV2", () => {
+           : null,
+         3_400,
+       );
+-      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+-      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
+@@ -1317,7 +1251,7 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
+-  it.effect("projects setStatus as a keyed live row and closes it on settle", () =>
++  it.effect("shows bounded extension errors without failing the turn", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+       const { runtime, takeEvent } = yield* openRuntime(fake);
+@@ -1328,128 +1262,50 @@ describe("PiAdapterV2", () => {
+       });
+       yield* startTurn(runtime, providerThread);
+       yield* fake.takeRequest("prompt");
+-      yield* fake.emit({ type: "agent_start" });
+       yield* fake.emit({
+-        type: "extension_ui_request",
+-        id: "ui-s1",
+-        method: "setStatus",
+-        statusKey: "tps",
+-        statusText: "42 tok/s",
++        type: "extension_error",
++        extensionPath: "/home/user/.pi/agent/extensions/broken.ts",
++        event: "before_agent_start",
++        error: `bad extension ${"x".repeat(3_000)}`,
+       });
+-      const row = yield* takeEvent(
+-        (event) =>
+-          event.type === "turn_item.updated" &&
+-          event.turnItem.type === "dynamic_tool" &&
+-          event.turnItem.toolName === "status",
++      const errorItem = yield* takeEvent(
++        (event) => event.type === "turn_item.updated" && event.turnItem.type === "error",
+       );
+       assert.isTrue(
+-        row.type === "turn_item.updated" &&
+-          row.turnItem.type === "dynamic_tool" &&
+-          row.turnItem.status === "running" &&
+-          row.turnItem.nativeItemRef?.nativeId === `status:${row.turnItem.providerTurnId}:tps` &&
+-          (row.turnItem.input as { status?: string }).status === "42 tok/s",
+-      );
+-      yield* fake.emit({ type: "agent_settled" });
+-      const closed = yield* takeEvent(
+-        (event) =>
+-          event.type === "turn_item.updated" &&
+-          event.turnItem.type === "dynamic_tool" &&
+-          event.turnItem.toolName === "status" &&
+-          event.turnItem.status === "completed",
+-      );
+-      assert.equal(closed.type, "turn_item.updated");
+-    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+-  );
+-
+-  it.effect("refuses to open a subagent child session while its task is running", () =>
+-    Effect.gen(function* () {
+-      const fake = yield* makeFakePi;
+-      const { runtime, takeEvent } = yield* openRuntime(fake);
+-      const providerThread = yield* runtime.ensureThread({
+-        threadId: THREAD_ID,
+-        modelSelection: modelSelection("default"),
+-        runtimePolicy,
+-      });
+-      yield* startTurn(runtime, providerThread);
+-      yield* fake.takeRequest("prompt");
+-      yield* fake.emit({ type: "agent_start" });
+-      const childFile = "/fake/.pi/agent/sessions/children/child-1.jsonl";
+-      yield* fake.emit({
+-        type: "tool_execution_update",
+-        toolCallId: "call_child",
+-        toolName: "subagent",
+-        partialResult: {
+-          content: [{ type: "text", text: "(running...)" }],
+-          details: {
+-            mode: "single",
+-            results: [
+-              {
+-                agent: "worker",
+-                task: "long task",
+-                finished: false,
+-                exitCode: -1,
+-                stopReason: "toolUse",
+-                stderr: "",
+-                messages: [],
+-                sessionFile: childFile,
+-              },
+-            ],
+-          },
+-        },
+-      });
+-      yield* takeEvent(
+-        (event) => event.type === "subagent.updated" && event.subagent.status === "running",
++        errorItem.type === "turn_item.updated" &&
++          errorItem.turnItem.type === "error" &&
++          errorItem.turnItem.title === "broken" &&
++          errorItem.turnItem.failure.message.startsWith(
++            "broken failed during before_agent_start.\n\nbad extension",
++          ) &&
++          errorItem.turnItem.failure.message.length < 2_100,
+       );
+-      const childThread: OrchestrationV2ProviderThread = {
+-        ...providerThread,
+-        nativeThreadRef: { driver: PI_PROVIDER, nativeId: childFile, strength: "strong" },
+-      };
+-      const error = yield* runtime.resumeThread({ providerThread: childThread }).pipe(Effect.flip);
+-      assert.equal(error._tag, "ProviderAdapterResumeThreadError");
+-
+-      // A parent teardown releases every child lock, even when the tool never
+-      // emitted a final result (for example after provider transport loss).
+       yield* fake.emit({ type: "agent_settled" });
+-      yield* takeEvent((event) => event.type === "turn.terminal");
+-      fake.queueState({ sessionFile: childFile, sessionId: "child-1" });
+-      const resumed = yield* runtime.resumeThread({ providerThread: childThread });
+-      assert.equal(resumed.nativeThreadRef?.nativeId, childFile);
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
+-  it.effect("forks a thread by cloning pi's session and switching back", () =>
++  it.effect("advertises portable forks and rejects direct native fork calls", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
++      const adapter = yield* makeAdapter(fake);
++      const capabilities = yield* adapter.getCapabilities();
++      assert.isFalse(capabilities.threads.canForkThread);
+       const { runtime } = yield* openRuntime(fake);
+       const providerThread = yield* runtime.ensureThread({
+         threadId: THREAD_ID,
+         modelSelection: modelSelection("default"),
+         runtimePolicy,
+       });
+-      const cloneFile = "/fake/.pi/agent/sessions/--workspace--/0002_clone.jsonl";
+-      fake.queueState({ sessionFile: cloneFile, sessionId: "clone" });
+-      const forked = yield* runtime.forkThread({
+-        sourceProviderThread: providerThread,
+-        targetThreadId: ThreadId.make("thread-pi-fork-target"),
+-      });
+-      assert.equal(forked.nativeThreadRef?.nativeId, cloneFile);
+-      assert.isNull(forked.providerSessionId);
+-      yield* fake.takeRequest("clone");
+-      const switchBack = yield* fake.takeRequest("switch_session");
+-      assert.equal(switchBack["sessionPath"], FAKE_SESSION_FILE);
+-
+-      fake.queueState({
+-        sessionFile: "/fake/.pi/agent/sessions/--workspace--/0003_clone.jsonl",
+-        sessionId: "clone-2",
+-      });
+-      fake.vetoNextSwitch();
+       const error = yield* runtime
+         .forkThread({
+           sourceProviderThread: providerThread,
+-          targetThreadId: ThreadId.make("thread-pi-fork-vetoed"),
++          targetThreadId: ThreadId.make("thread-pi-fork-target"),
+         })
+         .pipe(Effect.flip);
+       assert.equal(error._tag, "ProviderAdapterForkThreadError");
++      assert.match(String(error.cause), /portable full-thread fork/);
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index 562995837..9baa05637 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -18,10 +18,9 @@
+  * Extension UI: Pi extensions raise dialogs through `extension_ui_request`.
+  * Dialog methods become v2 runtime requests (`confirm` → approval_request,
+  * `select`/`input`/`editor` → user_input_request); answers travel back as
+- * `extension_ui_response`. `notify` becomes a completed activity item;
+- * keyed `setStatus`/`setWidget` updates become live work-log rows. Remaining
+- * fire-and-forget surfaces such as `setTitle` are ignored until T3 has a
+- * matching surface.
++ * `extension_ui_response`. `notify` becomes a completed activity item.
++ * Terminal-only decoration such as status, widget, title, and editor-text
++ * updates has no matching T3 surface and is ignored.
+  */
+ import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+@@ -37,7 +36,6 @@ import {
+   type OrchestrationV2ProviderSession,
+   type OrchestrationV2ProviderThread,
+   type OrchestrationV2ProviderTurn,
+-  type ThreadId,
+   type OrchestrationV2RuntimeRequest,
+   type OrchestrationV2TurnItem,
+   type OrchestrationV2UserInputQuestion,
+@@ -95,11 +93,6 @@ import {
+ } from "../ProviderAdapterDriver.ts";
+ import { makeProviderFailure } from "../ProviderFailure.ts";
+ import { turnScopedSelectionTransition } from "../ProviderSelectionTransition.ts";
+-import {
+-  makeSubagentChildThread,
+-  makeSubagentConversationArtifacts,
+-  subagentThreadTitle,
+-} from "../SubagentProjection.ts";
+ import {
+   makePiRpcConnection,
+   parsePiModelSlug,
+@@ -111,9 +104,8 @@ import {
+ } from "./PiRpc.ts";
+ import {
+   buildPiRpcLaunch,
+-  discoverPiUserExtensions,
+   materializePiT3McpExtension,
+-  materializePiT3SubagentExtension,
++  resolvePiLaunchArgs,
+ } from "./piT3McpInjection.ts";
+ 
+ export const PI_PROVIDER = ProviderDriverKind.make("pi");
+@@ -145,9 +137,9 @@ export const PiProviderCapabilitiesV2 = {
+     canCreateEmptyThread: true,
+     canReadThreadSnapshot: true,
+     canRollbackThread: true,
+-    // Forks clone pi's active branch into a new session file. Fork-from-a-
+-    // specific-turn stays off until clone-then-rewind lands.
+-    canForkThread: true,
++    // T3's portable full-thread handoff matches Cursor and Grok without
++    // making this process clone a Pi session and switch back behind T3.
++    canForkThread: false,
+     canForkFromTurn: false,
+     canForkFromSubagentThread: false,
+     exposesNativeThreadId: true,
+@@ -196,11 +188,11 @@ export const PiProviderCapabilitiesV2 = {
+     planDeltasHaveItemIds: false,
+   },
+   subagents: {
+-    // Pi has no core subagents; the T3-owned `subagent` override persists a
+-    // session file per task so each child is a resumeable T3 thread. The
+-    // official tool is omitted because a second `subagent` registration aborts Pi.
++    // T3 delegation uses the shared MCP `delegate_task` path. Installed Pi
++    // subagent extensions are observed best-effort, but their official tool
++    // runs children with --no-session and exposes no resumable child id.
+     supportsSubagents: true,
+-    exposesSubagentThreadIds: true,
++    exposesSubagentThreadIds: false,
+     emitsSubagentLifecycle: true,
+     canWaitForSubagents: false,
+     canCloseSubagents: false,
+@@ -291,7 +283,6 @@ interface ActivePiTurn {
+    * tool keeps one start timestamp and reports a real duration.
+    */
+   readonly toolStartedAt: Map<string, DateTime.Utc>;
+-  readonly childSubagents: Map<string, PiChildSubagent>;
+   interrupted: boolean;
+   /**
+    * Whether any agent run activity was observed. Command-only prompts (pure
+@@ -300,27 +291,11 @@ interface ActivePiTurn {
+    * the turn instead.
+    */
+   sawAgentActivity: boolean;
+-  /**
+-   * Open keyed status/widget items from extension `setStatus`/`setWidget`
+-   * calls, by native item id. Updated in place as the extension re-keys
+-   * them; whatever is still open is completed when the turn settles.
+-   */
+-  readonly liveStatus: Map<string, { title: string; input: unknown }>;
+   /** Pi reports context as unknown immediately after compaction; keep its estimate for the meter. */
+   latestCompactionAfterTokens: number | null;
+   failure: ReturnType<typeof makeProviderFailure> | null;
+ }
+ 
+-interface PiChildSubagent {
+-  readonly nativeTaskId: string;
+-  readonly sessionFile: string;
+-  readonly childThreadId: ThreadId;
+-  readonly childProviderThreadId: OrchestrationV2ProviderThread["id"];
+-  readonly childRootNodeId: OrchestrationV2ExecutionNode["id"];
+-  emittedUserPrompt: boolean;
+-  emittedMessageCount: number;
+-}
+-
+ interface PendingPiPrompt {
+   readonly nativeRequestId: string;
+   readonly method: "select" | "confirm" | "input" | "editor";
+@@ -339,13 +314,6 @@ interface PiThreadState {
+ 
+ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2Shape {
+   const { idAllocator } = options;
+-  /**
+-   * Session files of subagent children whose task is still running, shared
+-   * across this instance's sessions. A send into such a child would open a
+-   * second pi process on a session file the child process is actively
+-   * writing; refuse it with a readable error until the task finishes.
+-   */
+-  const liveChildSessions = new Set<string>();
+ 
+   const protocolError = (detail: string, payload?: unknown) =>
+     new ProviderAdapterProtocolError({
+@@ -383,19 +351,19 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           : yield* provideCacheFs(
+               materializePiT3McpExtension(options.serverConfig.providerStatusCacheDir),
+             );
+-      const subagentExtensionPath = yield* provideCacheFs(
+-        materializePiT3SubagentExtension(options.serverConfig.providerStatusCacheDir),
+-      );
+-      const discoveredExtensionPaths = yield* provideCacheFs(
+-        discoverPiUserExtensions({ environment: options.environment, cwd }),
+-      );
++      const resolvedLaunchArgs = resolvePiLaunchArgs(options.settings.launchArgs);
++      if (!resolvedLaunchArgs.ok) {
++        return yield* new ProviderAdapterOpenSessionError({
++          driver: PI_PROVIDER,
++          providerSessionId: input.providerSessionId,
++          cause: new Error(resolvedLaunchArgs.message),
++        });
++      }
+       const launch = buildPiRpcLaunch({
+-        launchArgs: options.settings.launchArgs,
++        launchArgs: resolvedLaunchArgs.args,
+         environment: options.environment,
+         mcpSession,
+         extensionPath,
+-        subagentExtensionPath,
+-        discoveredExtensionPaths,
+       });
+       const connection: PiRpcConnection = yield* makePiRpcConnection({
+         command: options.settings.binaryPath || "pi",
+@@ -464,6 +432,8 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+        * dialog bookkeeping stays single-threaded. Cancelled on session close.
+        */
+       const outOfTurnDialogs: Array<PiRpcRecord> = [];
++      /** Extension failures raised during startup are attached to the next turn. */
++      const outOfTurnExtensionErrors: Array<PiRpcRecord> = [];
+       /**
+        * Leaf entry id of the pi session tree as of the last turn boundary.
+        * Turn-start user entries are located relative to it, giving each
+@@ -845,11 +815,10 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       });
+ 
+       /**
+-       * Project the T3-owned pi subagent override's per-task progress into
+-       * v2's native subagent surface. Each result may include `sessionFile`;
+-       * when present the adapter binds a resumeable child thread. Tolerant by
+-       * design: any other tool named `subagent` without the results shape is
+-       * ignored.
++       * Observe the result shape from Pi's official example subagent extension.
++       * The extension runs children with --no-session, so these entries are
++       * visible in T3's shared subagent UI without inventing a child thread.
++       * Unknown or changed result shapes stay ordinary dynamic tool output.
+        */
+       const emitSubagentTasks = Effect.fnUntraced(function* (
+         turn: ActivePiTurn,
+@@ -890,212 +859,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+                 ? "completed"
+                 : "running";
+           const outputText = piSubagentOutput(result);
+-          const title = agent;
+-          const sessionFile = recordString(result, "sessionFile");
+-          if (sessionFile !== undefined) {
+-            if (finished) liveChildSessions.delete(sessionFile);
+-            else liveChildSessions.add(sessionFile);
+-          }
+-          let child = turn.childSubagents.get(nativeTaskId);
+-          if (sessionFile !== undefined && child === undefined) {
+-            const childThreadId = idAllocator.derive.threadFromProviderThread({
+-              driver: PI_PROVIDER,
+-              nativeThreadId: sessionFile,
+-            });
+-            const childProviderThreadId = idAllocator.derive.providerThread({
+-              driver: PI_PROVIDER,
+-              nativeThreadId: sessionFile,
+-            });
+-            const childRootNodeId = idAllocator.derive.nodeFromProviderItem({
+-              driver: PI_PROVIDER,
+-              nativeItemId: `${nativeTaskId}:child-root`,
+-            });
+-            child = {
+-              nativeTaskId,
+-              sessionFile,
+-              childThreadId,
+-              childProviderThreadId,
+-              childRootNodeId,
+-              emittedUserPrompt: false,
+-              emittedMessageCount: 0,
+-            };
+-            turn.childSubagents.set(nativeTaskId, child);
+-            const childModelSelection = {
+-              ...turn.turnInput.modelSelection,
+-              model: recordString(result, "model") ?? turn.turnInput.modelSelection.model,
+-            };
+-            const childThread = makeSubagentChildThread({
+-              parentThread: turn.turnInput.appThread,
+-              childThreadId,
+-              parentNodeId,
+-              activeProviderThreadId: childProviderThreadId,
+-              providerInstanceId: options.instanceId,
+-              modelSelection: childModelSelection,
+-              title: subagentThreadTitle({
+-                parentTitle: turn.turnInput.appThread.title,
+-                title,
+-                prompt: task,
+-                ordinal: index + 1,
+-              }),
+-              now: emittedAt,
+-              createdBy: "agent",
+-              creationSource: "provider",
+-            });
+-            // Null session id so a later send allocates a fresh RPC. Pi cannot
+-            // host two threads on the parent process; resume uses switch_session
+-            // against nativeThreadRef on that new session.
+-            const childProviderThread: OrchestrationV2ProviderThread = {
+-              id: childProviderThreadId,
+-              driver: PI_PROVIDER,
+-              providerInstanceId: options.instanceId,
+-              providerSessionId: null,
+-              appThreadId: childThreadId,
+-              ownerNodeId: parentNodeId,
+-              nativeThreadRef: providerRef(sessionFile),
+-              nativeConversationHeadRef: null,
+-              status: "idle",
+-              firstRunOrdinal: null,
+-              lastRunOrdinal: null,
+-              handoffIds: [],
+-              forkedFrom: {
+-                providerThreadId: turn.turnInput.providerThread.id,
+-                providerTurnId: turn.providerTurn.id,
+-              },
+-              pendingBackgroundTasks: [],
+-              createdAt: emittedAt,
+-              updatedAt: emittedAt,
+-            };
+-            yield* emit({
+-              type: "app_thread.created",
+-              driver: PI_PROVIDER,
+-              appThread: childThread,
+-            });
+-            yield* emit({
+-              type: "provider_thread.updated",
+-              driver: PI_PROVIDER,
+-              providerThread: childProviderThread,
+-            });
+-            yield* emit({
+-              type: "node.updated",
+-              driver: PI_PROVIDER,
+-              node: {
+-                id: childRootNodeId,
+-                threadId: childThreadId,
+-                runId: null,
+-                parentNodeId: null,
+-                rootNodeId: childRootNodeId,
+-                kind: "root_turn",
+-                status: "running",
+-                countsForRun: false,
+-                providerThreadId: childProviderThreadId,
+-                providerTurnId: null,
+-                nativeItemRef: providerRef(sessionFile),
+-                runtimeRequestId: null,
+-                checkpointScopeId: null,
+-                startedAt,
+-                completedAt: null,
+-              },
+-            });
+-          }
+-          if (child !== undefined && !child.emittedUserPrompt) {
+-            child.emittedUserPrompt = true;
+-            const promptArtifacts = makeSubagentConversationArtifacts({
+-              messageId: idAllocator.derive.messageFromProviderItem({
+-                driver: PI_PROVIDER,
+-                nativeItemId: `${nativeTaskId}:prompt`,
+-              }),
+-              turnItemId: idAllocator.derive.turnItemFromProviderItem({
+-                driver: PI_PROVIDER,
+-                nativeItemId: `${nativeTaskId}:prompt`,
+-              }),
+-              threadId: child.childThreadId,
+-              rootNodeId: child.childRootNodeId,
+-              providerThreadId: child.childProviderThreadId,
+-              providerTurnId: null,
+-              nativeItemRef: providerRef(`${nativeTaskId}:prompt`),
+-              role: "user",
+-              text: task,
+-              ordinal: 100,
+-              now: emittedAt,
+-            });
+-            yield* emit({
+-              type: "message.updated",
+-              driver: PI_PROVIDER,
+-              message: promptArtifacts.message,
+-            });
+-            yield* emit({
+-              type: "turn_item.updated",
+-              driver: PI_PROVIDER,
+-              turnItem: promptArtifacts.turnItem,
+-            });
+-          }
+-          if (child !== undefined) {
+-            const messages = recordField(result, "messages");
+-            if (Array.isArray(messages)) {
+-              for (let messageIndex = child.emittedMessageCount; messageIndex < messages.length; ) {
+-                const message = messages[messageIndex];
+-                messageIndex += 1;
+-                child.emittedMessageCount = messageIndex;
+-                if (recordString(message, "role") !== "assistant") continue;
+-                const text = contentText(recordField(message, "content"));
+-                if (text.length === 0) continue;
+-                const nativeMessageId = `${nativeTaskId}:assistant:${messageIndex}`;
+-                const artifacts = makeSubagentConversationArtifacts({
+-                  messageId: idAllocator.derive.messageFromProviderItem({
+-                    driver: PI_PROVIDER,
+-                    nativeItemId: nativeMessageId,
+-                  }),
+-                  turnItemId: idAllocator.derive.turnItemFromProviderItem({
+-                    driver: PI_PROVIDER,
+-                    nativeItemId: nativeMessageId,
+-                  }),
+-                  threadId: child.childThreadId,
+-                  rootNodeId: child.childRootNodeId,
+-                  providerThreadId: child.childProviderThreadId,
+-                  providerTurnId: null,
+-                  nativeItemRef: providerRef(nativeMessageId),
+-                  role: "assistant",
+-                  text,
+-                  ordinal: 100 + messageIndex,
+-                  now: emittedAt,
+-                });
+-                yield* emit({
+-                  type: "message.updated",
+-                  driver: PI_PROVIDER,
+-                  message: artifacts.message,
+-                });
+-                yield* emit({
+-                  type: "turn_item.updated",
+-                  driver: PI_PROVIDER,
+-                  turnItem: artifacts.turnItem,
+-                });
+-              }
+-            }
+-            if (finished) {
+-              yield* emit({
+-                type: "node.updated",
+-                driver: PI_PROVIDER,
+-                node: {
+-                  id: child.childRootNodeId,
+-                  threadId: child.childThreadId,
+-                  runId: null,
+-                  parentNodeId: null,
+-                  rootNodeId: child.childRootNodeId,
+-                  kind: "root_turn",
+-                  status,
+-                  countsForRun: false,
+-                  providerThreadId: child.childProviderThreadId,
+-                  providerTurnId: null,
+-                  nativeItemRef: providerRef(child.sessionFile),
+-                  runtimeRequestId: null,
+-                  checkpointScopeId: null,
+-                  startedAt,
+-                  completedAt: emittedAt,
+-                },
+-              });
+-            }
+-          }
+-          const childThreadId = child?.childThreadId ?? null;
++          const progress =
++            !finished && outputText.length > 0 ? { progress: outputText.slice(0, 200) } : {};
++          const resultText = finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null;
+           yield* emit({
+             type: "subagent.updated",
+             driver: PI_PROVIDER,
+@@ -1109,16 +875,14 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               driver: PI_PROVIDER,
+               providerInstanceId: options.instanceId,
+               providerThreadId: turn.turnInput.providerThread.id,
+-              childThreadId,
++              childThreadId: null,
+               nativeTaskRef: providerRef(nativeTaskId),
+               prompt: task,
+-              title,
++              title: agent,
+               model: recordString(result, "model") ?? null,
+               status,
+-              ...(finished || outputText.length === 0
+-                ? {}
+-                : { progress: outputText.slice(0, 200) }),
+-              result: finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null,
++              ...progress,
++              result: resultText,
+               startedAt,
+               completedAt: finished ? emittedAt : null,
+               updatedAt: emittedAt,
+@@ -1130,58 +894,22 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             turnItem: {
+               ...baseItemFields(turn, nativeTaskId, startedAt, emittedAt),
+               status,
+-              title,
++              title: agent,
+               completedAt: finished ? emittedAt : null,
+               type: "subagent",
+               subagentId,
+               origin: "provider_native",
+               driver: PI_PROVIDER,
+               providerInstanceId: options.instanceId,
+-              childThreadId,
++              childThreadId: null,
+               prompt: task,
+-              ...(finished || outputText.length === 0
+-                ? {}
+-                : { progress: outputText.slice(0, 200) }),
+-              result: finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null,
++              ...progress,
++              result: resultText,
+             },
+           });
+         }
+       });
+ 
+-      /** One keyed status/widget row, updated in place while running. */
+-      const emitLiveStatusItem = Effect.fnUntraced(function* (
+-        turn: ActivePiTurn,
+-        nativeItemId: string,
+-        title: string,
+-        input: unknown,
+-        done: boolean,
+-      ) {
+-        const emittedAt = yield* DateTime.now;
+-        const startedAt = turn.toolStartedAt.get(nativeItemId) ?? emittedAt;
+-        turn.toolStartedAt.set(nativeItemId, startedAt);
+-        yield* emitItemNode(
+-          turn,
+-          nativeItemId,
+-          "system",
+-          done ? "completed" : "running",
+-          startedAt,
+-          done ? emittedAt : null,
+-        );
+-        yield* emit({
+-          type: "turn_item.updated",
+-          driver: PI_PROVIDER,
+-          turnItem: {
+-            ...baseItemFields(turn, nativeItemId, startedAt, emittedAt),
+-            status: done ? "completed" : "running",
+-            title,
+-            completedAt: done ? emittedAt : null,
+-            type: "dynamic_tool",
+-            toolName: nativeItemId.startsWith("status:") ? "status" : "widget",
+-            input,
+-          },
+-        });
+-      });
+-
+       // ── extension UI prompts ──────────────────────────────
+ 
+       const cancelPrompt = (pending: PendingPiPrompt, resolvedAt: DateTime.Utc) =>
+@@ -1260,47 +988,13 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           });
+           return;
+         }
+-        if (method === "setStatus" || method === "setWidget") {
+-          // Keyed live progress from extensions (e.g. a tps tracker). Each
+-          // key becomes one work-log item updated in place: running while
+-          // the extension keeps it set, completed when cleared or on settle.
+-          const state = threadState;
+-          const turn = state?.activeTurn ?? null;
+-          if (turn === null) return;
+-          const key =
+-            method === "setStatus"
+-              ? recordString(event, "statusKey")
+-              : recordString(event, "widgetKey");
+-          if (key === undefined) return;
+-          const nativeItemId = `${method === "setStatus" ? "status" : "widget"}:${turn.providerTurn.id}:${key}`;
+-          const statusText = recordString(event, "statusText");
+-          const widgetLines = Array.isArray(event["widgetLines"])
+-            ? event["widgetLines"].filter((line): line is string => typeof line === "string")
+-            : undefined;
+-          const cleared =
+-            method === "setStatus" ? statusText === undefined : widgetLines === undefined;
+-          const payload =
+-            method === "setStatus"
+-              ? { title: key, input: { status: statusText ?? "" } }
+-              : { title: key, input: { lines: widgetLines ?? [] } };
+-          if (cleared) {
+-            const open = turn.liveStatus.get(nativeItemId);
+-            if (open === undefined) return;
+-            turn.liveStatus.delete(nativeItemId);
+-            yield* emitLiveStatusItem(turn, nativeItemId, open.title, open.input, true);
+-            return;
+-          }
+-          turn.liveStatus.set(nativeItemId, payload);
+-          yield* emitLiveStatusItem(turn, nativeItemId, payload.title, payload.input, false);
+-          return;
+-        }
+         if (
+           method !== "select" &&
+           method !== "confirm" &&
+           method !== "input" &&
+           method !== "editor"
+         ) {
+-          // setTitle / set_editor_text have no matching T3 surface yet.
++          // Terminal decoration has no matching T3 surface.
+           yield* Effect.logDebug("Ignoring pi extension UI update.", { method });
+           return;
+         }
+@@ -1397,6 +1091,44 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         yield* emit({ type: "turn_item.updated", driver: PI_PROVIDER, turnItem });
+       });
+ 
++      const emitExtensionError = Effect.fnUntraced(function* (event: PiRpcRecord) {
++        const state = threadState;
++        const turn = state?.activeTurn ?? null;
++        if (turn === null) {
++          outOfTurnExtensionErrors.push(event);
++          return;
++        }
++        const emittedAt = yield* DateTime.now;
++        const nativeItemId = `extension-error:${turn.nextItemOrdinal}`;
++        const extensionName = piExtensionDisplayName(recordString(event, "extensionPath"));
++        const extensionEvent = recordString(event, "event");
++        const detail = recordString(event, "error")?.trim();
++        const message = [
++          `${extensionName} failed${extensionEvent === undefined ? "" : ` during ${extensionEvent}`}.`,
++          detail === undefined || detail.length === 0 ? undefined : detail.slice(0, 2_000),
++        ]
++          .filter((part): part is string => part !== undefined)
++          .join("\n\n");
++        const failure = makeProviderFailure({
++          message,
++          class: "provider_error",
++          retryable: false,
++        });
++        yield* emitItemNode(turn, nativeItemId, "system", "failed", emittedAt, emittedAt);
++        yield* emit({
++          type: "turn_item.updated",
++          driver: PI_PROVIDER,
++          turnItem: {
++            ...baseItemFields(turn, nativeItemId, emittedAt, emittedAt),
++            status: "failed",
++            title: extensionName,
++            completedAt: emittedAt,
++            type: "error",
++            failure,
++          },
++        });
++      });
++
+       // ── turn lifecycle ────────────────────────────────────
+ 
+       /**
+@@ -1444,11 +1176,15 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         };
+       });
+ 
+-      const releaseLiveChildSessions = (turn: ActivePiTurn): void => {
+-        for (const child of turn.childSubagents.values()) {
+-          liveChildSessions.delete(child.sessionFile);
+-        }
+-      };
++      const refreshContextUsageAfterTurn = (state: PiThreadState, turn: ActivePiTurn) =>
++        readContextUsage(turn).pipe(
++          Effect.flatMap((contextUsage) =>
++            contextUsage === undefined || threadState !== state
++              ? Effect.void
++              : updateProviderThread(state, { contextUsage }),
++          ),
++          Effect.forkIn(scope),
++        );
+ 
+       const finalizeTurn = Effect.fnUntraced(function* (
+         state: PiThreadState,
+@@ -1457,20 +1193,10 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         const turn = state.activeTurn;
+         if (turn === null) return;
+         state.activeTurn = null;
+-        releaseLiveChildSessions(turn);
+         const completedAt = yield* DateTime.now;
+         yield* completeOpenStreamItems(turn);
+         yield* cancelPendingPrompts(completedAt);
+-        // Close any status/widget rows the extension left open.
+-        yield* Effect.forEach(
+-          Array.from(turn.liveStatus.entries()),
+-          ([nativeItemId, open]) =>
+-            emitLiveStatusItem(turn, nativeItemId, open.title, open.input, true),
+-          { discard: true },
+-        );
+-        turn.liveStatus.clear();
+         const treeRefs = yield* captureTurnTreeRefs();
+-        const contextUsage = refreshContextUsage ? yield* readContextUsage(turn) : undefined;
+         const failure = turn.interrupted ? null : turn.failure;
+         yield* emit({
+           type: "provider_turn.updated",
+@@ -1490,7 +1216,6 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           ...(treeRefs?.leafId == null
+             ? {}
+             : { nativeConversationHeadRef: providerRef(treeRefs.leafId) }),
+-          ...(contextUsage === undefined ? {} : { contextUsage }),
+         });
+         yield* updateProviderSession(failure !== null ? "error" : "ready");
+         if (failure !== null) {
+@@ -1518,18 +1243,21 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             failure,
+             threadDisposition: "reusable",
+           });
+-          return;
++        } else {
++          yield* emit({
++            type: "turn.terminal",
++            driver: PI_PROVIDER,
++            providerThreadId: state.providerThread.id,
++            providerTurnId: turn.providerTurn.id,
++            runOrdinal: turn.turnInput.runOrdinal,
++            status: turn.interrupted ? "interrupted" : "completed",
++            failure: null,
++            threadDisposition: "reusable",
++          });
+         }
+-        yield* emit({
+-          type: "turn.terminal",
+-          driver: PI_PROVIDER,
+-          providerThreadId: state.providerThread.id,
+-          providerTurnId: turn.providerTurn.id,
+-          runOrdinal: turn.turnInput.runOrdinal,
+-          status: turn.interrupted ? "interrupted" : "completed",
+-          failure: null,
+-          threadDisposition: "reusable",
+-        });
++        // Session statistics are optional telemetry. Terminalize first, then
++        // refresh the shared context meter without delaying the visible turn.
++        if (refreshContextUsage) yield* refreshContextUsageAfterTurn(state, turn);
+       });
+ 
+       // ── event pump ────────────────────────────────────────
+@@ -1682,13 +1410,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             yield* handleExtensionUiRequest(event);
+             return;
+           case "extension_error": {
+-            // Length only: extension errors are unbounded remote output and
+-            // can carry prompt text or credentials.
+-            yield* Effect.logWarning("Pi extension error.", {
+-              extensionPath: recordString(event, "extensionPath"),
+-              event: recordString(event, "event"),
+-              errorLength: recordString(event, "error")?.length,
+-            });
++            yield* emitExtensionError(event);
+             return;
+           }
+           case "agent_settled": {
+@@ -1759,6 +1481,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             for (const dialog of outOfTurnDialogs.splice(0)) {
+               yield* handleExtensionUiRequest(dialog);
+             }
++            for (const extensionError of outOfTurnExtensionErrors.splice(0)) {
++              yield* emitExtensionError(extensionError);
++            }
+             return;
+           }
+           case "t3.settle_probe": {
+@@ -1845,11 +1570,6 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         }
+         const existing = threadInput.existingProviderThread;
+         if (existing?.nativeThreadRef?.nativeId != null) {
+-          if (liveChildSessions.has(existing.nativeThreadRef.nativeId)) {
+-            return yield* protocolError(
+-              "This subagent is still running. Wait for it to finish before sending messages to its thread.",
+-            );
+-          }
+           const switchData = yield* request({
+             type: "switch_session",
+             sessionPath: existing.nativeThreadRef.nativeId,
+@@ -2043,12 +1763,6 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+ 
+       // Buffered dialogs must not strand their extensions when the session
+       // closes before another turn ever starts.
+-      yield* Effect.addFinalizer(() =>
+-        Effect.sync(() => {
+-          const turn = threadState?.activeTurn;
+-          if (turn !== null && turn !== undefined) releaseLiveChildSessions(turn);
+-        }),
+-      );
+       yield* Effect.addFinalizer(() =>
+         Effect.forEach(
+           outOfTurnDialogs,
+@@ -2164,10 +1878,8 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               streamItems: new Map(),
+               toolArgs: new Map(),
+               toolStartedAt: new Map(),
+-              childSubagents: new Map(),
+               interrupted: false,
+               sawAgentActivity: false,
+-              liveStatus: new Map(),
+               latestCompactionAfterTokens: null,
+               failure: null,
+             };
+@@ -2203,7 +1915,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             // Attach any dialogs that arrived before this turn existed
+             // (project trust, session-start login prompts). The flush runs
+             // inside the event pump, behind everything pi already emitted.
+-            if (outOfTurnDialogs.length > 0) {
++            if (outOfTurnDialogs.length > 0 || outOfTurnExtensionErrors.length > 0) {
+               yield* Queue.offer(connection.events, { type: "t3.flush_dialogs" });
+             }
+             // Pi acks `prompt` only after slash-command expansion completes,
+@@ -2463,82 +2175,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             ),
+           ),
+         forkThread: (forkInput) =>
+-          Effect.gen(function* () {
+-            const state = threadState;
+-            if (state === null || state.activeTurn !== null) {
+-              return yield* protocolError(
+-                "Pi can only fork an idle thread; wait for the current run to finish.",
+-              );
+-            }
+-            if (forkInput.providerTurnId !== undefined) {
+-              return yield* protocolError("Pi cannot fork from a specific earlier turn yet");
+-            }
+-            const sourceNativeId = forkInput.sourceProviderThread.nativeThreadRef?.nativeId;
+-            if (sourceNativeId == null) {
+-              return yield* protocolError("Pi fork source has no native session file");
+-            }
+-            if (state.providerThread.nativeThreadRef?.nativeId !== sourceNativeId) {
+-              return yield* protocolError(
+-                "Pi fork requested for a thread this session does not host",
+-              );
+-            }
+-            // `clone` duplicates the active branch into a new session file
+-            // and moves this process onto it; capture the clone's identity,
+-            // then switch back so this runtime keeps serving the source.
+-            const cloneData = yield* request({ type: "clone" });
+-            if (recordField(cloneData, "cancelled") === true) {
+-              return yield* protocolError("A Pi extension cancelled the session clone");
+-            }
+-            const cloneState = yield* request({ type: "get_state" }).pipe(
+-              Effect.tapError(() => connection.terminate),
+-            );
+-            const cloneNativeId =
+-              recordString(cloneState, "sessionFile") ?? recordString(cloneState, "sessionId");
+-            if (cloneNativeId === undefined || cloneNativeId === sourceNativeId) {
+-              yield* connection.terminate;
+-              return yield* protocolError("Pi clone did not produce a new session", cloneState);
+-            }
+-            const switchData = yield* request({
+-              type: "switch_session",
+-              sessionPath: sourceNativeId,
+-            }).pipe(Effect.tapError(() => connection.terminate));
+-            if (recordField(switchData, "cancelled") === true) {
+-              yield* connection.terminate;
+-              return yield* protocolError("A Pi extension cancelled the session switch");
+-            }
+-            const createdAt = yield* DateTime.now;
+-            return {
+-              id: idAllocator.derive.providerThread({
+-                driver: PI_PROVIDER,
+-                nativeThreadId: cloneNativeId,
+-              }),
++          Effect.fail(
++            new ProviderAdapterForkThreadError({
+               driver: PI_PROVIDER,
+-              providerInstanceId: options.instanceId,
+-              // Null so the fork's first send opens its own pi process.
+-              providerSessionId: null,
+-              appThreadId: forkInput.targetThreadId,
+-              ownerNodeId: forkInput.ownerNodeId ?? null,
+-              nativeThreadRef: providerRef(cloneNativeId),
+-              nativeConversationHeadRef: null,
+-              status: "idle",
+-              firstRunOrdinal: null,
+-              lastRunOrdinal: null,
+-              handoffIds: [],
+-              forkedFrom: { providerThreadId: forkInput.sourceProviderThread.id },
+-              pendingBackgroundTasks: [],
+-              createdAt,
+-              updatedAt: createdAt,
+-            } satisfies OrchestrationV2ProviderThread;
+-          }).pipe(
+-            sessionEventPermit.withPermits(1),
+-            Effect.mapError(
+-              (cause) =>
+-                new ProviderAdapterForkThreadError({
+-                  driver: PI_PROVIDER,
+-                  providerThreadId: forkInput.sourceProviderThread.id,
+-                  cause,
+-                }),
+-            ),
++              providerThreadId: forkInput.sourceProviderThread.id,
++              cause: "Pi threads use T3 Code's portable full-thread fork.",
++            }),
+           ),
+       };
+       return runtime;
+@@ -2597,6 +2239,13 @@ function piSubagentOutput(result: unknown): string {
+   return "";
+ }
+ 
++function piExtensionDisplayName(extensionPath: string | undefined): string {
++  if (extensionPath === undefined) return "Pi extension";
++  const normalized = extensionPath.replace(/\\/g, "/").replace(/\/+$/, "");
++  const name = normalized.slice(normalized.lastIndexOf("/") + 1).replace(/\.[^.]+$/, "");
++  return name.length === 0 ? "Pi extension" : name;
++}
++
+ function piThreadSnapshot(
+   providerThread: OrchestrationV2ProviderThread,
+ ): ProviderAdapterV2ThreadSnapshot {
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpExtensionSource.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpExtensionSource.ts
+index 4a18e1967..3d46ec98b 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpExtensionSource.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpExtensionSource.ts
+@@ -200,14 +200,15 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
+       const tools = await client.listTools(signal);
+       for (const tool of tools) {
+         const name = tool.name;
++        const registeredName = \`mcp__t3-code__\${name}\`;
+         const description = tool.description ?? name;
+         pi.registerTool({
+-          name,
++          name: registeredName,
+           label: name,
+           description,
+           promptSnippet: description.split("\\n")[0] ?? name,
+           promptGuidelines: [
+-            \`Use \${name} from the t3-code MCP server when the user asks for T3 orchestration that this tool covers.\`,
++            \`Use \${registeredName} from the t3-code MCP server when the user asks for T3 orchestration that this tool covers.\`,
+           ],
+           parameters: jsonSchemaToTypebox(tool.inputSchema),
+           async execute(_toolCallId, params, signal) {
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+index b153c98a5..194a72d3c 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+@@ -1,5 +1,5 @@
+-import { assert, describe, it } from "@effect/vitest";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, describe, it } from "@effect/vitest";
+ import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+@@ -9,16 +9,10 @@ import {
+   T3_MCP_BEARER_ENV,
+   T3_MCP_URL_ENV,
+ } from "./piT3McpExtensionSource.ts";
+-import {
+-  PI_T3_SUBAGENT_EXTENSION_FILENAME,
+-  T3_PI_CHILD_SESSION_ROOT_ENV,
+-} from "./piT3SubagentExtensionSource.ts";
+ import {
+   buildPiRpcLaunch,
+-  discoverPiUserExtensions,
+-  T3_PI_MCP_EXTENSION_PATH_ENV,
+   materializePiT3McpExtension,
+-  materializePiT3SubagentExtension,
++  resolvePiLaunchArgs,
+ } from "./piT3McpInjection.ts";
+ 
+ const threadId = ThreadId.make("thread-pi-t3-mcp");
+@@ -34,9 +28,9 @@ const mcpSession = {
+ };
+ 
+ describe("pi T3 MCP injection", () => {
+-  it("leaves spawn args unchanged when no MCP session exists", () => {
++  it("keeps native extension discovery when no MCP session exists", () => {
+     const launch = buildPiRpcLaunch({
+-      launchArgs: "--session-dir /tmp/pi-sessions",
++      launchArgs: ["--session-dir", "/tmp/pi-sessions"],
+       environment: { PATH: "/usr/bin" },
+       mcpSession: undefined,
+       extensionPath: "/tmp/pi-t3-mcp-extension.ts",
+@@ -47,22 +41,21 @@ describe("pi T3 MCP injection", () => {
+     assert.isUndefined(launch.env[T3_MCP_URL_ENV]);
+   });
+ 
+-  it("builds one deduplicated extension launch with scoped T3 credentials", () => {
++  it("adds only the namespaced T3 MCP bridge to the native Pi launch", () => {
+     const launch = buildPiRpcLaunch({
+-      launchArgs:
+-        "--session-dir /tmp/pi-sessions --extension /opt/pi/examples/extensions/subagent/index.ts --extension /tmp/cache/pi-t3-subagent-extension.ts --extension /home/user/.pi/agent/extensions/demo.ts",
++      launchArgs: [
++        "--extension",
++        "/home/user/.pi/agent/extensions/demo.ts",
++        "--session-dir",
++        "/tmp/pi-sessions",
++      ],
+       environment: { PATH: "/usr/bin" },
+       mcpSession,
+       extensionPath: "/tmp/cache/pi-t3-mcp-extension.ts",
+-      subagentExtensionPath: "/tmp/cache/pi-t3-subagent-extension.ts",
+-      discoveredExtensionPaths: ["/home/user/.pi/agent/extensions/demo.ts"],
+     });
+     assert.deepEqual(launch.args, [
+       "--mode",
+       "rpc",
+-      "--no-extensions",
+-      "--extension",
+-      "/tmp/cache/pi-t3-subagent-extension.ts",
+       "--extension",
+       "/home/user/.pi/agent/extensions/demo.ts",
+       "--session-dir",
+@@ -70,166 +63,61 @@ describe("pi T3 MCP injection", () => {
+       "--extension",
+       "/tmp/cache/pi-t3-mcp-extension.ts",
+     ]);
+-    assert.equal(launch.env[T3_PI_CHILD_SESSION_ROOT_ENV], "/tmp/pi-sessions/children");
++    assert.notInclude(launch.args, "--no-extensions");
+     assert.equal(launch.env[T3_MCP_URL_ENV], "http://127.0.0.1:43123/mcp");
+     assert.equal(launch.env[T3_MCP_BEARER_ENV], "secret-pi-token");
+-    assert.equal(launch.env[T3_PI_MCP_EXTENSION_PATH_ENV], "/tmp/cache/pi-t3-mcp-extension.ts");
+-    assert.equal(
+-      launch.args.filter((arg) => arg === "/tmp/cache/pi-t3-subagent-extension.ts").length,
+-      1,
++  });
++
++  it("does not register the same explicit T3 bridge twice", () => {
++    const launch = buildPiRpcLaunch({
++      launchArgs: ["-e", "/tmp/cache/pi-t3-mcp-extension.ts"],
++      environment: {},
++      mcpSession,
++      extensionPath: "/tmp/cache/pi-t3-mcp-extension.ts",
++    });
++    assert.deepEqual(launch.args, ["--mode", "rpc", "-e", "/tmp/cache/pi-t3-mcp-extension.ts"]);
++  });
++
++  it("accepts customization flags and rejects T3-owned execution flags", () => {
++    assert.deepEqual(
++      resolvePiLaunchArgs(
++        "--session-dir /tmp/pi --extension ./demo.ts --provider anthropic --offline --custom-flag value",
++      ),
++      {
++        ok: true,
++        args: [
++          "--session-dir",
++          "/tmp/pi",
++          "--extension",
++          "./demo.ts",
++          "--provider",
++          "anthropic",
++          "--offline",
++          "--custom-flag",
++          "value",
++        ],
++      },
+     );
++    assert.deepInclude(resolvePiLaunchArgs("--mode text"), {
++      ok: false,
++      message: "Pi launch argument '--mode' is controlled by T3 Code and cannot be overridden.",
++    });
++    assert.deepInclude(resolvePiLaunchArgs("--session old.jsonl"), { ok: false });
++    assert.deepInclude(resolvePiLaunchArgs("prompt pi immediately"), { ok: false });
+   });
+ 
+-  it.effect("materializes both runtime extensions", () =>
++  it.effect("materializes the MCP bridge with namespaced tool registration", () =>
+     Effect.gen(function* () {
+       const fs = yield* FileSystem.FileSystem;
+       const cacheDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-extensions-" });
+       const mcpDest = yield* materializePiT3McpExtension(cacheDir);
+-      const subagentDest = yield* materializePiT3SubagentExtension(cacheDir);
+       assert.isTrue(mcpDest.endsWith(PI_T3_MCP_EXTENSION_FILENAME));
+-      assert.isTrue(subagentDest.endsWith(PI_T3_SUBAGENT_EXTENSION_FILENAME));
+       const mcpSource = yield* fs.readFileString(mcpDest);
+-      const subagentSource = yield* fs.readFileString(subagentDest);
+       assert.include(mcpSource, "export default async function t3McpExtension");
+-      // Orchestration guidance rides the system-prompt hook, not the user
+-      // message, so first-turn slash commands still expand.
+       assert.include(mcpSource, "before_agent_start");
+       assert.include(mcpSource, '"mcp-protocol-version"');
+       assert.include(mcpSource, '"tools/call"');
+-      assert.include(subagentSource, "export default function t3SubagentExtension");
+-      assert.include(subagentSource, "--session");
+-      assert.include(subagentSource, T3_PI_CHILD_SESSION_ROOT_ENV);
+-      // Children re-attach the T3 MCP extension so t3_thread_* tools survive
+-      // the nested spawn (T3_MCP_* env is inherited from the parent).
+-      assert.include(subagentSource, T3_PI_MCP_EXTENSION_PATH_ENV);
+-      assert.isFalse(subagentSource.includes("--no-session"));
+-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+-  );
+-
+-  it.effect("discovers user and npm package extensions while skipping subagent overrides", () =>
+-    Effect.gen(function* () {
+-      const fs = yield* FileSystem.FileSystem;
+-      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-home-" });
+-      const extensionsDir = `${home}/.pi/agent/extensions`;
+-      const lensDir = `${home}/.pi/agent/npm/node_modules/pi-lens`;
+-      const authDir = `${home}/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth`;
+-      const filteredDir = `${home}/.pi/agent/npm/node_modules/filtered-extension`;
+-      const packageSubagentDir = `${home}/.pi/agent/npm/node_modules/pi-subagents`;
+-      yield* fs.makeDirectory(`${extensionsDir}/todos`, { recursive: true });
+-      yield* fs.makeDirectory(`${extensionsDir}/subagent`, { recursive: true });
+-      yield* fs.makeDirectory(`${lensDir}/src`, { recursive: true });
+-      yield* fs.makeDirectory(`${authDir}/src`, { recursive: true });
+-      yield* fs.makeDirectory(`${filteredDir}/src`, { recursive: true });
+-      yield* fs.makeDirectory(packageSubagentDir, { recursive: true });
+-      yield* fs.writeFileString(`${extensionsDir}/demo.ts`, "export default () => {}");
+-      // Dot entries (macOS AppleDouble sidecars) parse-fail as explicit
+-      // `--extension` paths and abort the pi spawn; discovery must skip them.
+-      yield* fs.writeFileString(`${extensionsDir}/._demo.ts`, "junk");
+-      yield* fs.makeDirectory(`${extensionsDir}/.hidden`, { recursive: true });
+-      yield* fs.writeFileString(`${extensionsDir}/.hidden/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${extensionsDir}/subagent.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${extensionsDir}/subagent.js`, "export default () => {}");
+-      yield* fs.writeFileString(`${extensionsDir}/todos/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${extensionsDir}/subagent/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${lensDir}/src/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${authDir}/src/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${filteredDir}/src/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${filteredDir}/src/legacy.ts`, "export default () => {}");
+-      yield* fs.writeFileString(`${packageSubagentDir}/index.ts`, "export default () => {}");
+-      yield* fs.writeFileString(
+-        `${lensDir}/package.json`,
+-        '{ "pi": { "extensions": ["./src/index.ts"] } }',
+-      );
+-      yield* fs.writeFileString(
+-        `${authDir}/package.json`,
+-        '{ "pi": { "extensions": ["./src/index.ts"] } }',
+-      );
+-      yield* fs.writeFileString(
+-        `${filteredDir}/package.json`,
+-        '{ "pi": { "extensions": ["./src/index.ts", "./src/legacy.ts"] } }',
+-      );
+-      yield* fs.writeFileString(
+-        `${packageSubagentDir}/package.json`,
+-        '{ "pi": { "extensions": ["./index.ts"] } }',
+-      );
+-      yield* fs.writeFileString(
+-        `${home}/.pi/agent/settings.json`,
+-        `{ "packages": [
+-          "npm:pi-lens",
+-          "npm:@gotgenes/pi-anthropic-auth@1.2.3",
+-          { "source": "npm:filtered-extension", "extensions": ["./src/index.ts"] },
+-          "npm:pi-subagents",
+-          { "source": "npm:disabled-extension", "extensions": [] }
+-        ] }`,
+-      );
+-      const found = yield* discoverPiUserExtensions({
+-        environment: { HOME: home },
+-        cwd: undefined,
+-      });
+-      assert.deepEqual(found, [
+-        `${extensionsDir}/demo.ts`,
+-        `${extensionsDir}/todos/index.ts`,
+-        `${lensDir}/src/index.ts`,
+-        `${authDir}/src/index.ts`,
+-        `${filteredDir}/src/index.ts`,
+-      ]);
+-      yield* fs.writeFileString(
+-        `${home}/.pi/agent/settings.json`,
+-        `{ "packages": [
+-          { "source": "npm:filtered-extension", "autoload": false, "extensions": ["./src/index.ts"] }
+-        ] }`,
+-      );
+-      const autoloadDisabled = yield* discoverPiUserExtensions({
+-        environment: { HOME: home },
+-        cwd: undefined,
+-      });
+-      assert.deepEqual(autoloadDisabled, [
+-        `${extensionsDir}/demo.ts`,
+-        `${extensionsDir}/todos/index.ts`,
+-        `${filteredDir}/src/index.ts`,
+-      ]);
+-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+-  );
+-
+-  it.effect("includes project extensions only under standing project trust", () =>
+-    Effect.gen(function* () {
+-      const fs = yield* FileSystem.FileSystem;
+-      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-home-" });
+-      const parent = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-parent-" });
+-      const project = `${parent}/project`;
+-      yield* fs.makeDirectory(`${home}/.pi/agent`, { recursive: true });
+-      yield* fs.makeDirectory(`${project}/.pi/extensions`, { recursive: true });
+-      yield* fs.writeFileString(`${project}/.pi/extensions/local.ts`, "export default () => {}");
+-      const untrusted = yield* discoverPiUserExtensions({
+-        environment: { HOME: home },
+-        cwd: project,
+-      });
+-      assert.deepEqual(untrusted, []);
+-      yield* fs.writeFileString(`${home}/.pi/agent/trust.json`, `{ "${parent}": true }`);
+-      const trustedViaAncestor = yield* discoverPiUserExtensions({
+-        environment: { HOME: home },
+-        cwd: project,
+-      });
+-      assert.deepEqual(trustedViaAncestor, [`${project}/.pi/extensions/local.ts`]);
+-      yield* fs.writeFileString(
+-        `${home}/.pi/agent/settings.json`,
+-        '{ "defaultProjectTrust": "always" }',
+-      );
+-      yield* fs.writeFileString(
+-        `${home}/.pi/agent/trust.json`,
+-        `{ "${parent}": true, "${project}": false }`,
+-      );
+-      const explicitlyUntrusted = yield* discoverPiUserExtensions({
+-        environment: { HOME: home },
+-        cwd: project,
+-      });
+-      assert.deepEqual(explicitlyUntrusted, []);
+-      yield* fs.writeFileString(`${home}/.pi/agent/trust.json`, "{}");
+-      const trustedByDefault = yield* discoverPiUserExtensions({
+-        environment: { HOME: home },
+-        cwd: project,
+-      });
+-      assert.deepEqual(trustedByDefault, [`${project}/.pi/extensions/local.ts`]);
++      assert.include(mcpSource, "mcp__t3-code__");
+     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+   );
+ });
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+index 619aedd19..0efedd85c 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+@@ -1,8 +1,6 @@
++import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+-import * as Option from "effect/Option";
+-import * as Schema from "effect/Schema";
+-import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+ 
+ import type { McpProviderSessionConfig } from "../../mcp/McpProviderSession.ts";
+ import {
+@@ -11,320 +9,163 @@ import {
+   T3_MCP_BEARER_ENV,
+   T3_MCP_URL_ENV,
+ } from "./piT3McpExtensionSource.ts";
+-import {
+-  PI_T3_SUBAGENT_EXTENSION_FILENAME,
+-  PI_T3_SUBAGENT_EXTENSION_SOURCE,
+-  T3_PI_CHILD_SESSION_ROOT_ENV,
+-} from "./piT3SubagentExtensionSource.ts";
+-
+-export {
+-  PI_T3_MCP_EXTENSION_FILENAME,
+-  PI_T3_SUBAGENT_EXTENSION_FILENAME,
+-  T3_MCP_BEARER_ENV,
+-  T3_MCP_URL_ENV,
+-  T3_PI_CHILD_SESSION_ROOT_ENV,
+-};
+ 
+-/** Env var telling the T3 subagent override where the MCP extension lives. */
+-export const T3_PI_MCP_EXTENSION_PATH_ENV = "T3_PI_MCP_EXTENSION_PATH";
+-
+-function bearerTokenFromAuthorizationHeader(header: string): string {
+-  return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : header;
+-}
+-
+-const PiPackageSource = Schema.Union([
+-  Schema.String,
+-  Schema.Struct({
+-    source: Schema.String,
+-    autoload: Schema.optional(Schema.Boolean),
+-    extensions: Schema.optional(Schema.Array(Schema.String)),
+-  }),
++export { PI_T3_MCP_EXTENSION_FILENAME, T3_MCP_BEARER_ENV, T3_MCP_URL_ENV };
++
++const RESERVED_PI_LAUNCH_ARGUMENTS = new Set([
++  "--continue",
++  "-c",
++  "--export",
++  "--fork",
++  "--help",
++  "-h",
++  "--list-models",
++  "--mode",
++  "--no-session",
++  "--print",
++  "-p",
++  "--resume",
++  "-r",
++  "--session",
++  "--session-id",
++  "--version",
++  "-v",
+ ]);
+ 
+-const PiSettingsFile = Schema.Struct({
+-  defaultProjectTrust: Schema.optional(Schema.String),
+-  packages: Schema.optional(Schema.Array(PiPackageSource)),
+-});
+-
+-const PiPackageJson = Schema.Struct({
+-  pi: Schema.optional(
+-    Schema.Struct({
+-      extensions: Schema.optional(Schema.Array(Schema.String)),
+-    }),
+-  ),
+-});
+-
+-const PiTrustStore = Schema.Record(Schema.String, Schema.NullOr(Schema.Boolean));
++const PI_ARGUMENTS_WITH_VALUES = new Set([
++  "--api-key",
++  "--append-system-prompt",
++  "--exclude-tools",
++  "-xt",
++  "--extension",
++  "-e",
++  "--model",
++  "--models",
++  "--name",
++  "-n",
++  "--prompt-template",
++  "--provider",
++  "--session-dir",
++  "--skill",
++  "--system-prompt",
++  "--theme",
++  "--thinking",
++  "--tools",
++  "-t",
++  "--tui-mode",
++  "--use-theme",
++]);
+ 
+-const decodePiSettings = Schema.decodeUnknownOption(Schema.fromJsonString(PiSettingsFile));
+-const decodePiPackageJson = Schema.decodeUnknownOption(Schema.fromJsonString(PiPackageJson));
+-const decodePiTrustStore = Schema.decodeUnknownOption(Schema.fromJsonString(PiTrustStore));
++const PI_ARGUMENTS_WITHOUT_VALUES = new Set([
++  "--approve",
++  "-a",
++  "--no-approve",
++  "-na",
++  "--no-builtin-tools",
++  "-nbt",
++  "--no-context-files",
++  "-nc",
++  "--no-extensions",
++  "-ne",
++  "--no-prompt-templates",
++  "-np",
++  "--no-skills",
++  "-ns",
++  "--no-themes",
++  "--no-tools",
++  "-nt",
++  "--offline",
++  "--verbose",
++]);
+ 
+-function normalizePiTrustPath(value: string): string {
+-  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+-  if (normalized.length === 0) return "/";
+-  return /^[A-Za-z]:$/.test(normalized) ? `${normalized}/` : normalized;
+-}
++export type PiLaunchArgsResolution =
++  | { readonly ok: true; readonly args: ReadonlyArray<string> }
++  | { readonly ok: false; readonly message: string };
+ 
+-function piTrustParentPath(value: string): string | undefined {
+-  if (value === "/" || /^[A-Za-z]:\/$/.test(value)) return undefined;
+-  const uncRoot = value.match(/^\/\/[^/]+\/[^/]+/)?.[0];
+-  if (uncRoot === value) return undefined;
+-  const separatorIndex = value.lastIndexOf("/");
+-  if (separatorIndex < 0) return undefined;
+-  const parent = separatorIndex === 0 ? "/" : value.slice(0, separatorIndex);
+-  return uncRoot !== undefined && parent.length < uncRoot.length
+-    ? uncRoot
+-    : normalizePiTrustPath(parent);
+-}
+-
+-/** Mirrors Pi's canonical nearest-ancestor lookup over `trust.json`. */
+-function piNearestProjectTrustDecision(
+-  trust: typeof PiTrustStore.Type,
+-  cwd: string,
+-): boolean | undefined {
+-  const decisions = new Map(
+-    Object.entries(trust).map(([path, decision]) => [normalizePiTrustPath(path), decision]),
+-  );
+-  let current: string | undefined = normalizePiTrustPath(cwd);
+-  while (current !== undefined) {
+-    const decision = decisions.get(current);
+-    if (decision === true || decision === false) return decision;
+-    current = piTrustParentPath(current);
++function reservedPiArgument(arg: string): string | undefined {
++  for (const reserved of RESERVED_PI_LAUNCH_ARGUMENTS) {
++    if (arg === reserved || (reserved.startsWith("--") && arg.startsWith(`${reserved}=`))) {
++      return reserved;
++    }
+   }
+   return undefined;
+ }
+ 
+-function piNpmPackageName(source: string): string | undefined {
+-  if (!source.startsWith("npm:")) return undefined;
+-  const spec = source.slice("npm:".length).trim();
+-  const name = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@.+)?$/)?.[1];
+-  return name !== undefined &&
+-    /^(?:@[A-Za-z0-9._~-]+\/[A-Za-z0-9._~-]+|[A-Za-z0-9._~-]+)$/.test(name)
+-    ? name
+-    : undefined;
+-}
+-
+-function piPackageSource(pkg: typeof PiPackageSource.Type): string {
+-  return typeof pkg === "string" ? pkg : pkg.source;
+-}
+-
+-function piPackageExtensionPath(packageRoot: string, entry: string): string | undefined {
+-  const segments: Array<string> = [];
+-  for (const segment of entry.replace(/\\/g, "/").split("/")) {
+-    if (segment === "" || segment === ".") continue;
+-    if (segment === "..") {
+-      if (segments.pop() === undefined) return undefined;
++/**
++ * Pi launch arguments may configure resources, models, tools, trust, and
++ * storage. T3 owns RPC mode and session identity, so arguments that select a
++ * different execution mode or native session are rejected before spawn.
++ */
++export function resolvePiLaunchArgs(launchArgs: string): PiLaunchArgsResolution {
++  const args = tokenizeCliArgs(launchArgs);
++  for (let index = 0; index < args.length; index += 1) {
++    const arg = args[index];
++    if (arg === undefined) continue;
++    const reserved = reservedPiArgument(arg);
++    if (reserved !== undefined) {
++      return {
++        ok: false,
++        message: `Pi launch argument '${reserved}' is controlled by T3 Code and cannot be overridden.`,
++      };
++    }
++    if (arg === "--") {
++      return {
++        ok: false,
++        message: "Pi launch arguments cannot include positional prompts.",
++      };
++    }
++    if (PI_ARGUMENTS_WITH_VALUES.has(arg)) {
++      const value = args[index + 1];
++      if (value === undefined || value.startsWith("-")) {
++        return { ok: false, message: `Pi launch argument '${arg}' requires a value.` };
++      }
++      index += 1;
++      continue;
++    }
++    if (PI_ARGUMENTS_WITHOUT_VALUES.has(arg) || (arg.startsWith("--") && arg.includes("="))) {
++      continue;
++    }
++    if (arg.startsWith("--")) {
++      // Pi extensions may register arbitrary long flags. Treat one following
++      // non-flag token as that extension flag's value.
++      if (args[index + 1] !== undefined && !args[index + 1]!.startsWith("-")) index += 1;
+       continue;
+     }
+-    segments.push(segment);
++    if (arg.startsWith("-")) {
++      return { ok: false, message: `Pi launch argument '${arg}' is not supported by T3 Code.` };
++    }
++    return {
++      ok: false,
++      message: `Pi launch arguments cannot include positional prompt '${arg}'.`,
++    };
+   }
+-  return segments.length === 0 ? undefined : `${packageRoot}/${segments.join("/")}`;
++  return { ok: true, args };
+ }
+ 
+-function piPackagePatternPaths(
+-  fs: FileSystem.FileSystem,
+-  packageRoot: string,
+-  pattern: string,
+-  exact: boolean,
+-): Effect.Effect<Set<string>> {
+-  const normalizedPattern = pattern.replace(/\\/g, "/").replace(/^\.\//, "");
+-  if (
+-    normalizedPattern.length === 0 ||
+-    normalizedPattern.startsWith("/") ||
+-    /^[A-Za-z]:\//.test(normalizedPattern) ||
+-    normalizedPattern.split("/").includes("..")
+-  ) {
+-    return Effect.succeed(new Set());
+-  }
+-  const patterns =
+-    exact || normalizedPattern.includes("/")
+-      ? [normalizedPattern]
+-      : [normalizedPattern, `**/${normalizedPattern}`];
+-  return Effect.forEach(patterns, (candidate) =>
+-    exact
+-      ? Effect.succeed([candidate])
+-      : fs.glob(candidate, { root: packageRoot }).pipe(Effect.orElseSucceed(() => [])),
+-  ).pipe(
+-    Effect.map(
+-      (groups) =>
+-        new Set(
+-          groups.flatMap((matches) =>
+-            matches.flatMap((match) => {
+-              const normalizedMatch = normalizePiPath(match);
+-              const path = normalizedMatch.startsWith(`${normalizePiPath(packageRoot)}/`)
+-                ? normalizedMatch
+-                : piPackageExtensionPath(packageRoot, normalizedMatch);
+-              return path === undefined ? [] : [path];
+-            }),
+-          ),
+-        ),
+-    ),
+-  );
++function bearerTokenFromAuthorizationHeader(header: string): string {
++  return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : header;
+ }
+ 
+-function piEnabledPackageExtensions(
+-  fs: FileSystem.FileSystem,
+-  packageRoot: string,
+-  extensionPaths: ReadonlyArray<string>,
+-  pkg: typeof PiPackageSource.Type,
+-): Effect.Effect<Array<string>> {
+-  return Effect.gen(function* () {
+-    if (typeof pkg === "string") return [...extensionPaths];
+-    if (pkg.extensions === undefined) return pkg.autoload === false ? [] : [...extensionPaths];
+-    if (pkg.extensions.length === 0) return [];
+-    const includes = pkg.extensions.filter((pattern) => !/^[!+-]/.test(pattern));
+-    const patterns =
+-      pkg.autoload === false
+-        ? pkg.extensions
+-        : [
+-            ...includes,
+-            ...pkg.extensions.filter((pattern) => pattern.startsWith("!")),
+-            ...pkg.extensions.filter((pattern) => pattern.startsWith("+")),
+-            ...pkg.extensions.filter((pattern) => pattern.startsWith("-")),
+-          ];
+-    const enabled = new Set(pkg.autoload === false || includes.length > 0 ? [] : extensionPaths);
+-    for (const pattern of patterns) {
+-      const prefix = pattern[0];
+-      const target = /^[!+-]/.test(prefix ?? "") ? pattern.slice(1) : pattern;
+-      const matches = yield* piPackagePatternPaths(
+-        fs,
+-        packageRoot,
+-        target,
+-        prefix === "+" || prefix === "-",
+-      );
+-      for (const path of extensionPaths) {
+-        if (!matches.has(path)) continue;
+-        if (prefix === "!" || prefix === "-") enabled.delete(path);
+-        else enabled.add(path);
+-      }
+-    }
+-    return extensionPaths.filter((path) => enabled.has(path));
+-  });
++function normalizedPiPath(value: string): string {
++  return value.replace(/\\/g, "/").replace(/\/+$/, "");
+ }
+ 
+-/**
+- * Re-discover the user's pi extensions for a `--no-extensions` spawn: the
+- * subagent override forces discovery off (a second `subagent` registration
+- * aborts pi), which must not cost the user every other extension they have.
+- * Mirrors pi's own discovery roots and user npm package manifests:
+- * `<agent dir>/extensions`, `settings.json` package `pi.extensions`, and the
+- * project-local `.pi/extensions` only under Pi's recorded per-project trust
+- * or, when no decision exists, `defaultProjectTrust: "always"` —
+- * explicit `--extension` paths bypass pi's trust prompt, so anything short
+- * of standing trust must not be silently loaded. Pi's `pi-subagents` package
+- * and conventional `subagent` entries are skipped in favor of the T3 override.
+- */
+-export const discoverPiUserExtensions = Effect.fn("discoverPiUserExtensions")(function* (input: {
+-  readonly environment: NodeJS.ProcessEnv;
+-  readonly cwd: string | undefined;
+-}) {
+-  const fs = yield* FileSystem.FileSystem;
+-  const home = input.environment["HOME"] ?? input.environment["USERPROFILE"];
+-  const agentDir =
+-    input.environment["PI_CODING_AGENT_DIR"] ??
+-    (home === undefined ? undefined : `${normalizePiPath(home)}/.pi/agent`);
+-  const normalizedAgentDir = agentDir === undefined ? undefined : normalizePiPath(agentDir);
+-  const settingsRaw =
+-    normalizedAgentDir === undefined
+-      ? ""
+-      : yield* fs
+-          .readFileString(`${normalizedAgentDir}/settings.json`)
+-          .pipe(Effect.orElseSucceed(() => ""));
+-  const settings = Option.getOrUndefined(decodePiSettings(settingsRaw));
+-  const roots: Array<string> = [];
+-  if (normalizedAgentDir !== undefined) roots.push(`${normalizedAgentDir}/extensions`);
+-  if (normalizedAgentDir !== undefined && input.cwd !== undefined) {
+-    const cwd = input.cwd;
+-    const trustPath = `${normalizedAgentDir}/trust.json`;
+-    const trustExists = yield* fs.exists(trustPath).pipe(Effect.orElseSucceed(() => false));
+-    const trustRaw = trustExists
+-      ? yield* fs.readFileString(trustPath).pipe(Effect.orElseSucceed(() => ""))
+-      : undefined;
+-    const trustStore =
+-      trustRaw === undefined ? {} : Option.getOrUndefined(decodePiTrustStore(trustRaw));
+-    const canonicalCwd = yield* fs.realPath(cwd).pipe(Effect.orElseSucceed(() => cwd));
+-    const decision =
+-      trustStore === undefined ? false : piNearestProjectTrustDecision(trustStore, canonicalCwd);
+-    const projectTrusted = decision ?? settings?.defaultProjectTrust === "always";
+-    if (projectTrusted) {
+-      roots.push(`${normalizePiPath(cwd)}/.pi/extensions`);
+-    }
+-  }
+-  const found: Array<string> = [];
+-  const addFound = (path: string) => {
+-    if (!isConflictingPiSubagentExtensionPath(path) && !found.includes(path)) found.push(path);
+-  };
+-  for (const root of roots) {
+-    const entries = yield* fs
+-      .readDirectory(root)
+-      .pipe(Effect.orElseSucceed(() => [] as Array<string>));
+-    for (const entry of entries.toSorted()) {
+-      // Pi's own discovery skips dotfiles, and a parse failure on an explicit
+-      // `--extension` path aborts the spawn, so stray dot entries (macOS
+-      // AppleDouble `._*.ts` sidecars) must never be passed along.
+-      if (entry.startsWith(".")) continue;
+-      if (entry === "subagent" || entry === "subagent.ts" || entry === "subagent.js") continue;
+-      const path = `${root}/${entry}`;
+-      if (entry.endsWith(".ts") || entry.endsWith(".js")) {
+-        addFound(path);
+-        continue;
+-      }
+-      for (const indexPath of [`${path}/index.ts`, `${path}/index.js`]) {
+-        const hasIndex = yield* fs.exists(indexPath).pipe(Effect.orElseSucceed(() => false));
+-        if (hasIndex) {
+-          addFound(indexPath);
+-          break;
+-        }
+-      }
+-    }
+-  }
+-  if (normalizedAgentDir !== undefined) {
+-    for (const pkg of settings?.packages ?? []) {
+-      const packageName = piNpmPackageName(piPackageSource(pkg));
+-      if (packageName === undefined || packageName === "pi-subagents") continue;
+-      const packageRoot = `${normalizedAgentDir}/npm/node_modules/${packageName}`;
+-      const packageJsonRaw = yield* fs
+-        .readFileString(`${packageRoot}/package.json`)
+-        .pipe(Effect.orElseSucceed(() => ""));
+-      const packageJson = Option.getOrUndefined(decodePiPackageJson(packageJsonRaw));
+-      const extensionPaths: Array<string> = [];
+-      for (const entry of packageJson?.pi?.extensions ?? []) {
+-        const extensionPath = piPackageExtensionPath(packageRoot, entry);
+-        if (extensionPath === undefined) continue;
+-        const exists = yield* fs.exists(extensionPath).pipe(Effect.orElseSucceed(() => false));
+-        if (exists) extensionPaths.push(extensionPath);
+-      }
+-      const enabledExtensions = yield* piEnabledPackageExtensions(
+-        fs,
+-        packageRoot,
+-        extensionPaths,
+-        pkg,
+-      );
+-      for (const extensionPath of enabledExtensions) {
+-        addFound(extensionPath);
+-      }
+-    }
++function hasExplicitExtension(args: ReadonlyArray<string>, extensionPath: string): boolean {
++  const wanted = normalizedPiPath(extensionPath);
++  for (let index = 0; index < args.length; index += 1) {
++    const arg = args[index];
++    if (arg !== "--extension" && arg !== "-e") continue;
++    const configured = args[index + 1];
++    if (configured !== undefined && normalizedPiPath(configured) === wanted) return true;
++    index += 1;
+   }
+-  return found;
+-});
++  return false;
++}
+ 
+ function piT3McpExtensionDestPath(cacheDir: string): string {
+   return `${cacheDir.replace(/\\/g, "/")}/${PI_T3_MCP_EXTENSION_FILENAME}`;
+ }
+ 
+-function piT3SubagentExtensionDestPath(cacheDir: string): string {
+-  return `${cacheDir.replace(/\\/g, "/")}/${PI_T3_SUBAGENT_EXTENSION_FILENAME}`;
+-}
+-
+-function piChildSessionRootFromLaunchArgs(launchArgs: string): string | undefined {
+-  const args = tokenizeCliArgs(launchArgs);
+-  const index = args.indexOf("--session-dir");
+-  const sessionDir = index >= 0 ? args[index + 1] : undefined;
+-  if (sessionDir === undefined || sessionDir.length === 0) return undefined;
+-  return `${sessionDir.replace(/\\/g, "/")}/children`;
+-}
+-
+ export const materializePiT3McpExtension = Effect.fn("materializePiT3McpExtension")(function* (
+   cacheDir: string,
+ ) {
+@@ -338,135 +179,44 @@ export const materializePiT3McpExtension = Effect.fn("materializePiT3McpExtensio
+   return dest;
+ });
+ 
+-export const materializePiT3SubagentExtension = Effect.fn("materializePiT3SubagentExtension")(
+-  function* (cacheDir: string) {
+-    const fs = yield* FileSystem.FileSystem;
+-    yield* fs.makeDirectory(cacheDir, { recursive: true });
+-    const dest = piT3SubagentExtensionDestPath(cacheDir);
+-    const existing = yield* fs.readFileString(dest).pipe(Effect.orElseSucceed(() => ""));
+-    if (existing !== PI_T3_SUBAGENT_EXTENSION_SOURCE) {
+-      yield* fs.writeFileString(dest, PI_T3_SUBAGENT_EXTENSION_SOURCE);
+-    }
+-    return dest;
+-  },
+-);
+-
+-function appendExtensionArg(
+-  args: ReadonlyArray<string>,
+-  extensionPath: string | undefined,
+-): string[] {
+-  return extensionPath === undefined ? [...args] : [...args, "--extension", extensionPath];
+-}
+-
+-function normalizePiPath(value: string): string {
+-  return value.replace(/\\/g, "/").replace(/\/+$/, "");
+-}
+-
+-/** Official / user-installed `subagent` tool. Not the T3 override file. */
+-function isConflictingPiSubagentExtensionPath(extensionPath: string): boolean {
+-  const normalized = normalizePiPath(extensionPath);
+-  if (normalized.endsWith(`/${PI_T3_SUBAGENT_EXTENSION_FILENAME}`)) return false;
+-  return (
+-    normalized.endsWith("/extensions/subagent/index.ts") ||
+-    normalized.endsWith("/extensions/subagent/index.js") ||
+-    normalized.endsWith("/examples/extensions/subagent/index.ts") ||
+-    normalized.endsWith("/examples/extensions/subagent/index.js")
+-  );
+-}
+-
+-function stripConflictingPiSubagentExtensionArgs(args: ReadonlyArray<string>): string[] {
+-  const stripped: string[] = [];
+-  for (let index = 0; index < args.length; index += 1) {
+-    const arg = args[index];
+-    if (arg === undefined) continue;
+-    const next = args[index + 1];
+-    if (
+-      (arg === "--extension" || arg === "-e") &&
+-      next !== undefined &&
+-      isConflictingPiSubagentExtensionPath(next)
+-    ) {
+-      index += 1;
+-      continue;
+-    }
+-    stripped.push(arg);
+-  }
+-  return stripped;
+-}
+-
+-function deduplicatePiExtensionArgs(args: ReadonlyArray<string>): string[] {
+-  const seen = new Set<string>();
+-  const deduplicated: Array<string> = [];
+-  for (let index = 0; index < args.length; index += 1) {
+-    const arg = args[index];
+-    if (arg === undefined) continue;
+-    const extensionPath = args[index + 1];
+-    if ((arg === "--extension" || arg === "-e") && extensionPath !== undefined) {
+-      index += 1;
+-      const normalized = normalizePiPath(extensionPath);
+-      if (seen.has(normalized)) continue;
+-      seen.add(normalized);
+-      deduplicated.push(arg, extensionPath);
+-      continue;
+-    }
+-    deduplicated.push(arg);
+-  }
+-  return deduplicated;
+-}
+-
+ export function buildPiRpcLaunch(input: {
+-  readonly launchArgs: string;
++  readonly launchArgs: ReadonlyArray<string>;
+   readonly environment: NodeJS.ProcessEnv;
+   readonly mcpSession: McpProviderSessionConfig | undefined;
+   readonly extensionPath: string | undefined;
+-  readonly subagentExtensionPath?: string | undefined;
+-  /** User extensions re-added around the `--no-extensions` subagent spawn. */
+-  readonly discoveredExtensionPaths?: ReadonlyArray<string> | undefined;
++  readonly ephemeral?: boolean;
++  readonly disableExtensions?: boolean;
+ }): {
+   readonly args: ReadonlyArray<string>;
+   readonly env: NodeJS.ProcessEnv;
+   readonly hasT3Mcp: boolean;
+ } {
+-  const userArgs = tokenizeCliArgs(input.launchArgs);
+   const hasT3Mcp = input.mcpSession !== undefined && input.extensionPath !== undefined;
+-  // Duplicate `subagent` registrations abort Pi. Disable discovery and drop
+-  // the official tool from launchArgs so only the T3 override remains.
+-  let args = ["--mode", "rpc"];
+-  if (input.subagentExtensionPath !== undefined) {
+-    if (!userArgs.includes("--no-extensions") && !userArgs.includes("-ne")) {
+-      args.push("--no-extensions");
+-    }
+-    args = appendExtensionArg(args, input.subagentExtensionPath);
+-    for (const discovered of input.discoveredExtensionPaths ?? []) {
+-      args = appendExtensionArg(args, discovered);
+-    }
+-    args = [...args, ...stripConflictingPiSubagentExtensionArgs(userArgs)];
+-  } else {
+-    args = [...args, ...userArgs];
+-  }
+-  if (hasT3Mcp && input.extensionPath !== undefined) {
+-    args = appendExtensionArg(args, input.extensionPath);
++  const args = [
++    "--mode",
++    "rpc",
++    ...(input.ephemeral === true ? ["--no-session"] : []),
++    ...(input.disableExtensions === true ? ["--no-extensions"] : []),
++    ...input.launchArgs,
++  ];
++  if (
++    hasT3Mcp &&
++    input.extensionPath !== undefined &&
++    !hasExplicitExtension(args, input.extensionPath)
++  ) {
++    args.push("--extension", input.extensionPath);
+   }
+-  args = deduplicatePiExtensionArgs(args);
+ 
+-  const childSessionRoot = piChildSessionRootFromLaunchArgs(input.launchArgs);
+   return {
+     args,
+     env: {
+       ...input.environment,
+-      ...(input.subagentExtensionPath === undefined || childSessionRoot === undefined
+-        ? {}
+-        : { [T3_PI_CHILD_SESSION_ROOT_ENV]: childSessionRoot }),
+       ...(hasT3Mcp && input.mcpSession !== undefined
+         ? {
+             [T3_MCP_URL_ENV]: input.mcpSession.endpoint,
+             [T3_MCP_BEARER_ENV]: bearerTokenFromAuthorizationHeader(
+               input.mcpSession.authorizationHeader,
+             ),
+-            // The subagent override passes this through to child spawns so
+-            // native children get the T3 tools too (env is inherited).
+-            ...(input.extensionPath === undefined
+-              ? {}
+-              : { [T3_PI_MCP_EXTENSION_PATH_ENV]: input.extensionPath }),
+           }
+         : {}),
+     },
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts b/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts
+deleted file mode 100644
+index 0c49f7c07..000000000
+--- a/apps/server/src/orchestration-v2/Adapters/piT3SubagentExtensionSource.ts
++++ /dev/null
+@@ -1,556 +0,0 @@
+-/**
+- * T3-owned override of the official Pi `subagent` tool.
+- *
+- * Official spawn is `pi --mode json -p --no-session`, so there is no session
+- * file to bind as a T3 child thread. This copy persists `--session <path>` and
+- * reports `sessionFile` on each result so the adapter can resume it.
+- *
+- * Loaded via CLI `--extension`. Pi aborts if two extensions register
+- * `subagent`, so the launcher omits the official tool.
+- */
+-export const PI_T3_SUBAGENT_EXTENSION_FILENAME = "pi-t3-subagent-extension.ts";
+-
+-export const T3_PI_CHILD_SESSION_ROOT_ENV = "T3_PI_CHILD_SESSION_ROOT";
+-
+-export const PI_T3_SUBAGENT_EXTENSION_SOURCE = `\
+-import { spawn } from "node:child_process";
+-import * as fs from "node:fs";
+-import * as os from "node:os";
+-import * as path from "node:path";
+-import { randomBytes } from "node:crypto";
+-import { StringEnum } from "@earendil-works/pi-ai";
+-import {
+-  CONFIG_DIR_NAME,
+-  type ExtensionAPI,
+-  getAgentDir,
+-  parseFrontmatter,
+-} from "@earendil-works/pi-coding-agent";
+-import { Type } from "typebox";
+-
+-const SESSION_ROOT_ENV = ${JSON.stringify(T3_PI_CHILD_SESSION_ROOT_ENV)};
+-const MAX_PARALLEL_TASKS = 8;
+-const MAX_CONCURRENCY = 4;
+-
+-type AgentScope = "user" | "project" | "both";
+-
+-type AgentConfig = {
+-  name: string;
+-  description: string;
+-  tools?: string[];
+-  model?: string;
+-  systemPrompt: string;
+-  source: "user" | "project";
+-};
+-
+-type SingleResult = {
+-  agent: string;
+-  agentSource: "user" | "project" | "unknown";
+-  task: string;
+-  finished: boolean;
+-  exitCode: number;
+-  messages: unknown[];
+-  stderr: string;
+-  model?: string;
+-  stopReason?: string;
+-  errorMessage?: string;
+-  step?: number;
+-  sessionFile?: string;
+-};
+-
+-function parseToolList(value: unknown): string[] | undefined {
+-  const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
+-  const tools = raw
+-    .filter((entry): entry is string => typeof entry === "string")
+-    .map((entry) => entry.trim())
+-    .filter(Boolean);
+-  return tools.length > 0 ? tools : undefined;
+-}
+-
+-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+-  if (!fs.existsSync(dir)) return [];
+-  let entries: fs.Dirent[];
+-  try {
+-    entries = fs.readdirSync(dir, { withFileTypes: true });
+-  } catch {
+-    return [];
+-  }
+-  const agents: AgentConfig[] = [];
+-  for (const entry of entries) {
+-    if (!entry.name.endsWith(".md")) continue;
+-    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+-    const filePath = path.join(dir, entry.name);
+-    let content: string;
+-    try {
+-      content = fs.readFileSync(filePath, "utf-8");
+-    } catch {
+-      continue;
+-    }
+-    const { frontmatter, body } = parseFrontmatter<{
+-      name?: unknown;
+-      description?: unknown;
+-      tools?: unknown;
+-      model?: unknown;
+-    }>(content);
+-    if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
+-      continue;
+-    }
+-    agents.push({
+-      name: frontmatter.name,
+-      description: frontmatter.description,
+-      tools: parseToolList(frontmatter.tools),
+-      model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+-      systemPrompt: body,
+-      source,
+-    });
+-  }
+-  return agents;
+-}
+-
+-function discoverAgents(cwd: string, scope: AgentScope) {
+-  const userDir = path.join(getAgentDir(), "agents");
+-  let projectAgentsDir: string | null = null;
+-  let currentDir = cwd;
+-  while (true) {
+-    const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
+-    try {
+-      if (fs.statSync(candidate).isDirectory()) {
+-        projectAgentsDir = candidate;
+-        break;
+-      }
+-    } catch {
+-      /* keep walking */
+-    }
+-    const parentDir = path.dirname(currentDir);
+-    if (parentDir === currentDir) break;
+-    currentDir = parentDir;
+-  }
+-  const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
+-  const projectAgents =
+-    scope === "user" || projectAgentsDir === null
+-      ? []
+-      : loadAgentsFromDir(projectAgentsDir, "project");
+-  const agentMap = new Map<string, AgentConfig>();
+-  if (scope === "both") {
+-    for (const agent of userAgents) agentMap.set(agent.name, agent);
+-    for (const agent of projectAgents) agentMap.set(agent.name, agent);
+-  } else if (scope === "user") {
+-    for (const agent of userAgents) agentMap.set(agent.name, agent);
+-  } else {
+-    for (const agent of projectAgents) agentMap.set(agent.name, agent);
+-  }
+-  return { agents: Array.from(agentMap.values()), projectAgentsDir };
+-}
+-
+-function getFinalOutput(messages: unknown[]): string {
+-  for (let index = messages.length - 1; index >= 0; index -= 1) {
+-    const message = messages[index] as { role?: string; content?: unknown };
+-    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+-    for (const part of message.content) {
+-      const record = part as { type?: string; text?: string };
+-      if (record.type === "text" && typeof record.text === "string" && record.text.length > 0) {
+-        return record.text;
+-      }
+-    }
+-  }
+-  return "";
+-}
+-
+-function isFailedResult(result: SingleResult): boolean {
+-  return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+-}
+-
+-function getResultOutput(result: SingleResult): string {
+-  if (isFailedResult(result)) {
+-    return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+-  }
+-  return getFinalOutput(result.messages) || "(no output)";
+-}
+-
+-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+-  const currentScript = process.argv[1];
+-  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+-    return { command: process.execPath, args: [currentScript, ...args] };
+-  }
+-  const execName = path.basename(process.execPath).toLowerCase();
+-  if (/^(node|bun)(\\.exe)?$/.test(execName)) return { command: "pi", args };
+-  return { command: process.execPath, args };
+-}
+-
+-function childSessionFile(): string {
+-  const root =
+-    process.env[SESSION_ROOT_ENV] && process.env[SESSION_ROOT_ENV]!.length > 0
+-      ? process.env[SESSION_ROOT_ENV]!
+-      : path.join(getAgentDir(), "sessions");
+-  fs.mkdirSync(root, { recursive: true });
+-  const id = randomBytes(6).toString("hex");
+-  return path.join(root, \`t3-subagent-\${Date.now()}-\${id}.jsonl\`);
+-}
+-
+-async function runSingleAgent(
+-  defaultCwd: string,
+-  defaults: { model?: string; thinkingLevel?: string },
+-  agents: AgentConfig[],
+-  agentName: string,
+-  task: string,
+-  cwd: string | undefined,
+-  step: number | undefined,
+-  signal: AbortSignal | undefined,
+-  onUpdate: ((partial: { content: { type: "text"; text: string }[]; details: { results: SingleResult[] } }) => void) | undefined,
+-): Promise<SingleResult> {
+-  const agent = agents.find((entry) => entry.name === agentName);
+-  if (!agent) {
+-    const available = agents.map((entry) => \`"\${entry.name}"\`).join(", ") || "none";
+-    return {
+-      agent: agentName,
+-      agentSource: "unknown",
+-      task,
+-      finished: true,
+-      exitCode: 1,
+-      messages: [],
+-      stderr: \`Unknown agent: "\${agentName}". Available agents: \${available}.\`,
+-      step,
+-    };
+-  }
+-
+-  const sessionFile = childSessionFile();
+-  const args: string[] = [
+-    "--mode",
+-    "json",
+-    "-p",
+-    "--session",
+-    sessionFile,
+-    "--name",
+-    \`t3-subagent \${agentName}\`,
+-  ];
+-  // Children inherit T3_MCP_URL / T3_MCP_BEARER_TOKEN from this process, so
+-  // loading the same T3 MCP extension gives them delegate_task / t3_thread_*.
+-  const t3McpExtension = process.env["T3_PI_MCP_EXTENSION_PATH"];
+-  if (t3McpExtension) args.push("--extension", t3McpExtension);
+-  const model = agent.model ?? defaults.model;
+-  if (model) args.push("--model", model);
+-  if (!agent.model && defaults.thinkingLevel) args.push("--thinking", defaults.thinkingLevel);
+-  if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+-
+-  let tmpPromptDir: string | null = null;
+-  const currentResult: SingleResult = {
+-    agent: agentName,
+-    agentSource: agent.source,
+-    task,
+-    finished: false,
+-    exitCode: 0,
+-    messages: [],
+-    stderr: "",
+-    model,
+-    step,
+-    sessionFile,
+-  };
+-
+-  const emitUpdate = () => {
+-    onUpdate?.({
+-      content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+-      details: { results: [currentResult] },
+-    });
+-  };
+-  emitUpdate();
+-
+-  try {
+-    if (agent.systemPrompt.trim()) {
+-      tmpPromptDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-t3-subagent-"));
+-      const promptPath = path.join(tmpPromptDir, "prompt.md");
+-      await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+-      args.push("--append-system-prompt", promptPath);
+-    }
+-    args.push(\`Task: \${task}\`);
+-
+-    const exitCode = await new Promise<number>((resolve) => {
+-      const invocation = getPiInvocation(args);
+-      const proc = spawn(invocation.command, invocation.args, {
+-        cwd: cwd ?? defaultCwd,
+-        shell: false,
+-        stdio: ["ignore", "pipe", "pipe"],
+-      });
+-      let buffer = "";
+-      const processLine = (line: string) => {
+-        if (!line.trim()) return;
+-        let event: { type?: string; message?: unknown };
+-        try {
+-          event = JSON.parse(line) as { type?: string; message?: unknown };
+-        } catch {
+-          return;
+-        }
+-        if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+-          currentResult.messages.push(event.message);
+-          const message = event.message as {
+-            role?: string;
+-            model?: string;
+-            stopReason?: string;
+-            errorMessage?: string;
+-          };
+-          if (message.role === "assistant") {
+-            if (!currentResult.model && message.model) currentResult.model = message.model;
+-            if (message.stopReason) currentResult.stopReason = message.stopReason;
+-            if (message.errorMessage) currentResult.errorMessage = message.errorMessage;
+-          }
+-          emitUpdate();
+-        }
+-      };
+-      proc.stdout?.setEncoding("utf8");
+-      proc.stdout?.on("data", (chunk: string) => {
+-        buffer += chunk;
+-        const lines = buffer.split("\\n");
+-        buffer = lines.pop() ?? "";
+-        for (const line of lines) processLine(line);
+-      });
+-      proc.stderr?.setEncoding("utf8");
+-      proc.stderr?.on("data", (chunk: string) => {
+-        currentResult.stderr += chunk;
+-      });
+-      let killTimer: ReturnType<typeof setTimeout> | undefined;
+-      let settled = false;
+-      const settle = (code: number) => {
+-        if (settled) return;
+-        settled = true;
+-        signal?.removeEventListener("abort", onAbort);
+-        if (killTimer !== undefined) clearTimeout(killTimer);
+-        if (buffer.trim()) processLine(buffer);
+-        resolve(code);
+-      };
+-      const onAbort = () => {
+-        currentResult.stopReason = "aborted";
+-        if (proc.kill("SIGTERM")) {
+-          killTimer = setTimeout(() => proc.kill("SIGKILL"), 1_000);
+-          killTimer.unref();
+-        }
+-      };
+-      proc.on("close", (code) => settle(code ?? 1));
+-      proc.on("error", (error) => {
+-        currentResult.stderr += error.message;
+-        settle(1);
+-      });
+-      if (signal?.aborted) onAbort();
+-      else signal?.addEventListener("abort", onAbort, { once: true });
+-    });
+-    currentResult.exitCode = exitCode;
+-    currentResult.finished = true;
+-    return currentResult;
+-  } finally {
+-    if (tmpPromptDir) {
+-      await fs.promises.rm(tmpPromptDir, { recursive: true, force: true }).catch(() => undefined);
+-    }
+-  }
+-}
+-
+-const TaskItem = Type.Object({
+-  agent: Type.String(),
+-  task: Type.String(),
+-  cwd: Type.Optional(Type.String()),
+-});
+-
+-export default function t3SubagentExtension(pi: ExtensionAPI) {
+-  pi.registerTool({
+-    name: "subagent",
+-    label: "Subagent",
+-    description:
+-      "Delegate tasks to specialized Pi subagents with isolated context. Each child persists a Pi session that T3 can open and continue.",
+-    parameters: Type.Object({
+-      agent: Type.Optional(Type.String()),
+-      task: Type.Optional(Type.String()),
+-      tasks: Type.Optional(Type.Array(TaskItem)),
+-      chain: Type.Optional(Type.Array(TaskItem)),
+-      agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const)),
+-      confirmProjectAgents: Type.Optional(Type.Boolean()),
+-      cwd: Type.Optional(Type.String()),
+-    }),
+-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+-      const agentScope: AgentScope = params.agentScope ?? "user";
+-      const discovery = discoverAgents(ctx.cwd, agentScope);
+-      const agents = discovery.agents;
+-      const defaults = {
+-        model: ctx.model ? \`\${ctx.model.provider}/\${ctx.model.id}\` : undefined,
+-        thinkingLevel: ctx.thinkingLevel,
+-      };
+-      const confirmProjectAgents = params.confirmProjectAgents ?? true;
+-      const hasChain = (params.chain?.length ?? 0) > 0;
+-      const hasTasks = (params.tasks?.length ?? 0) > 0;
+-      const hasSingle = Boolean(params.agent && params.task);
+-      const makeDetails = (results: SingleResult[]) => ({
+-        mode: hasChain ? "chain" : hasTasks ? "parallel" : "single",
+-        agentScope,
+-        projectAgentsDir: discovery.projectAgentsDir,
+-        results,
+-      });
+-
+-      if (Number(hasChain) + Number(hasTasks) + Number(hasSingle) !== 1) {
+-        const available = agents.map((agent) => agent.name).join(", ") || "none";
+-        return {
+-          content: [{ type: "text", text: \`Invalid parameters. Available agents: \${available}\` }],
+-          details: makeDetails([]),
+-        };
+-      }
+-
+-      if (
+-        (agentScope === "project" || agentScope === "both") &&
+-        confirmProjectAgents &&
+-        ctx.hasUI
+-      ) {
+-        const names = new Set<string>();
+-        if (params.chain) for (const step of params.chain) names.add(step.agent);
+-        if (params.tasks) for (const item of params.tasks) names.add(item.agent);
+-        if (params.agent) names.add(params.agent);
+-        const projectRequested = agents.filter(
+-          (agent) => agent.source === "project" && names.has(agent.name),
+-        );
+-        if (projectRequested.length > 0) {
+-          const ok = await ctx.ui.confirm(
+-            "Run project-local agents?",
+-            \`Agents: \${projectRequested.map((agent) => agent.name).join(", ")}\\nSource: \${discovery.projectAgentsDir ?? "(unknown)"}\`,
+-          );
+-          if (!ok) {
+-            return {
+-              content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+-              details: makeDetails([]),
+-            };
+-          }
+-        }
+-      }
+-
+-      if (params.chain && params.chain.length > 0) {
+-        const results: SingleResult[] = [];
+-        let previousOutput = "";
+-        for (let index = 0; index < params.chain.length; index += 1) {
+-          const step = params.chain[index];
+-          const result = await runSingleAgent(
+-            ctx.cwd,
+-            defaults,
+-            agents,
+-            step.agent,
+-            step.task.replace(/\\{previous\\}/g, previousOutput),
+-            step.cwd,
+-            index + 1,
+-            signal,
+-            onUpdate
+-              ? (partial) => {
+-                  const current = partial.details?.results[0];
+-                  if (current) onUpdate({ ...partial, details: makeDetails([...results, current]) });
+-                }
+-              : undefined,
+-          );
+-          results.push(result);
+-          if (isFailedResult(result)) {
+-            return {
+-              content: [
+-                {
+-                  type: "text",
+-                  text: \`Chain stopped at step \${index + 1} (\${step.agent}): \${getResultOutput(result)}\`,
+-                },
+-              ],
+-              details: makeDetails(results),
+-              isError: true,
+-            };
+-          }
+-          previousOutput = getFinalOutput(result.messages);
+-        }
+-        return {
+-          content: [
+-            {
+-              type: "text",
+-              text: getFinalOutput(results[results.length - 1]?.messages ?? []) || "(no output)",
+-            },
+-          ],
+-          details: makeDetails(results),
+-        };
+-      }
+-
+-      if (params.tasks && params.tasks.length > 0) {
+-        if (params.tasks.length > MAX_PARALLEL_TASKS) {
+-          return {
+-            content: [{ type: "text", text: \`Too many parallel tasks (\${params.tasks.length}).\` }],
+-            details: makeDetails([]),
+-          };
+-        }
+-        const allResults: SingleResult[] = params.tasks.map((item) => ({
+-          agent: item.agent,
+-          agentSource: "unknown",
+-          task: item.task,
+-          finished: false,
+-          exitCode: -1,
+-          messages: [],
+-          stderr: "",
+-        }));
+-        const emitParallel = () => {
+-          onUpdate?.({
+-            content: [{ type: "text", text: "Parallel tasks running..." }],
+-            details: makeDetails([...allResults]),
+-          });
+-        };
+-        let nextIndex = 0;
+-        const workers = Array.from({ length: Math.min(MAX_CONCURRENCY, params.tasks.length) }, async () => {
+-          while (true) {
+-            const index = nextIndex;
+-            nextIndex += 1;
+-            if (index >= params.tasks.length) return;
+-            const item = params.tasks[index];
+-            const result = await runSingleAgent(
+-              ctx.cwd,
+-              defaults,
+-              agents,
+-              item.agent,
+-              item.task,
+-              item.cwd,
+-              undefined,
+-              signal,
+-              (partial) => {
+-                if (partial.details?.results[0]) {
+-                  allResults[index] = partial.details.results[0];
+-                  emitParallel();
+-                }
+-              },
+-            );
+-            allResults[index] = result;
+-            emitParallel();
+-          }
+-        });
+-        await Promise.all(workers);
+-        const successCount = allResults.filter((result) => !isFailedResult(result)).length;
+-        return {
+-          content: [
+-            {
+-              type: "text",
+-              text: \`Parallel: \${successCount}/\${allResults.length} succeeded\`,
+-            },
+-          ],
+-          details: makeDetails(allResults),
+-        };
+-      }
+-
+-      const result = await runSingleAgent(
+-        ctx.cwd,
+-        defaults,
+-        agents,
+-        params.agent as string,
+-        params.task as string,
+-        params.cwd,
+-        undefined,
+-        signal,
+-        onUpdate
+-          ? (partial) => onUpdate({ ...partial, details: makeDetails(partial.details.results) })
+-          : undefined,
+-      );
+-      const failed = isFailedResult(result);
+-      return {
+-        content: [
+-          {
+-            type: "text",
+-            text: failed
+-              ? \`Agent \${result.stopReason || "failed"}: \${getResultOutput(result)}\`
+-              : getFinalOutput(result.messages) || "(no output)",
+-          },
+-        ],
+-        details: makeDetails([result]),
+-        ...(failed ? { isError: true } : {}),
+-      };
+-    },
+-  });
+-}
+-`;
+diff --git a/apps/server/src/provider/Layers/PiProvider.test.ts b/apps/server/src/provider/Layers/PiProvider.test.ts
+new file mode 100644
+index 000000000..b1767d13d
+--- /dev/null
++++ b/apps/server/src/provider/Layers/PiProvider.test.ts
+@@ -0,0 +1,90 @@
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, describe, it } from "@effect/vitest";
++import * as Effect from "effect/Effect";
++import * as Sink from "effect/Sink";
++import * as Stream from "effect/Stream";
++import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
++
++import { checkPiProviderStatus, MINIMUM_PI_VERSION } from "./PiProvider.ts";
++
++const encoder = new TextEncoder();
++
++function processHandle(input: {
++  readonly stdout?: string;
++  readonly stderr?: string;
++  readonly exitCode?: number;
++}) {
++  const bytes = (value: string | undefined) =>
++    value === undefined || value.length === 0
++      ? Stream.empty
++      : Stream.succeed(encoder.encode(value));
++  return ChildProcessSpawner.makeHandle({
++    pid: ChildProcessSpawner.ProcessId(900_000_001),
++    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(input.exitCode ?? 0)),
++    isRunning: Effect.succeed(false),
++    kill: () => Effect.void,
++    unref: Effect.succeed(Effect.void),
++    stdin: Sink.drain,
++    stdout: bytes(input.stdout),
++    stderr: bytes(input.stderr),
++    all: Stream.empty,
++    getInputFd: () => Sink.drain,
++    getOutputFd: () => Stream.empty,
++  });
++}
++
++function piProbeSpawner(version: string) {
++  return ChildProcessSpawner.make((command) => {
++    const args = ChildProcess.isStandardCommand(command) ? command.args : [];
++    return Effect.succeed(
++      args.includes("--version")
++        ? processHandle({ stdout: `pi ${version}\n` })
++        : processHandle({ stderr: "RPC startup failed", exitCode: 1 }),
++    );
++  });
++}
++
++const settings = {
++  enabled: true,
++  binaryPath: "pi",
++  launchArgs: "",
++  customModels: [],
++} as const;
++
++describe("PiProvider", () => {
++  it.effect("requires the first published Pi version with entries and settlement hooks", () =>
++    Effect.gen(function* () {
++      const snapshot = yield* checkPiProviderStatus(settings).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, piProbeSpawner("0.80.3")),
++      );
++      assert.equal(snapshot.status, "error");
++      assert.equal(snapshot.version, "0.80.3");
++      assert.include(snapshot.message ?? "", `Pi ${MINIMUM_PI_VERSION} or newer`);
++    }).pipe(Effect.provide(NodeServices.layer)),
++  );
++
++  it.effect("keeps compatible Pi selectable when optional discovery fails", () =>
++    Effect.gen(function* () {
++      const snapshot = yield* checkPiProviderStatus(settings).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, piProbeSpawner("0.84.3")),
++      );
++      assert.equal(snapshot.status, "ready");
++      assert.equal(snapshot.auth.status, "unknown");
++      assert.deepEqual(
++        snapshot.models.map((model) => model.slug),
++        ["default"],
++      );
++      assert.include(snapshot.message ?? "", "could not refresh its models and commands");
++    }).pipe(Effect.provide(NodeServices.layer)),
++  );
++
++  it.effect("reports reserved launch arguments before opening an RPC session", () =>
++    Effect.gen(function* () {
++      const snapshot = yield* checkPiProviderStatus({ ...settings, launchArgs: "--resume" }).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, piProbeSpawner("0.84.3")),
++      );
++      assert.equal(snapshot.status, "error");
++      assert.include(snapshot.message ?? "", "controlled by T3 Code");
++    }).pipe(Effect.provide(NodeServices.layer)),
++  );
++});
+diff --git a/apps/server/src/provider/Layers/PiProvider.ts b/apps/server/src/provider/Layers/PiProvider.ts
+index f76e51d48..ea701383c 100644
+--- a/apps/server/src/provider/Layers/PiProvider.ts
++++ b/apps/server/src/provider/Layers/PiProvider.ts
+@@ -11,7 +11,7 @@
+ import { type PiSettings, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
+ import { causeErrorTag } from "@t3tools/shared/observability";
+ import { resolveSpawnCommand } from "@t3tools/shared/shell";
+-import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
++import { compareSemverVersions } from "@t3tools/shared/semver";
+ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+ import * as Exit from "effect/Exit";
+@@ -20,6 +20,10 @@ import * as Result from "effect/Result";
+ import { HttpClient } from "effect/unstable/http";
+ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+ 
++import {
++  buildPiRpcLaunch,
++  resolvePiLaunchArgs,
++} from "../../orchestration-v2/Adapters/piT3McpInjection.ts";
+ import {
+   makePiRpcConnection,
+   piRecordField as recordField,
+@@ -52,6 +56,12 @@ const PI_PRESENTATION = {
+ 
+ const VERSION_PROBE_TIMEOUT_MS = 4_000;
+ const PI_RPC_DISCOVERY_TIMEOUT_MS = 15_000;
++/**
++ * get_entries arrived in 0.80.3 and agent_settled landed in source at 0.80.4.
++ * Version 0.80.5 was the first published package containing both hooks. T3
++ * needs them for rollback boundaries and reliable turn terminalization.
++ */
++export const MINIMUM_PI_VERSION = "0.80.5";
+ 
+ /** Deferring to the user's own settings.json default model. */
+ const PI_DEFAULT_MODEL: ServerProviderModel = {
+@@ -102,13 +112,25 @@ function parseDiscoveredModels(
+   return parsed;
+ }
+ 
+-const discoverPiViaRpc = (piSettings: PiSettings, environment: NodeJS.ProcessEnv, cwd?: string) =>
++const discoverPiViaRpc = (
++  piSettings: PiSettings,
++  environment: NodeJS.ProcessEnv,
++  launchArgs: ReadonlyArray<string>,
++  cwd?: string,
++) =>
+   Effect.gen(function* () {
++    const launch = buildPiRpcLaunch({
++      launchArgs,
++      environment,
++      mcpSession: undefined,
++      extensionPath: undefined,
++      ephemeral: true,
++    });
+     const connection = yield* makePiRpcConnection({
+       command: piSettings.binaryPath || "pi",
+-      args: ["--mode", "rpc", "--no-session", ...tokenizeCliArgs(piSettings.launchArgs)],
++      args: launch.args,
+       cwd,
+-      env: environment,
++      env: launch.env,
+     });
+     const stateData = yield* connection.request({ type: "get_state" });
+     const modelsData = yield* connection.request({ type: "get_available_models" });
+@@ -263,10 +285,61 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
+     });
+   }
+ 
+-  const discoveryExit = yield* discoverPiViaRpc(piSettings, environment, cwd).pipe(
+-    Effect.timeoutOption(PI_RPC_DISCOVERY_TIMEOUT_MS),
+-    Effect.exit,
+-  );
++  if (version === null) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version: null,
++        status: "error",
++        auth: { status: "unknown" },
++        message: `T3 Code could not determine the Pi version. Pi ${MINIMUM_PI_VERSION} or newer is required.`,
++      },
++    });
++  }
++
++  if (compareSemverVersions(version, MINIMUM_PI_VERSION) < 0) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: `Pi ${version} is unsupported. Update to Pi ${MINIMUM_PI_VERSION} or newer.`,
++      },
++    });
++  }
++
++  const resolvedLaunchArgs = resolvePiLaunchArgs(piSettings.launchArgs);
++  if (!resolvedLaunchArgs.ok) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: resolvedLaunchArgs.message,
++      },
++    });
++  }
++
++  const discoveryExit = yield* discoverPiViaRpc(
++    piSettings,
++    environment,
++    resolvedLaunchArgs.args,
++    cwd,
++  ).pipe(Effect.timeoutOption(PI_RPC_DISCOVERY_TIMEOUT_MS), Effect.exit);
+   if (Exit.isFailure(discoveryExit)) {
+     yield* Effect.logWarning("Pi RPC discovery failed.", {
+       errorTag: causeErrorTag(discoveryExit.cause),
+@@ -279,9 +352,10 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
+       probe: {
+         installed: true,
+         version,
+-        status: "error",
++        status: "ready",
+         auth: { status: "unknown" },
+-        message: "Pi CLI is installed but RPC startup failed. Check server logs for details.",
++        message:
++          "Pi is available, but T3 Code could not refresh its models and commands. The live session will retry startup.",
+       },
+     });
+   }
+@@ -294,9 +368,10 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
+       probe: {
+         installed: true,
+         version,
+-        status: "error",
++        status: "ready",
+         auth: { status: "unknown" },
+-        message: `Pi CLI is installed but RPC startup timed out after ${PI_RPC_DISCOVERY_TIMEOUT_MS}ms.`,
++        message:
++          "Pi is available, but model and command discovery needs interactive input. The live session will handle it.",
+       },
+     });
+   }
+diff --git a/apps/server/src/textGeneration/PiTextGeneration.ts b/apps/server/src/textGeneration/PiTextGeneration.ts
+index b849728e5..d53e99573 100644
+--- a/apps/server/src/textGeneration/PiTextGeneration.ts
++++ b/apps/server/src/textGeneration/PiTextGeneration.ts
+@@ -11,11 +11,14 @@ import * as Schema from "effect/Schema";
+ import { ChildProcessSpawner } from "effect/unstable/process";
+ 
+ import { TextGenerationError, type ModelSelection, type PiSettings } from "@t3tools/contracts";
+-import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+ import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
+ import { extractJsonObject } from "@t3tools/shared/schemaJson";
+ 
+ import { makePiRpcConnection, parsePiModelSlug } from "../orchestration-v2/Adapters/PiRpc.ts";
++import {
++  buildPiRpcLaunch,
++  resolvePiLaunchArgs,
++} from "../orchestration-v2/Adapters/piT3McpInjection.ts";
+ import * as TextGeneration from "./TextGeneration.ts";
+ import {
+   buildBranchNamePrompt,
+@@ -57,20 +60,30 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function*
+     modelSelection: ModelSelection;
+   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
+     Effect.gen(function* () {
++      const resolvedLaunchArgs = resolvePiLaunchArgs(piSettings.launchArgs);
++      if (!resolvedLaunchArgs.ok) {
++        return yield* new TextGenerationError({
++          operation,
++          detail: resolvedLaunchArgs.message,
++        });
++      }
++      const launch = buildPiRpcLaunch({
++        launchArgs: resolvedLaunchArgs.args,
++        environment,
++        mcpSession: undefined,
++        extensionPath: undefined,
++        ephemeral: true,
++        // No user is present to answer a text-generation extension dialog.
++        disableExtensions: true,
++      });
+       const connection = yield* makePiRpcConnection({
+         command: piSettings.binaryPath || "pi",
+         // --no-extensions is deliberate: an extension raising a dialog here
+         // would stall commit-message generation until the timeout, and no
+         // one is present to answer it. User model config and auth still apply.
+-        args: [
+-          "--mode",
+-          "rpc",
+-          "--no-session",
+-          "--no-extensions",
+-          ...tokenizeCliArgs(piSettings.launchArgs),
+-        ],
++        args: launch.args,
+         cwd,
+-        env: environment,
++        env: launch.env,
+       }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+ 
+       if (modelSelection.model !== "default") {
+diff --git a/docs/internals/providers.md b/docs/internals/providers.md
+index 44d0f9e37..bf03bc248 100644
+--- a/docs/internals/providers.md
++++ b/docs/internals/providers.md
+@@ -19,12 +19,12 @@ orchestration layer does not know which one is behind a thread.
+ | `pi`          | [`Drivers/PiDriver.ts`][pi]             |
+ 
+ The Pi driver speaks Pi's stdio JSONL RPC mode (`pi --mode rpc`) and spawns the user's own `pi`
+-install, preserving its skills, context files, custom models, auth, and sessions. T3 replaces Pi's
+-official `subagent` extension with a session-persisting variant. That launch uses
+-`--no-extensions`, then explicitly re-adds the T3 extensions and the user's discovered extensions;
+-project-local extensions are only re-added when Pi has standing project trust. Extension UI dialogs
+-surface as orchestration runtime requests, and Pi's session statistics feed the shared context
+-window meter.
++install, preserving its skills, context files, custom models, auth, extensions, and sessions. Pi
++owns native extension discovery. T3 explicitly injects only its namespaced MCP bridge. The shared
++`delegate_task` tool owns durable child threads, while results from Pi's installed example
++`subagent` extension are projected without synthetic child sessions. Extension UI dialogs surface
++as orchestration runtime requests, and optional Pi session statistics feed the shared context window
++meter after turn terminalization. Pi 0.80.5 is the minimum supported protocol version.
+ 
+ Each driver declares its `driverKind`, a `configSchema`, and a `create` function that builds an
+ adapter in a child scope. Adapter implementations live beside them in
+diff --git a/docs/orchestration-v2/orchestrator-mcp-server.md b/docs/orchestration-v2/orchestrator-mcp-server.md
+index c63822c05..40228e182 100644
+--- a/docs/orchestration-v2/orchestrator-mcp-server.md
++++ b/docs/orchestration-v2/orchestrator-mcp-server.md
+@@ -142,20 +142,20 @@ T3_MCP_BEARER_TOKEN=<provider-session-token>
+ ```
+ 
+ The extension connects to that HTTP endpoint, lists tools, and registers each
+-one with `pi.registerTool` under its original name (`delegate_task`,
+-`t3_thread_start`, and the rest). Follow-up HTTP requests send
++one with `pi.registerTool` under a `mcp__t3-code__` namespace
++(`mcp__t3-code__delegate_task`, `mcp__t3-code__t3_thread_start`, and the rest).
++The bridge calls the original MCP tool name over HTTP. Follow-up requests send
+ `mcp-protocol-version: 2025-06-18`; Effect's MCP transport returns 400
+ without it. The first turn of a session also receives the shared T3
+ orchestration instructions.
+ 
+-A second T3-owned extension overrides the official `subagent` tool to
+-persist `--session` and report `sessionFile`. Duplicate `subagent`
+-registrations abort Pi, so the launcher disables extension discovery and
+-drops the official tool from `launchArgs`. It then explicitly re-adds the
+-T3 extensions and deduplicated user extensions, including project-local
+-extensions only under standing project trust. Other user `launchArgs` are
+-preserved. The adapter binds each result as a child thread that later sends
+-resume through `switch_session`.
++Pi keeps ownership of native extension discovery. T3 does not replace Pi's
++`subagent` tool or reproduce Pi's package and project-trust loader. Durable
++delegation goes through the namespaced T3 MCP `delegate_task` tool and the
++shared orchestration child-thread lifecycle. When Pi's example `subagent`
++extension is installed, the adapter observes its documented `details.results`
++shape and projects task cards with no child thread id. Unknown result shapes
++remain ordinary dynamic tool output.
+ 
+ ### Initial Provider Support
+ 
+diff --git a/docs/user/providers-pi.md b/docs/user/providers-pi.md
+index 367f87c08..98de100c9 100644
+--- a/docs/user/providers-pi.md
++++ b/docs/user/providers-pi.md
+@@ -5,35 +5,43 @@ extensions, skills, context files, and native session history.
+ 
+ ## Set Up Pi
+ 
+-1. Install Pi on the machine running the T3 Code server.
++1. Install Pi 0.80.5 or newer on the machine running the T3 Code server.
+ 2. Run Pi once in a terminal and finish the provider login or API-key setup you normally use.
+ 3. Open T3 Code Settings, enable Pi, and refresh the provider.
+ 
+ If `pi` is not on the server's `PATH`, set Pi's binary path to the executable. Provider environment
+ variables and launch arguments are also available for installations that need a custom agent
+-directory, endpoint, or model configuration.
++directory, endpoint, or model configuration. T3 Code rejects launch arguments that change Pi's
++execution mode or select a session because T3 owns those parts of the process lifecycle.
+ 
+ ## What Carries Over
+ 
+ T3 Code discovers the models reported by Pi and exposes their supported thinking levels. The
+ thinking picker marks Pi's current configured level as the default without overriding it. Threads
+-use Pi's native session files, so resume, rollback, and current-branch forks keep Pi's conversation
+-state. Extension dialogs appear in the T3 Code composer, and the composer context meter updates from
+-Pi's own context-window statistics after a response settles.
++use Pi's native session files for resume and rollback. Thread forks use T3 Code's portable
++conversation context to start a fresh Pi session instead of cloning Pi's active session. Extension
++dialogs appear in the T3 Code composer, and the composer context meter updates from Pi's own
++context-window statistics after a response settles.
+ 
+ Pi skills appear in the composer's `$` menu. This includes user skills and project skills that Pi
+ loads for the current workspace; selecting one uses Pi's native skill expansion.
+ 
+-Pi's normal user extensions continue to load. T3 Code supplies its own session-aware `subagent`
+-tool so each child can be opened and continued as a T3 Code thread. Project-local extensions are
+-only loaded automatically when Pi is configured to always trust that project.
++Pi loads its normal user and project extensions. Blocking `select`, `confirm`, `input`, and `editor`
++dialogs work in T3 Code. Notifications appear in the work log. Pi terminal decoration such as
++titles, status lines, and widgets does not have a T3 Code equivalent.
++
++T3 Code's `delegate_task` tool creates durable child threads in the shared subagent UI. If the user
++installs Pi's example `subagent` extension, T3 Code also shows its task progress and results in that
++UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
++threads.
+ 
+ ## Troubleshooting
+ 
+ - If Pi is unavailable, confirm that the configured binary runs on the server machine, then refresh
+   the provider in Settings.
+ - If no models appear, open Pi directly and confirm its authentication and model configuration.
+-- If a project extension is missing, approve the project in Pi or configure standing project trust,
+-  then start a fresh provider session.
++- If discovery cannot complete, T3 Code keeps Pi available with the `Pi default` model. Start a
++  thread to let the interactive Pi session handle any startup prompt.
++- If a project extension is missing, approve the project in Pi, then start a fresh provider session.
+ - If a project skill is missing from the `$` menu, approve the project in Pi and refresh the provider.
+ - The context meter appears after Pi returns its first usable token snapshot for the thread.
+-- 
+2.50.1 (Apple Git-155)
+

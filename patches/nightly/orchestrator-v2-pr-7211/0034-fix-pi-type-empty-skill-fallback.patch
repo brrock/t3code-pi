@@ -1,0 +1,27 @@
+From aaf4bf2a406e7047871f6c6ead6a778a9f715d79 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 21:12:06 +0200
+Subject: [PATCH] fix(pi): type empty skill fallback
+
+---
+ apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index 0409f193e..53f790a64 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -1999,7 +1999,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         // Retry a failed session-local lookup once at first use so a transient
+         // startup failure cannot leave a visible $ skill inert for this session.
+         if (skillNames === null && text.includes("$")) {
+-          skillNames = yield* discoverSkillNames.pipe(Effect.orElseSucceed(() => new Set()));
++          skillNames = yield* discoverSkillNames.pipe(
++            Effect.orElseSucceed(() => new Set<string>()),
++          );
+         }
+         const expandedText = skillNames === null ? text : expandPiSkillReference(text, skillNames);
+         const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+-- 
+2.50.1 (Apple Git-155)
+

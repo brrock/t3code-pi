@@ -1,0 +1,139 @@
+From 18f773833f93f97bd8321b3ca7088bf61017d966 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Wed, 19 Aug 2026 07:33:55 +0200
+Subject: [PATCH] fix(pi): honor project trust decisions
+
+---
+ .../Adapters/piT3McpInjection.test.ts         | 23 +++++++--
+ .../Adapters/piT3McpInjection.ts              | 47 ++++++++++++++++---
+ 2 files changed, 60 insertions(+), 10 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+index 4a166ff80..bc974cac3 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+@@ -190,7 +190,8 @@ describe("pi T3 MCP injection", () => {
+     Effect.gen(function* () {
+       const fs = yield* FileSystem.FileSystem;
+       const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-home-" });
+-      const project = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-project-" });
++      const parent = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-parent-" });
++      const project = `${parent}/project`;
+       yield* fs.makeDirectory(`${home}/.pi/agent`, { recursive: true });
+       yield* fs.makeDirectory(`${project}/.pi/extensions`, { recursive: true });
+       yield* fs.writeFileString(`${project}/.pi/extensions/local.ts`, "export default () => {}");
+@@ -199,15 +200,31 @@ describe("pi T3 MCP injection", () => {
+         cwd: project,
+       });
+       assert.deepEqual(untrusted, []);
++      yield* fs.writeFileString(`${home}/.pi/agent/trust.json`, `{ "${parent}": true }`);
++      const trustedViaAncestor = yield* discoverPiUserExtensions({
++        environment: { HOME: home },
++        cwd: project,
++      });
++      assert.deepEqual(trustedViaAncestor, [`${project}/.pi/extensions/local.ts`]);
+       yield* fs.writeFileString(
+         `${home}/.pi/agent/settings.json`,
+         '{ "defaultProjectTrust": "always" }',
+       );
+-      const trusted = yield* discoverPiUserExtensions({
++      yield* fs.writeFileString(
++        `${home}/.pi/agent/trust.json`,
++        `{ "${parent}": true, "${project}": false }`,
++      );
++      const explicitlyUntrusted = yield* discoverPiUserExtensions({
++        environment: { HOME: home },
++        cwd: project,
++      });
++      assert.deepEqual(explicitlyUntrusted, []);
++      yield* fs.writeFileString(`${home}/.pi/agent/trust.json`, "{}");
++      const trustedByDefault = yield* discoverPiUserExtensions({
+         environment: { HOME: home },
+         cwd: project,
+       });
+-      assert.deepEqual(trusted, [`${project}/.pi/extensions/local.ts`]);
++      assert.deepEqual(trustedByDefault, [`${project}/.pi/extensions/local.ts`]);
+     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+   );
+ });
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+index 4ffa33ab8..997a7bfe6 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+@@ -1,3 +1,5 @@
++import * as NodePath from "node:path";
++
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Option from "effect/Option";
+@@ -54,8 +56,26 @@ const PiPackageJson = Schema.Struct({
+   ),
+ });
+ 
++const PiTrustStore = Schema.Record(Schema.String, Schema.NullOr(Schema.Boolean));
++
+ const decodePiSettings = Schema.decodeUnknownOption(Schema.fromJsonString(PiSettingsFile));
+ const decodePiPackageJson = Schema.decodeUnknownOption(Schema.fromJsonString(PiPackageJson));
++const decodePiTrustStore = Schema.decodeUnknownOption(Schema.fromJsonString(PiTrustStore));
++
++/** Mirrors Pi's canonical nearest-ancestor lookup over `trust.json`. */
++function piNearestProjectTrustDecision(
++  trust: typeof PiTrustStore.Type,
++  cwd: string,
++): boolean | undefined {
++  let current = cwd;
++  while (true) {
++    const decision = trust[current];
++    if (decision === true || decision === false) return decision;
++    const parent = NodePath.dirname(current);
++    if (parent === current) return undefined;
++    current = parent;
++  }
++}
+ 
+ function piNpmPackageName(source: string): string | undefined {
+   if (!source.startsWith("npm:")) return undefined;
+@@ -171,7 +191,8 @@ function piEnabledPackageExtensions(
+  * aborts pi), which must not cost the user every other extension they have.
+  * Mirrors pi's own discovery roots and user npm package manifests:
+  * `<agent dir>/extensions`, `settings.json` package `pi.extensions`, and the
+- * project-local `.pi/extensions` only when the user's `defaultProjectTrust` is `always` —
++ * project-local `.pi/extensions` only under Pi's recorded per-project trust
++ * or, when no decision exists, `defaultProjectTrust: "always"` —
+  * explicit `--extension` paths bypass pi's trust prompt, so anything short
+  * of standing trust must not be silently loaded. Pi's `pi-subagents` package
+  * and conventional `subagent` entries are skipped in favor of the T3 override.
+@@ -195,12 +216,24 @@ export const discoverPiUserExtensions = Effect.fn("discoverPiUserExtensions")(fu
+   const settings = Option.getOrUndefined(decodePiSettings(settingsRaw));
+   const roots: Array<string> = [];
+   if (normalizedAgentDir !== undefined) roots.push(`${normalizedAgentDir}/extensions`);
+-  if (
+-    normalizedAgentDir !== undefined &&
+-    input.cwd !== undefined &&
+-    settings?.defaultProjectTrust === "always"
+-  ) {
+-    roots.push(`${normalizePiPath(input.cwd)}/.pi/extensions`);
++  if (normalizedAgentDir !== undefined && input.cwd !== undefined) {
++    const trustPath = `${normalizedAgentDir}/trust.json`;
++    const trustExists = yield* fs.exists(trustPath).pipe(Effect.orElseSucceed(() => false));
++    const trustRaw = trustExists
++      ? yield* fs.readFileString(trustPath).pipe(Effect.orElseSucceed(() => ""))
++      : undefined;
++    const trustStore =
++      trustRaw === undefined ? {} : Option.getOrUndefined(decodePiTrustStore(trustRaw));
++    const resolvedCwd = NodePath.resolve(input.cwd);
++    const canonicalCwd = yield* fs
++      .realPath(resolvedCwd)
++      .pipe(Effect.orElseSucceed(() => resolvedCwd));
++    const decision =
++      trustStore === undefined ? false : piNearestProjectTrustDecision(trustStore, canonicalCwd);
++    const projectTrusted = decision ?? settings?.defaultProjectTrust === "always";
++    if (projectTrusted) {
++      roots.push(`${normalizePiPath(input.cwd)}/.pi/extensions`);
++    }
+   }
+   const found: Array<string> = [];
+   const addFound = (path: string) => {
+-- 
+2.50.1 (Apple Git-155)
+

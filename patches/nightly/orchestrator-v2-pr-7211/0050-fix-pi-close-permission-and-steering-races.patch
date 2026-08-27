@@ -1,0 +1,160 @@
+From d4488ed0b6ba4fcf22dd30b5937ce7b6052709dc Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 11:01:02 +0200
+Subject: [PATCH] fix(pi): close permission and steering races
+
+---
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 37 ++++++++++---------
+ .../Adapters/piT3McpInjection.test.ts         | 19 +++++++++-
+ .../Adapters/piT3McpInjection.ts              | 14 +++----
+ 3 files changed, 44 insertions(+), 26 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index f7a2b45f6..292ec17a4 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -350,12 +350,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               }),
+           ),
+         );
+-      const extensionPath =
+-        mcpSession === undefined
+-          ? undefined
+-          : yield* provideCacheFs(
+-              materializePiT3McpExtension(options.serverConfig.providerStatusCacheDir),
+-            );
++      // The extension owns both the optional MCP bridge and Pi's permission
++      // hook. Materialize it even when this session has no MCP credential so
++      // Supervised never silently degrades to unrestricted tool execution.
++      const extensionPath = yield* provideCacheFs(
++        materializePiT3McpExtension(options.serverConfig.providerStatusCacheDir),
++      );
+       const resolvedLaunchArgs = resolvePiLaunchArgs(options.settings.launchArgs);
+       if (!resolvedLaunchArgs.ok) {
+         return yield* protocolError(resolvedLaunchArgs.message);
+@@ -1338,6 +1338,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               // errorMessage and deserve a visible failed compaction item.
+               const errorMessage = recordString(event, "errorMessage");
+               if (event["aborted"] === true || errorMessage === undefined) return;
++              // Threshold compaction can run after a successful answer. Its
++              // failure is visible, but must not replace that successful turn;
++              // overflow failures already arrive through message_end above.
+               const failedItemId = `compaction:${turn.nextItemOrdinal}`;
+               yield* emit({
+                 type: "turn_item.updated",
+@@ -1926,19 +1929,19 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               steerInput.message.text,
+               steerInput.message.attachments,
+             );
+-            // Reading attachments suspends, so the turn is revalidated here:
+-            // without this a steer resolved after the turn ended would be
+-            // accepted by an idle session or by the next turn.
+-            if (threadState?.activeTurn !== turn) {
+-              return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
+-            }
+             // Same fire-and-forget contract as `prompt`: a steer that expands
+-            // a slash command must not block on the ack.
++            // a slash command must not block on the ack. The final active-turn
++            // check lives inside the permit so settlement cannot overtake it.
+             yield* sessionEventPermit.withPermits(1)(
+-              connection.send({
+-                type: "steer",
+-                message: payload.message,
+-                ...(payload.images.length === 0 ? {} : { images: payload.images }),
++              Effect.gen(function* () {
++                if (threadState?.activeTurn !== turn) {
++                  return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
++                }
++                yield* connection.send({
++                  type: "steer",
++                  message: payload.message,
++                  ...(payload.images.length === 0 ? {} : { images: payload.images }),
++                });
+               }),
+             );
+           }).pipe(
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+index 40b858a2b..c29637055 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.test.ts
+@@ -29,7 +29,7 @@ const mcpSession = {
+ };
+ 
+ describe("pi T3 MCP injection", () => {
+-  it("adds only the namespaced T3 MCP bridge to the native Pi launch", () => {
++  it("always adds the permission bridge and configures MCP when available", () => {
+     const launch = buildPiRpcLaunch({
+       launchArgs: [
+         "--extension",
+@@ -56,6 +56,23 @@ describe("pi T3 MCP injection", () => {
+     assert.equal(launch.env[T3_MCP_URL_ENV], "http://127.0.0.1:43123/mcp");
+     assert.equal(launch.env[T3_MCP_BEARER_ENV], "secret-pi-token");
+     assert.equal(launch.env[T3_PI_RUNTIME_MODE_ENV], "approval-required");
++
++    const permissionOnly = buildPiRpcLaunch({
++      launchArgs: [],
++      environment: {},
++      mcpSession: undefined,
++      extensionPath: "/tmp/cache/pi-t3-mcp-extension.ts",
++      runtimeMode: "auto-accept-edits",
++    });
++    assert.deepEqual(permissionOnly.args, [
++      "--mode",
++      "rpc",
++      "--extension",
++      "/tmp/cache/pi-t3-mcp-extension.ts",
++    ]);
++    assert.isFalse(permissionOnly.hasT3Mcp);
++    assert.isUndefined(permissionOnly.env[T3_MCP_URL_ENV]);
++    assert.equal(permissionOnly.env[T3_PI_RUNTIME_MODE_ENV], "auto-accept-edits");
+   });
+ 
+   it("forces tools and user extensions off for unattended text generation", () => {
+diff --git a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+index 10efe2bb2..0f382ba3f 100644
+--- a/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
++++ b/apps/server/src/orchestration-v2/Adapters/piT3McpInjection.ts
+@@ -235,10 +235,8 @@ export function buildPiRpcLaunch(input: {
+   readonly env: NodeJS.ProcessEnv;
+   readonly hasT3Mcp: boolean;
+ } {
+-  const hasT3Mcp =
+-    input.disableExtensions !== true &&
+-    input.mcpSession !== undefined &&
+-    input.extensionPath !== undefined;
++  const hasT3Extension = input.disableExtensions !== true && input.extensionPath !== undefined;
++  const hasT3Mcp = hasT3Extension && input.mcpSession !== undefined;
+   const extensionSafeArgs =
+     input.disableExtensions === true
+       ? withoutExplicitExtensions(input.launchArgs)
+@@ -256,7 +254,7 @@ export function buildPiRpcLaunch(input: {
+     ...(input.disableTools === true ? ["--no-tools"] : []),
+   ];
+   if (
+-    hasT3Mcp &&
++    hasT3Extension &&
+     input.extensionPath !== undefined &&
+     !hasExplicitExtension(args, input.extensionPath)
+   ) {
+@@ -267,15 +265,15 @@ export function buildPiRpcLaunch(input: {
+     args,
+     env: {
+       ...input.environment,
++      ...(hasT3Extension && input.runtimeMode !== undefined
++        ? { [T3_PI_RUNTIME_MODE_ENV]: input.runtimeMode }
++        : {}),
+       ...(hasT3Mcp && input.mcpSession !== undefined
+         ? {
+             [T3_MCP_URL_ENV]: input.mcpSession.endpoint,
+             [T3_MCP_BEARER_ENV]: bearerTokenFromAuthorizationHeader(
+               input.mcpSession.authorizationHeader,
+             ),
+-            ...(input.runtimeMode === undefined
+-              ? {}
+-              : { [T3_PI_RUNTIME_MODE_ENV]: input.runtimeMode }),
+           }
+         : {}),
+     },
+-- 
+2.50.1 (Apple Git-155)
+

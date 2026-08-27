@@ -1,0 +1,453 @@
+From 9ec848c06b5facf634146499ff65f585f3c3a30c Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 15:49:05 +0200
+Subject: [PATCH] feat(providers): Pi session-tree rollback and session-name
+ sync
+
+Turn boundaries now capture pi session-tree refs: each provider turn's
+nativeTurnRef becomes its first user entry id and the thread's
+nativeConversationHeadRef tracks the tree leaf, giving rollback a durable
+target. rollbackThread re-roots the active branch with pi's fork command,
+so reverting a checkpoint also rewinds the provider conversation instead
+of marking it divergent. Thread titles sync into pi's session name so T3
+threads stay identifiable in pi's own /resume listing.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/PiAdapterV2.test.ts              | 129 ++++++++++++++-
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 153 +++++++++++++++++-
+ 2 files changed, 272 insertions(+), 10 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 0b9a67b24..463e7cfaf 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -1,9 +1,11 @@
+ import { assert, describe, it } from "@effect/vitest";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import {
++  CheckpointId,
+   NodeId,
+   ProviderInstanceId,
+   ProviderSessionId,
++  ProviderTurnId,
+   RunAttemptId,
+   RunId,
+   ThreadId,
+@@ -11,6 +13,7 @@ import {
+   type ModelSelection,
+   type OrchestrationV2AppThread,
+   type OrchestrationV2ProviderThread,
++  type OrchestrationV2ProviderTurn,
+ } from "@t3tools/contracts";
+ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+@@ -29,7 +32,12 @@ import {
+   type ProviderAdapterV2Event,
+   type ProviderAdapterV2SessionRuntime,
+ } from "../ProviderAdapter.ts";
+-import { makePiAdapterV2, PiProviderCapabilitiesV2, PI_PROVIDER } from "./PiAdapterV2.ts";
++import {
++  makePiAdapterV2,
++  piRollbackForkEntry,
++  PiProviderCapabilitiesV2,
++  PI_PROVIDER,
++} from "./PiAdapterV2.ts";
+ import { makePiRpcConnection, type PiRpcRecord } from "./PiRpc.ts";
+ 
+ const serverConfigLayer = ServerConfig.layerTest(process.cwd(), {
+@@ -63,6 +71,8 @@ interface FakePi {
+   readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
+   readonly emit: (record: PiRpcRecord) => Effect.Effect<void>;
+   readonly takeRequest: (type: string) => Effect.Effect<PiRpcRecord>;
++  /** Data returned by the next `get_entries` acks, consumed in order. */
++  readonly queueEntries: (data: unknown) => void;
+ }
+ 
+ /**
+@@ -72,6 +82,7 @@ interface FakePi {
+ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   const stdout = yield* Queue.unbounded<Uint8Array>();
+   const requests = yield* Queue.unbounded<PiRpcRecord>();
++  const entriesQueue: Array<unknown> = [];
+   let stdinBuffer = "";
+ 
+   const emit = (record: PiRpcRecord) =>
+@@ -102,6 +113,10 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+         };
+       case "switch_session":
+         return { ...base, data: { cancelled: false } };
++      case "get_entries":
++        return { ...base, data: entriesQueue.shift() ?? { entries: [], leafId: null } };
++      case "fork":
++        return { ...base, data: { cancelled: false, message: "forked" } };
+       default:
+         return base;
+     }
+@@ -149,7 +164,12 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+       }
+     });
+ 
+-  return { spawner, emit, takeRequest } satisfies FakePi;
++  return {
++    spawner,
++    emit,
++    takeRequest,
++    queueEntries: (data) => entriesQueue.push(data),
++  } satisfies FakePi;
+ });
+ 
+ const makeAdapter = Effect.fnUntraced(function* (fake: FakePi) {
+@@ -357,6 +377,111 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
++  it.effect("syncs the thread title into pi's session name before prompting", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      // takeRequest discards preceding records, so this also proves ordering.
++      const setName = yield* fake.takeRequest("set_session_name");
++      assert.equal(setName["name"], "Pi test thread");
++      yield* fake.takeRequest("prompt");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("captures session-tree refs at turn boundaries and rolls back via fork", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      // First get_entries ack baselines the leaf during ensureThread; the
++      // second answers the finalize capture with this turn's user entry.
++      fake.queueEntries({ entries: [], leafId: "leaf-0" });
++      fake.queueEntries({
++        entries: [{ type: "message", id: "u1", message: { role: "user" } }],
++        leafId: "a1",
++      });
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({ type: "agent_settled" });
++      const finalTurn = yield* takeEvent(
++        (event) =>
++          event.type === "provider_turn.updated" && event.providerTurn.status === "completed",
++      );
++      yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(
++        finalTurn.type === "provider_turn.updated" &&
++          finalTurn.providerTurn.nativeTurnRef?.nativeId === "u1" &&
++          finalTurn.providerTurn.nativeTurnRef.strength === "strong",
++      );
++
++      const turnRef = (ordinal: number, nativeId: string): OrchestrationV2ProviderTurn => ({
++        id: ProviderTurnId.make(`provider-turn:test:${ordinal}`),
++        providerThreadId: providerThread.id,
++        nodeId: NodeId.make(`node:test:${ordinal}`),
++        runAttemptId: null,
++        nativeTurnRef: { driver: PI_PROVIDER, nativeId, strength: "strong" },
++        ordinal,
++        status: "completed",
++        startedAt: null,
++        completedAt: null,
++      });
++      yield* runtime.rollbackThread({
++        providerThread,
++        target: {
++          type: "provider_turn",
++          checkpointId: CheckpointId.make("checkpoint:test:1"),
++          appRunOrdinal: 1,
++          providerTurn: turnRef(1, "u1"),
++        },
++        providerThreadTurns: [turnRef(1, "u1"), turnRef(2, "u2")],
++      });
++      const fork = yield* fake.takeRequest("fork");
++      assert.equal(fork["entryId"], "u2");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it("resolves rollback fork entries from captured turn refs", () => {
++    const turn = (ordinal: number, ref: OrchestrationV2ProviderTurn["nativeTurnRef"]) =>
++      ({ ordinal, nativeTurnRef: ref }) as OrchestrationV2ProviderTurn;
++    const strong = (nativeId: string) =>
++      ({ driver: PI_PROVIDER, nativeId, strength: "strong" }) as const;
++    const weak = (nativeId: string) =>
++      ({ driver: PI_PROVIDER, nativeId, strength: "weak" }) as const;
++    // No turns after the target: nothing to discard.
++    assert.isNull(
++      piRollbackForkEntry({
++        target: { type: "provider_turn", providerTurn: turn(2, strong("u2")) },
++        providerThreadTurns: [turn(1, strong("u1")), turn(2, strong("u2"))],
++      }),
++    );
++    // Boundary turn without a captured (strong) entry ref cannot roll back.
++    assert.isUndefined(
++      piRollbackForkEntry({
++        target: { type: "provider_turn", providerTurn: turn(1, strong("u1")) },
++        providerThreadTurns: [turn(1, strong("u1")), turn(2, weak("synthetic"))],
++      }),
++    );
++    // thread_start discards everything from the first captured turn.
++    assert.equal(
++      piRollbackForkEntry({
++        target: { type: "thread_start" },
++        providerThreadTurns: [turn(2, strong("u2")), turn(1, strong("u1"))],
++      }),
++      "u1",
++    );
++  });
++
+   it.effect("settles a command-only prompt from its deferred ack and idle probe", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index b19db1aed..d9cc6696f 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -79,6 +79,7 @@ import {
+   type ProviderAdapterV2SessionRuntime,
+   type ProviderAdapterV2Shape,
+   type ProviderAdapterV2SteerInput,
++  type ProviderAdapterV2ThreadSnapshot,
+   type ProviderAdapterV2TurnInput,
+ } from "../ProviderAdapter.ts";
+ import {
+@@ -122,7 +123,7 @@ export const PiProviderCapabilitiesV2 = {
+   threads: {
+     canCreateEmptyThread: true,
+     canReadThreadSnapshot: false,
+-    canRollbackThread: false,
++    canRollbackThread: true,
+     canForkThread: false,
+     canForkFromTurn: false,
+     canForkFromSubagentThread: false,
+@@ -192,7 +193,7 @@ export const PiProviderCapabilitiesV2 = {
+   checkpointing: {
+     appCanCheckpointFilesystem: true,
+     supportsNestedCheckpointScopes: false,
+-    providerCanRollbackConversation: false,
++    providerCanRollbackConversation: true,
+     providerRollbackReturnsSnapshot: false,
+     providerCanReadConversationSnapshot: false,
+   },
+@@ -366,6 +367,14 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       let threadState: PiThreadState | null = null;
+       let appliedModel: string | null = null;
+       let appliedThinking: string | null = null;
++      /** Last thread title synced into pi's session name (`/resume` listing). */
++      let appliedSessionName: string | null = null;
++      /**
++       * Leaf entry id of the pi session tree as of the last turn boundary.
++       * Turn-start user entries are located relative to it, giving each
++       * provider turn a durable native ref for session-tree rollback.
++       */
++      let lastKnownLeaf: string | null = null;
+       // Pi's own configured defaults, captured from the first `get_state` so
+       // that selecting "Pi default"/"inherit" again can restore them. Pi has no
+       // "unset model" command, so the baseline has to be replayed explicitly.
+@@ -864,6 +873,37 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+ 
+       // ── turn lifecycle ────────────────────────────────────
+ 
++      /**
++       * Locate this turn's first user entry and the new leaf in pi's session
++       * tree. The user-entry id becomes the provider turn's native ref (the
++       * point `fork` rolls back to); the leaf becomes the conversation head.
++       * Pure bookkeeping: failures degrade to the synthetic refs.
++       */
++      const captureTurnTreeRefs = Effect.fnUntraced(function* () {
++        const data = yield* request({
++          type: "get_entries",
++          ...(lastKnownLeaf === null ? {} : { since: lastKnownLeaf }),
++        }).pipe(Effect.orElseSucceed(() => undefined));
++        if (data === undefined) return null;
++        const entries = recordField(data, "entries");
++        const leafId = recordString(data, "leafId");
++        if (leafId !== undefined) lastKnownLeaf = leafId;
++        const firstUserEntryId = Array.isArray(entries)
++          ? entries
++              .filter(
++                (entry) =>
++                  recordField(entry, "type") === "message" &&
++                  recordString(recordField(entry, "message"), "role") === "user",
++              )
++              .map((entry) => recordString(entry, "id"))
++              .find((id) => id !== undefined)
++          : undefined;
++        return {
++          turnStartEntryId: firstUserEntryId ?? null,
++          leafId: leafId ?? null,
++        };
++      });
++
+       const finalizeTurn = Effect.fnUntraced(function* (state: PiThreadState) {
+         const turn = state.activeTurn;
+         if (turn === null) return;
+@@ -871,6 +911,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         const completedAt = yield* DateTime.now;
+         yield* completeOpenStreamItems(turn);
+         yield* cancelPendingPrompts(completedAt);
++        const treeRefs = yield* captureTurnTreeRefs();
+         const failure = turn.interrupted ? null : turn.failure;
+         yield* emit({
+           type: "provider_turn.updated",
+@@ -878,11 +919,19 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           threadId: turn.turnInput.threadId,
+           providerTurn: {
+             ...turn.providerTurn,
++            ...(treeRefs?.turnStartEntryId == null
++              ? {}
++              : { nativeTurnRef: providerRef(treeRefs.turnStartEntryId) }),
+             status: turn.interrupted ? "interrupted" : failure !== null ? "failed" : "completed",
+             completedAt,
+           },
+         });
+-        yield* updateProviderThread(state, { status: "idle" });
++        yield* updateProviderThread(state, {
++          status: "idle",
++          ...(treeRefs?.leafId == null
++            ? {}
++            : { nativeConversationHeadRef: providerRef(treeRefs.leafId) }),
++        });
+         yield* updateProviderSession(failure !== null ? "error" : "ready");
+         if (failure !== null) {
+           const failureItemId = `terminal-failure:${turn.providerTurn.id}`;
+@@ -1237,6 +1286,13 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+                 updatedAt: createdAt,
+               };
+         threadState = { providerThread, activeTurn: null };
++        // Baseline the session-tree leaf so the first turn's user entry can
++        // be located with a `since` cursor instead of a full entry scan.
++        lastKnownLeaf =
++          recordString(
++            yield* request({ type: "get_entries" }).pipe(Effect.orElseSucceed(() => undefined)),
++            "leafId",
++          ) ?? null;
+         yield* emit({
+           type: "provider_thread.updated",
+           driver: PI_PROVIDER,
+@@ -1371,6 +1427,20 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               );
+             }
+             yield* applySelection(turnInput.modelSelection);
++            // Mirror the thread title into pi's session name so the session
++            // stays identifiable in pi's own /resume listing. Best-effort:
++            // naming must never block a turn.
++            if (turnInput.appThread.title !== appliedSessionName) {
++              yield* request({
++                type: "set_session_name",
++                name: turnInput.appThread.title,
++              }).pipe(
++                Effect.tap(() =>
++                  Effect.sync(() => (appliedSessionName = turnInput.appThread.title)),
++                ),
++                Effect.ignore,
++              );
++            }
+             // Resolved before the turn is installed: a failure here (an
+             // unreadable attachment) must not leave `activeTurn` set, which
+             // would reject every later turn as already active.
+@@ -1560,11 +1630,48 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             }),
+           ),
+         rollbackThread: (rollbackInput) =>
+-          Effect.fail(
+-            new ProviderAdapterRollbackThreadError({
+-              driver: PI_PROVIDER,
+-              providerThreadId: rollbackInput.providerThread.id,
+-            }),
++          Effect.gen(function* () {
++            const state = threadState;
++            if (state === null) {
++              return yield* protocolError("Pi session has no registered thread");
++            }
++            if (state.activeTurn !== null) {
++              return yield* protocolError("Cannot roll back while a Pi turn is active");
++            }
++            // `fork(entryId)` re-roots the active branch before that user
++            // message, so the rollback boundary is the first user entry of
++            // the earliest turn being discarded.
++            const forkEntryId = piRollbackForkEntry(rollbackInput);
++            if (forkEntryId === null) {
++              // Nothing after the target: the conversation is already there.
++              return piThreadSnapshot(state.providerThread);
++            }
++            if (forkEntryId === undefined) {
++              return yield* protocolError("Pi rollback target has no captured session-tree entry");
++            }
++            const forkData = yield* request({ type: "fork", entryId: forkEntryId });
++            if (recordField(forkData, "cancelled") === true) {
++              return yield* protocolError("A Pi extension cancelled the session fork");
++            }
++            const entriesData = yield* request({ type: "get_entries" }).pipe(
++              Effect.orElseSucceed(() => undefined),
++            );
++            const leafId = recordString(entriesData, "leafId") ?? null;
++            lastKnownLeaf = leafId;
++            yield* updateProviderThread(state, {
++              nativeConversationHeadRef: leafId === null ? null : providerRef(leafId),
++            });
++            return piThreadSnapshot(state.providerThread);
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterRollbackThreadError({
++                  driver: PI_PROVIDER,
++                  providerThreadId: rollbackInput.providerThread.id,
++                  checkpointId: rollbackInput.target.checkpointId,
++                  cause,
++                }),
++            ),
+           ),
+         forkThread: (forkInput) =>
+           Effect.fail(
+@@ -1579,6 +1686,36 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+   });
+ }
+ 
++/**
++ * Resolve the pi session-tree entry `fork` should re-root at for a rollback.
++ * Returns `null` when no turns follow the target (nothing to discard) and
++ * `undefined` when the boundary turn has no captured entry ref (only
++ * turn-boundary refs recorded by `captureTurnTreeRefs` are strong).
++ */
++export function piRollbackForkEntry(input: {
++  readonly target:
++    | { readonly type: "thread_start" }
++    | { readonly type: "provider_turn"; readonly providerTurn: OrchestrationV2ProviderTurn };
++  readonly providerThreadTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
++}): string | null | undefined {
++  const boundaryOrdinal =
++    input.target.type === "thread_start" ? 0 : input.target.providerTurn.ordinal;
++  const discarded = input.providerThreadTurns
++    .filter((turn) => turn.ordinal > boundaryOrdinal)
++    .sort((a, b) => a.ordinal - b.ordinal);
++  const boundary = discarded[0];
++  if (boundary === undefined) return null;
++  const ref = boundary.nativeTurnRef;
++  if (ref === null || ref.strength !== "strong" || ref.nativeId === null) return undefined;
++  return ref.nativeId;
++}
++
++function piThreadSnapshot(
++  providerThread: OrchestrationV2ProviderThread,
++): ProviderAdapterV2ThreadSnapshot {
++  return { providerThread, providerTurns: [], messages: [], runtimeRequests: [] };
++}
++
+ function piQuestion(
+   questionId: string,
+   method: "select" | "input" | "editor",
+-- 
+2.50.1 (Apple Git-155)
+

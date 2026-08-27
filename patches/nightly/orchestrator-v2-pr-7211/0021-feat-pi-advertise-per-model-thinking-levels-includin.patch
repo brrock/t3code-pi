@@ -1,0 +1,303 @@
+From 929354f47fcc2fc958d0b9628636344766731519 Mon Sep 17 00:00:00 2001
+From: Mike Olson <mwolson@member.fsf.org>
+Date: Sun, 16 Aug 2026 22:18:02 -0400
+Subject: [PATCH] feat(pi): advertise per-model thinking levels including Extra
+ High
+
+Pi discovery used one High-capped picker for every reasoning model.
+get_available_thinking_levels is session-scoped, so catalog discovery
+now reads each get_available_models thinkingLevelMap instead. Extra
+High and Max appear only when the map has a non-null entry.
+---
+ apps/server/src/provider/Layers/PiProvider.ts | 44 ++--------
+ .../Layers/piThinkingCapabilities.test.ts     | 87 ++++++++++++++++++
+ .../provider/Layers/piThinkingCapabilities.ts | 88 +++++++++++++++++++
+ 3 files changed, 182 insertions(+), 37 deletions(-)
+ create mode 100644 apps/server/src/provider/Layers/piThinkingCapabilities.test.ts
+ create mode 100644 apps/server/src/provider/Layers/piThinkingCapabilities.ts
+
+diff --git a/apps/server/src/provider/Layers/PiProvider.ts b/apps/server/src/provider/Layers/PiProvider.ts
+index ecdc9b276..19cd59d0a 100644
+--- a/apps/server/src/provider/Layers/PiProvider.ts
++++ b/apps/server/src/provider/Layers/PiProvider.ts
+@@ -9,7 +9,6 @@
+  * shows up in T3 without any hardcoded catalog.
+  */
+ import {
+-  type ModelCapabilities,
+   type PiSettings,
+   type ServerProvider,
+   type ServerProviderModel,
+@@ -17,7 +16,6 @@ import {
+   type ServerProviderSlashCommand,
+ } from "@t3tools/contracts";
+ import { causeErrorTag } from "@t3tools/shared/observability";
+-import { createModelCapabilities } from "@t3tools/shared/model";
+ import { resolveSpawnCommand } from "@t3tools/shared/shell";
+ import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+ import * as DateTime from "effect/DateTime";
+@@ -41,6 +39,10 @@ import {
+   enrichProviderSnapshotWithVersionAdvisory,
+   type ProviderMaintenanceCapabilities,
+ } from "../providerMaintenance.ts";
++import {
++  EMPTY_PI_MODEL_CAPABILITIES,
++  thinkingCapabilitiesForPiModel,
++} from "./piThinkingCapabilities.ts";
+ 
+ const PI_PRESENTATION = {
+   displayName: "Pi",
+@@ -52,43 +54,12 @@ const PI_PRESENTATION = {
+ const VERSION_PROBE_TIMEOUT_MS = 4_000;
+ const PI_RPC_DISCOVERY_TIMEOUT_MS = 15_000;
+ 
+-const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+-  optionDescriptors: [],
+-});
+-
+-/**
+- * Reasoning-capable Pi models expose Pi's thinking levels. "Inherit" leaves
+- * the user's settings.json `defaultThinkingLevel` untouched.
+- *
+- * Only the levels every reasoning model accepts are advertised. Pi exposes
+- * `xhigh` and `max` per model (see `get_available_thinking_levels`), and
+- * offering them globally makes `set_thinking_level` fail on models that lack
+- * them, which blocks the turn from starting.
+- */
+-const THINKING_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+-  optionDescriptors: [
+-    {
+-      id: "thinking",
+-      label: "Thinking",
+-      type: "select",
+-      options: [
+-        { id: "inherit", label: "Pi default", isDefault: true },
+-        { id: "off", label: "Off" },
+-        { id: "minimal", label: "Minimal" },
+-        { id: "low", label: "Low" },
+-        { id: "medium", label: "Medium" },
+-        { id: "high", label: "High" },
+-      ],
+-    },
+-  ],
+-});
+-
+ /** Deferring to the user's own settings.json default model. */
+ const PI_DEFAULT_MODEL: ServerProviderModel = {
+   slug: "default",
+   name: "Pi default",
+   isCustom: false,
+-  capabilities: EMPTY_CAPABILITIES,
++  capabilities: EMPTY_PI_MODEL_CAPABILITIES,
+ };
+ 
+ interface PiDiscovery {
+@@ -105,7 +76,7 @@ function piModelsFromSettings(
+   return providerModelsFromSettings(
+     [PI_DEFAULT_MODEL, ...discovered],
+     customModels ?? [],
+-    EMPTY_CAPABILITIES,
++    EMPTY_PI_MODEL_CAPABILITIES,
+   );
+ }
+ 
+@@ -135,8 +106,7 @@ function parseDiscoveredModels(data: unknown): ReadonlyArray<ServerProviderModel
+       slug,
+       name: recordString(model, "name") ?? slug,
+       isCustom: false,
+-      capabilities:
+-        recordField(model, "reasoning") === true ? THINKING_CAPABILITIES : EMPTY_CAPABILITIES,
++      capabilities: thinkingCapabilitiesForPiModel(model),
+     });
+   }
+   return parsed;
+diff --git a/apps/server/src/provider/Layers/piThinkingCapabilities.test.ts b/apps/server/src/provider/Layers/piThinkingCapabilities.test.ts
+new file mode 100644
+index 000000000..a89138d55
+--- /dev/null
++++ b/apps/server/src/provider/Layers/piThinkingCapabilities.test.ts
+@@ -0,0 +1,87 @@
++import { assert, describe, it } from "@effect/vitest";
++
++import {
++  EMPTY_PI_MODEL_CAPABILITIES,
++  supportedPiThinkingLevelsFromModel,
++  thinkingCapabilitiesForPiModel,
++} from "./piThinkingCapabilities.ts";
++
++describe("supportedPiThinkingLevelsFromModel", () => {
++  it("returns no levels when the model does not advertise reasoning", () => {
++    assert.deepEqual(supportedPiThinkingLevelsFromModel({ reasoning: false }), []);
++    assert.deepEqual(supportedPiThinkingLevelsFromModel({}), []);
++  });
++
++  it("advertises off through high without Extra High or Max when the map is absent", () => {
++    assert.deepEqual(supportedPiThinkingLevelsFromModel({ reasoning: true }), [
++      "off",
++      "minimal",
++      "low",
++      "medium",
++      "high",
++    ]);
++  });
++
++  it("adds Extra High and Max only when the map has a non-null entry", () => {
++    assert.deepEqual(
++      supportedPiThinkingLevelsFromModel({
++        reasoning: true,
++        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
++      }),
++      ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
++    );
++  });
++
++  it("hides a mapped-null level and keeps Extra High when only that entry exists", () => {
++    assert.deepEqual(
++      supportedPiThinkingLevelsFromModel({
++        reasoning: true,
++        thinkingLevelMap: { off: null, xhigh: "extra_high" },
++      }),
++      ["minimal", "low", "medium", "high", "xhigh"],
++    );
++  });
++
++  it("does not treat a null Extra High or Max entry as supported", () => {
++    assert.deepEqual(
++      supportedPiThinkingLevelsFromModel({
++        reasoning: true,
++        thinkingLevelMap: { xhigh: null, max: null },
++      }),
++      ["off", "minimal", "low", "medium", "high"],
++    );
++  });
++});
++
++describe("thinkingCapabilitiesForPiModel", () => {
++  it("returns empty capabilities for a non-reasoning model", () => {
++    assert.deepEqual(
++      thinkingCapabilitiesForPiModel({ reasoning: false }),
++      EMPTY_PI_MODEL_CAPABILITIES,
++    );
++  });
++
++  it("prepends inherit and labels Extra High for grok-4.6-shaped maps", () => {
++    const capabilities = thinkingCapabilitiesForPiModel({
++      reasoning: true,
++      thinkingLevelMap: { xhigh: "xhigh" },
++    });
++    const descriptors = capabilities.optionDescriptors ?? [];
++    const thinking = descriptors[0];
++    assert.equal(thinking?.id, "thinking");
++    assert.equal(thinking?.type, "select");
++    if (thinking?.type !== "select") return;
++    assert.deepEqual(
++      thinking.options.map((option) => [option.id, option.label, option.isDefault === true]),
++      [
++        ["inherit", "Pi default", true],
++        ["off", "Off", false],
++        ["minimal", "Minimal", false],
++        ["low", "Low", false],
++        ["medium", "Medium", false],
++        ["high", "High", false],
++        ["xhigh", "Extra High", false],
++      ],
++    );
++  });
++});
+diff --git a/apps/server/src/provider/Layers/piThinkingCapabilities.ts b/apps/server/src/provider/Layers/piThinkingCapabilities.ts
+new file mode 100644
+index 000000000..f6ffed21c
+--- /dev/null
++++ b/apps/server/src/provider/Layers/piThinkingCapabilities.ts
+@@ -0,0 +1,88 @@
++import { type ModelCapabilities, type ProviderOptionChoice } from "@t3tools/contracts";
++import { createModelCapabilities } from "@t3tools/shared/model";
++
++/**
++ * Pi's full thinking ladder. Extra High (`xhigh`) and Max are opt-in per
++ * model via `thinkingLevelMap`; advertising them globally makes
++ * `set_thinking_level` fail on models that lack them.
++ */
++export const PI_THINKING_LEVELS = [
++  "off",
++  "minimal",
++  "low",
++  "medium",
++  "high",
++  "xhigh",
++  "max",
++] as const;
++
++export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
++
++const PI_THINKING_LEVEL_LABELS: Record<PiThinkingLevel, string> = {
++  off: "Off",
++  minimal: "Minimal",
++  low: "Low",
++  medium: "Medium",
++  high: "High",
++  xhigh: "Extra High",
++  max: "Max",
++};
++
++const INHERIT_CHOICE: ProviderOptionChoice = {
++  id: "inherit",
++  label: "Pi default",
++  isDefault: true,
++};
++
++export const EMPTY_PI_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
++  optionDescriptors: [],
++});
++
++export function thinkingCapabilitiesForPiModel(model: unknown): ModelCapabilities {
++  const levels = supportedPiThinkingLevelsFromModel(model);
++  if (levels.length === 0) return EMPTY_PI_MODEL_CAPABILITIES;
++  return createModelCapabilities({
++    optionDescriptors: [
++      {
++        id: "thinking",
++        label: "Thinking",
++        type: "select",
++        options: [
++          INHERIT_CHOICE,
++          ...levels.map((level) => ({
++            id: level,
++            label: PI_THINKING_LEVEL_LABELS[level],
++          })),
++        ],
++      },
++    ],
++  });
++}
++
++/**
++ * Mirror of `@earendil-works/pi-ai` `getSupportedThinkingLevels`.
++ *
++ * A reasoning model always exposes off through high unless a map entry is
++ * `null`. Extra High and Max appear only when the map has a non-null entry.
++ */
++export function supportedPiThinkingLevelsFromModel(model: unknown): ReadonlyArray<PiThinkingLevel> {
++  if (recordField(model, "reasoning") !== true) return [];
++  const thinkingLevelMap = thinkingLevelMapFromModel(model);
++  return PI_THINKING_LEVELS.filter((level) => {
++    const mapped = thinkingLevelMap?.[level];
++    if (mapped === null) return false;
++    if (level === "xhigh" || level === "max") return mapped !== undefined;
++    return true;
++  });
++}
++
++function thinkingLevelMapFromModel(model: unknown): Record<string, unknown> | undefined {
++  const value = recordField(model, "thinkingLevelMap");
++  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
++  return value as Record<string, unknown>;
++}
++
++function recordField(input: unknown, key: string): unknown {
++  if (typeof input !== "object" || input === null) return undefined;
++  return (input as Record<string, unknown>)[key];
++}
+-- 
+2.50.1 (Apple Git-155)
+

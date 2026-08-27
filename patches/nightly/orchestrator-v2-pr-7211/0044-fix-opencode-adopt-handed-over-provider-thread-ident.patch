@@ -1,0 +1,53 @@
+From 249e63001f12cc12924eca50600a205107e49a62 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 13:48:52 +0200
+Subject: [PATCH] fix(opencode): adopt handed-over provider thread identity
+
+The create path in ensureThread minted a fresh session-keyed row even
+when the caller handed over the run's provider thread, leaving the same
+two-live-rows hazard the Pi adapter just fixed. Bind the new native
+session to the caller's row instead, mirroring the Pi adopt branch.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/OpenCodeAdapterV2.ts               | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/OpenCodeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/OpenCodeAdapterV2.ts
+index 0991a1831..c6141c535 100644
+--- a/apps/server/src/orchestration-v2/Adapters/OpenCodeAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/OpenCodeAdapterV2.ts
+@@ -2376,7 +2376,7 @@ export function makeOpenCodeAdapterV2(options: OpenCodeAdapterV2Options): Provid
+               );
+               const nativeSession = unwrapData("session.create", response);
+               const createdAt = yield* DateTime.now;
+-              const providerThread = makeProviderThread({
++              const created = makeProviderThread({
+                 idAllocator,
+                 providerInstanceId: options.instanceId,
+                 providerSessionId: input.providerSessionId,
+@@ -2384,6 +2384,21 @@ export function makeOpenCodeAdapterV2(options: OpenCodeAdapterV2Options): Provid
+                 nativeSession,
+                 now: createdAt,
+               });
++              const existing = threadInput.existingProviderThread;
++              // Bind the new native session to the caller's row when one was
++              // handed over: a second live row per app thread would make
++              // `activeProviderThreadId` flap between the two on every update.
++              const providerThread =
++                existing === undefined
++                  ? created
++                  : {
++                      ...existing,
++                      providerSessionId: input.providerSessionId,
++                      nativeThreadRef: created.nativeThreadRef,
++                      nativeConversationHeadRef: created.nativeConversationHeadRef,
++                      status: created.status,
++                      updatedAt: created.updatedAt,
++                    };
+               registerThread(nativeSession, providerThread, null);
+               return providerThread;
+             }).pipe(
+-- 
+2.50.1 (Apple Git-155)
+

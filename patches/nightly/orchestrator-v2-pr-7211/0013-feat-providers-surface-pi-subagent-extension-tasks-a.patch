@@ -1,0 +1,291 @@
+From c084433b4eef41c0268423184d46bef2ded16dc0 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 18:21:52 +0200
+Subject: [PATCH] feat(providers): surface pi subagent-extension tasks as
+ native subagents
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The official pi subagent extension delegates work to separate pi
+processes through a 'subagent' tool and streams per-task results in its
+tool details. Project each delegated task into V2's native subagent
+surface — live progress, model, per-task success/failure, and final
+output — so extension-driven subagents get real subagent cards instead
+of an opaque tool row. Any other tool named subagent without that shape
+is ignored.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/PiAdapterV2.test.ts              | 101 ++++++++++++++
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 127 +++++++++++++++++-
+ 2 files changed, 226 insertions(+), 2 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 7153fbb52..dafd2ee88 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -490,6 +490,107 @@ describe("PiAdapterV2", () => {
+     );
+   });
+ 
++  it.effect("projects the subagent extension's tasks as native subagents", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({
++        type: "tool_execution_start",
++        toolCallId: "call_sub",
++        toolName: "subagent",
++        args: { tasks: [{ agent: "scout", task: "map the repo" }] },
++      });
++      yield* fake.emit({
++        type: "tool_execution_update",
++        toolCallId: "call_sub",
++        toolName: "subagent",
++        partialResult: {
++          content: [{ type: "text", text: "(running...)" }],
++          details: {
++            mode: "parallel",
++            results: [
++              {
++                agent: "scout",
++                task: "map the repo",
++                exitCode: 0,
++                stderr: "",
++                messages: [
++                  { role: "assistant", content: [{ type: "text", text: "scanning files" }] },
++                ],
++              },
++            ],
++          },
++        },
++      });
++      const running = yield* takeEvent(
++        (event) => event.type === "subagent.updated" && event.subagent.status === "running",
++      );
++      assert.isTrue(
++        running.type === "subagent.updated" &&
++          running.subagent.title === "scout" &&
++          running.subagent.prompt === "map the repo" &&
++          running.subagent.progress === "scanning files",
++      );
++      yield* fake.emit({
++        type: "tool_execution_end",
++        toolCallId: "call_sub",
++        toolName: "subagent",
++        isError: false,
++        result: {
++          content: [{ type: "text", text: "done" }],
++          details: {
++            mode: "parallel",
++            results: [
++              {
++                agent: "scout",
++                task: "map the repo",
++                exitCode: 0,
++                stopReason: "stop",
++                stderr: "",
++                messages: [
++                  { role: "assistant", content: [{ type: "text", text: "repo has one file" }] },
++                ],
++              },
++              {
++                agent: "worker",
++                task: "broken task",
++                exitCode: 1,
++                stderr: "boom",
++                messages: [],
++              },
++            ],
++          },
++        },
++      });
++      const doneCard = yield* takeEvent(
++        (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
++      );
++      assert.isTrue(
++        doneCard.type === "subagent.updated" && doneCard.subagent.result === "repo has one file",
++      );
++      const failedCard = yield* takeEvent(
++        (event) => event.type === "subagent.updated" && event.subagent.status === "failed",
++      );
++      assert.isTrue(
++        failedCard.type === "subagent.updated" &&
++          failedCard.subagent.title === "worker" &&
++          failedCard.subagent.result === "boom",
++      );
++      const subagentItem = yield* takeEvent(
++        (event) => event.type === "turn_item.updated" && event.turnItem.type === "subagent",
++      );
++      assert.equal(subagentItem.type, "turn_item.updated");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("settles a command-only prompt from its deferred ack and idle probe", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index b30779782..a7c7309d3 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -173,9 +173,12 @@ export const PiProviderCapabilitiesV2 = {
+     planDeltasHaveItemIds: false,
+   },
+   subagents: {
+-    supportsSubagents: false,
++    // Pi has no core subagents; the official subagent extension delegates to
++    // separate pi processes through a tool, and the adapter projects its
++    // per-task progress into native subagent lifecycle events when present.
++    supportsSubagents: true,
+     exposesSubagentThreadIds: false,
+-    emitsSubagentLifecycle: false,
++    emitsSubagentLifecycle: true,
+     canWaitForSubagents: false,
+     canCloseSubagents: false,
+     canForkSubagentThread: false,
+@@ -693,6 +696,101 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             ...(outputText.length > 0 ? { output: outputText } : {}),
+           },
+         });
++        if (toolName === "subagent") {
++          yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed);
++        }
++      });
++
++      /**
++       * Project the official pi subagent extension's per-task progress into
++       * v2's native subagent surface. The extension reports
++       * `details: { results: [{agent, task, exitCode, stopReason, messages,
++       * step?, model?}] }` on every tool update, so each delegated task
++       * becomes a first-class subagent card with live progress. Tolerant by
++       * design: any other tool named `subagent` without that shape is simply
++       * ignored.
++       */
++      const emitSubagentTasks = Effect.fnUntraced(function* (
++        turn: ActivePiTurn,
++        toolCallId: string,
++        resultRecord: unknown,
++        completed: boolean,
++      ) {
++        const results = recordField(recordField(resultRecord, "details"), "results");
++        if (!Array.isArray(results)) return;
++        const emittedAt = yield* DateTime.now;
++        for (const [index, result] of results.entries()) {
++          const agent = recordString(result, "agent");
++          const task = recordString(result, "task");
++          if (agent === undefined || task === undefined) continue;
++          const nativeTaskId = `${toolCallId}:subagent:${recordNumber(result, "step") ?? index}`;
++          const subagentId = idAllocator.derive.nodeFromProviderItem({
++            driver: PI_PROVIDER,
++            nativeItemId: nativeTaskId,
++          });
++          const startedAt = turn.toolStartedAt.get(nativeTaskId) ?? emittedAt;
++          turn.toolStartedAt.set(nativeTaskId, startedAt);
++          const stopReason = recordString(result, "stopReason");
++          const exitCode = recordNumber(result, "exitCode") ?? 0;
++          const failed =
++            (completed && exitCode !== 0) || stopReason === "error" || stopReason === "aborted";
++          const finished = completed || failed || stopReason !== undefined;
++          const status = failed ? "failed" : finished ? "completed" : "running";
++          const outputText = piSubagentOutput(result);
++          const title = recordString(result, "step") === undefined ? agent : `${agent}`;
++          yield* emit({
++            type: "subagent.updated",
++            driver: PI_PROVIDER,
++            subagent: {
++              id: subagentId,
++              threadId: turn.turnInput.threadId,
++              runId: turn.turnInput.runId,
++              parentNodeId: idAllocator.derive.nodeFromProviderItem({
++                driver: PI_PROVIDER,
++                nativeItemId: toolCallId,
++              }),
++              origin: "provider_native",
++              createdBy: "agent",
++              driver: PI_PROVIDER,
++              providerInstanceId: options.instanceId,
++              providerThreadId: turn.turnInput.providerThread.id,
++              childThreadId: null,
++              nativeTaskRef: providerRef(nativeTaskId),
++              prompt: task,
++              title,
++              model: recordString(result, "model") ?? null,
++              status,
++              ...(finished || outputText.length === 0
++                ? {}
++                : { progress: outputText.slice(0, 200) }),
++              result: finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null,
++              startedAt,
++              completedAt: finished ? emittedAt : null,
++              updatedAt: emittedAt,
++            },
++          });
++          yield* emit({
++            type: "turn_item.updated",
++            driver: PI_PROVIDER,
++            turnItem: {
++              ...baseItemFields(turn, nativeTaskId, startedAt, emittedAt),
++              status,
++              title,
++              completedAt: finished ? emittedAt : null,
++              type: "subagent",
++              subagentId,
++              origin: "provider_native",
++              driver: PI_PROVIDER,
++              providerInstanceId: options.instanceId,
++              childThreadId: null,
++              prompt: task,
++              ...(finished || outputText.length === 0
++                ? {}
++                : { progress: outputText.slice(0, 200) }),
++              result: finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null,
++            },
++          });
++        }
+       });
+ 
+       // ── extension UI prompts ──────────────────────────────
+@@ -1739,6 +1837,31 @@ export function piRollbackForkEntry(input: {
+   return ref.nativeId;
+ }
+ 
++/**
++ * Human-readable output for one subagent-extension task result: the last
++ * assistant text from its transcript, or the error/stderr when it failed.
++ */
++function piSubagentOutput(result: unknown): string {
++  const stopReason = recordString(result, "stopReason");
++  const failed =
++    (recordNumber(result, "exitCode") ?? 0) !== 0 ||
++    stopReason === "error" ||
++    stopReason === "aborted";
++  if (failed) {
++    const failure = recordString(result, "errorMessage") ?? recordString(result, "stderr");
++    if (failure !== undefined && failure.length > 0) return failure;
++  }
++  const messages = recordField(result, "messages");
++  if (!Array.isArray(messages)) return "";
++  for (let index = messages.length - 1; index >= 0; index -= 1) {
++    const message = messages[index];
++    if (recordString(message, "role") !== "assistant") continue;
++    const text = contentText(recordField(message, "content"));
++    if (text.length > 0) return text;
++  }
++  return "";
++}
++
+ function piThreadSnapshot(
+   providerThread: OrchestrationV2ProviderThread,
+ ): ProviderAdapterV2ThreadSnapshot {
+-- 
+2.50.1 (Apple Git-155)
+

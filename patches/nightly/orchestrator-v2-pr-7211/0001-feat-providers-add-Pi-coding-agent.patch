@@ -1,0 +1,3686 @@
+From 76e9a4ad613e0535095530be1d960bb909c6ceb8 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 14:54:51 +0200
+Subject: [PATCH] feat(providers): add Pi coding agent
+
+Adds Pi (pi.dev) as an Early Access, disabled-by-default provider on the
+orchestrator v2 architecture, speaking Pi's official stdio JSONL RPC mode.
+
+The adapter deliberately spawns the user's own pi install with no --no-*
+flags, so extensions, skills, AGENTS.md/SYSTEM.md context, settings.json,
+custom models, and auth all load exactly as in the pi TUI. Sessions live in
+Pi's own session store and resume via switch_session, so threads stay
+interoperable with the TUI in both directions. Extension UI dialogs bridge
+into v2 runtime requests; agent_settled (not agent_end) terminalizes turns;
+steering uses pi's native steer command.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ apps/mobile/src/components/ProviderIcon.tsx   |   14 +
+ apps/mobile/src/lib/modelOptions.ts           |    1 +
+ .../Adapters/PiAdapterV2.test.ts              |  579 +++++++
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 1526 +++++++++++++++++
+ .../src/orchestration-v2/Adapters/PiRpc.ts    |  293 ++++
+ .../builtInProviderAdapterDrivers.ts          |    5 +-
+ apps/server/src/provider/Drivers/PiDriver.ts  |  181 ++
+ apps/server/src/provider/Layers/PiProvider.ts |  414 +++++
+ .../provider/Layers/ProviderRegistry.test.ts  |    1 +
+ apps/server/src/provider/builtInDrivers.ts    |    5 +-
+ .../src/textGeneration/PiTextGeneration.ts    |  224 +++
+ .../src/textGeneration/TextGeneration.ts      |    8 +-
+ .../src/components/chat/providerIconUtils.ts  |    3 +-
+ .../settings/AddProviderInstanceDialog.tsx    |    7 +-
+ .../settings/ProviderModelsSection.tsx        |    1 +
+ .../components/settings/providerDriverMeta.ts |    9 +
+ apps/web/src/lib/contextWindow.ts             |    2 +
+ apps/web/src/session-logic.ts                 |    6 +
+ docs/internals/providers.md                   |    9 +-
+ packages/contracts/src/model.ts               |    4 +
+ packages/contracts/src/settings.ts            |   42 +
+ 21 files changed, 3323 insertions(+), 11 deletions(-)
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+ create mode 100644 apps/server/src/provider/Drivers/PiDriver.ts
+ create mode 100644 apps/server/src/provider/Layers/PiProvider.ts
+ create mode 100644 apps/server/src/textGeneration/PiTextGeneration.ts
+
+diff --git a/apps/mobile/src/components/ProviderIcon.tsx b/apps/mobile/src/components/ProviderIcon.tsx
+index 5eb69627f..e71c54660 100644
+--- a/apps/mobile/src/components/ProviderIcon.tsx
++++ b/apps/mobile/src/components/ProviderIcon.tsx
+@@ -50,6 +50,20 @@ export function ProviderIcon(props: ProviderIconProps) {
+     );
+   }
+ 
++  if (props.provider === "pi") {
++    const foreground = isDarkMode ? "#F5F5F5" : "#0F0F0F";
++    return (
++      <Svg width={size} height={size} viewBox="0 0 800 800" fill="none">
++        <Path
++          fill={foreground}
++          fillRule="evenodd"
++          d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
++        />
++        <Path fill={foreground} d="M517.36 400H634.72V634.72H517.36Z" />
++      </Svg>
++    );
++  }
++
+   if (props.provider === "opencode") {
+     return (
+       <Svg width={size} height={size} viewBox="0 0 32 40" fill="none">
+diff --git a/apps/mobile/src/lib/modelOptions.ts b/apps/mobile/src/lib/modelOptions.ts
+index 8f3f8c34a..f601956e8 100644
+--- a/apps/mobile/src/lib/modelOptions.ts
++++ b/apps/mobile/src/lib/modelOptions.ts
+@@ -36,6 +36,7 @@ function providerDisplayLabel(provider: {
+   if (provider.displayName) return provider.displayName;
+   if (provider.driver === "codex") return "Codex";
+   if (provider.driver === "claudeAgent") return "Claude";
++  if (provider.driver === "pi") return "Pi";
+   return provider.instanceId;
+ }
+ 
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+new file mode 100644
+index 000000000..964fdd22e
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -0,0 +1,579 @@
++import { assert, describe, it } from "@effect/vitest";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import {
++  NodeId,
++  ProviderInstanceId,
++  ProviderSessionId,
++  RunAttemptId,
++  RunId,
++  ThreadId,
++  type ModelSelection,
++  type OrchestrationV2AppThread,
++  type OrchestrationV2ProviderThread,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Queue from "effect/Queue";
++import * as Schema from "effect/Schema";
++import * as Sink from "effect/Sink";
++import * as Stream from "effect/Stream";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import { ServerConfig } from "../../config.ts";
++import { IdAllocatorV2, layer as idAllocatorLayer } from "../IdAllocator.ts";
++import {
++  ProviderAdapterV2RuntimePolicy,
++  type ProviderAdapterV2Event,
++  type ProviderAdapterV2SessionRuntime,
++} from "../ProviderAdapter.ts";
++import { makePiAdapterV2, PiProviderCapabilitiesV2, PI_PROVIDER } from "./PiAdapterV2.ts";
++import { makePiRpcConnection, type PiRpcRecord } from "./PiRpc.ts";
++
++const serverConfigLayer = ServerConfig.layerTest(process.cwd(), {
++  prefix: "t3-pi-v2-adapter-",
++}).pipe(Layer.provide(NodeServices.layer));
++
++const testLayer = Layer.mergeAll(NodeServices.layer, idAllocatorLayer, serverConfigLayer);
++
++const decodeJsonLine = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
++const encodeJsonLine = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
++
++const PI_INSTANCE_ID = ProviderInstanceId.make("pi");
++const THREAD_ID = ThreadId.make("thread-pi-test");
++const SESSION_ID = ProviderSessionId.make("provider-session-pi-test");
++const FAKE_SESSION_FILE = "/fake/.pi/agent/sessions/--workspace--/0001_abc.jsonl";
++/** Deliberately outside the valid pid range so a group-kill can never land. */
++const FAKE_PID = 999_999_999;
++
++const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
++  runtimeMode: "full-access",
++  interactionMode: "default",
++  cwd: null,
++});
++
++const modelSelection = (model: string): ModelSelection => ({
++  instanceId: PI_INSTANCE_ID,
++  model,
++});
++
++interface FakePi {
++  readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
++  readonly emit: (record: PiRpcRecord) => Effect.Effect<void>;
++  readonly takeRequest: (type: string) => Effect.Effect<PiRpcRecord>;
++}
++
++/**
++ * In-process fake `pi --mode rpc`: captures every stdin record, auto-acks
++ * requests with canned data, and lets tests push protocol events to stdout.
++ */
++const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
++  const stdout = yield* Queue.unbounded<Uint8Array>();
++  const requests = yield* Queue.unbounded<PiRpcRecord>();
++  let stdinBuffer = "";
++
++  const emit = (record: PiRpcRecord) =>
++    Queue.offer(stdout, new TextEncoder().encode(`${encodeJsonLine(record)}\n`)).pipe(
++      Effect.asVoid,
++    );
++
++  const respondTo = (record: PiRpcRecord): PiRpcRecord | null => {
++    if (typeof record["id"] !== "string") return null;
++    const base = {
++      type: "response",
++      id: record["id"],
++      command: String(record["type"]),
++      success: true,
++    };
++    switch (record["type"]) {
++      case "get_state":
++        return {
++          ...base,
++          data: {
++            model: null,
++            thinkingLevel: "medium",
++            isStreaming: false,
++            isCompacting: false,
++            sessionFile: FAKE_SESSION_FILE,
++            sessionId: "abc",
++          },
++        };
++      case "switch_session":
++        return { ...base, data: { cancelled: false } };
++      default:
++        return base;
++    }
++  };
++
++  const handleStdinChunk = (chunk: Uint8Array) =>
++    Effect.gen(function* () {
++      stdinBuffer += new TextDecoder().decode(chunk);
++      while (true) {
++        const newline = stdinBuffer.indexOf("\n");
++        if (newline === -1) return;
++        const line = stdinBuffer.slice(0, newline);
++        stdinBuffer = stdinBuffer.slice(newline + 1);
++        if (line.length === 0) continue;
++        const record = decodeJsonLine(line) as PiRpcRecord;
++        yield* Queue.offer(requests, record);
++        const response = respondTo(record);
++        if (response !== null) yield* emit(response);
++      }
++    });
++
++  const spawner = ChildProcessSpawner.make(() =>
++    Effect.succeed(
++      ChildProcessSpawner.makeHandle({
++        pid: ChildProcessSpawner.ProcessId(FAKE_PID),
++        exitCode: Effect.never,
++        isRunning: Effect.succeed(true),
++        kill: () => Effect.void,
++        unref: Effect.succeed(Effect.void),
++        stdin: Sink.forEach(handleStdinChunk),
++        stdout: Stream.fromQueue(stdout),
++        stderr: Stream.empty,
++        all: Stream.empty,
++        getInputFd: () => Sink.drain,
++        getOutputFd: () => Stream.empty,
++      }),
++    ),
++  );
++
++  const takeRequest = (type: string): Effect.Effect<PiRpcRecord> =>
++    Effect.gen(function* () {
++      while (true) {
++        const record = yield* Queue.take(requests);
++        if (record["type"] === type) return record;
++      }
++    });
++
++  return { spawner, emit, takeRequest } satisfies FakePi;
++});
++
++const makeAdapter = Effect.fnUntraced(function* (fake: FakePi) {
++  const idAllocator = yield* IdAllocatorV2;
++  const serverConfig = yield* ServerConfig;
++  const fileSystem = yield* FileSystem.FileSystem;
++  return makePiAdapterV2({
++    instanceId: PI_INSTANCE_ID,
++    settings: { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
++    environment: {},
++    spawner: fake.spawner,
++    fileSystem,
++    idAllocator,
++    serverConfig,
++  });
++});
++
++const openRuntime = Effect.fnUntraced(function* (fake: FakePi, model = "default") {
++  const adapter = yield* makeAdapter(fake);
++  const runtime = yield* adapter.openSession({
++    threadId: THREAD_ID,
++    providerSessionId: SESSION_ID,
++    modelSelection: modelSelection(model),
++    runtimePolicy,
++  });
++  const emitted = yield* Queue.unbounded<ProviderAdapterV2Event>();
++  yield* runtime.events.pipe(
++    Stream.runForEach((event) => Queue.offer(emitted, event)),
++    Effect.forkScoped,
++  );
++  const takeEvent = (predicate: (event: ProviderAdapterV2Event) => boolean) =>
++    Effect.gen(function* () {
++      while (true) {
++        const event = yield* Queue.take(emitted);
++        if (predicate(event)) return event;
++      }
++    });
++  return { runtime, takeEvent };
++});
++
++const makeAppThread = Effect.fnUntraced(function* (model: string) {
++  const now = yield* DateTime.now;
++  return {
++    createdBy: "user",
++    creationSource: "web",
++    id: THREAD_ID,
++    projectId: "project:fixture:pi" as OrchestrationV2AppThread["projectId"],
++    title: "Pi test thread",
++    providerInstanceId: PI_INSTANCE_ID,
++    modelSelection: modelSelection(model),
++    runtimeMode: "full-access",
++    interactionMode: "default",
++    branch: null,
++    worktreePath: null,
++    activeProviderThreadId: null,
++    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: THREAD_ID },
++    forkedFrom: null,
++    createdAt: now,
++    updatedAt: now,
++    archivedAt: null,
++    settledOverride: null,
++    settledAt: null,
++    lastVisitedAt: null,
++    deletedAt: null,
++  } satisfies OrchestrationV2AppThread;
++});
++
++const startTurn = Effect.fnUntraced(function* (
++  runtime: ProviderAdapterV2SessionRuntime,
++  providerThread: OrchestrationV2ProviderThread,
++  model = "default",
++) {
++  const appThread = yield* makeAppThread(model);
++  yield* runtime.startTurn({
++    appThread,
++    threadId: THREAD_ID,
++    runId: RunId.make("run:thread-pi-test:1"),
++    runOrdinal: 1,
++    providerTurnOrdinal: 1,
++    attemptId: RunAttemptId.make("run-attempt:run:thread-pi-test:1:1"),
++    rootNodeId: NodeId.make("node:run:thread-pi-test:1:root"),
++    providerThread,
++    message: {
++      messageId: "message:thread-pi-test:1" as never,
++      text: "Hello pi",
++      attachments: [],
++      createdBy: "user",
++      creationSource: "web",
++    },
++    modelSelection: modelSelection(model),
++    runtimePolicy,
++  });
++});
++
++describe("PiAdapterV2", () => {
++  it("declares Pi-honest capabilities", () => {
++    assert.isTrue(PiProviderCapabilitiesV2.turns.supportsActiveSteering);
++    assert.isFalse(PiProviderCapabilitiesV2.turns.supportsSteeringByInterruptRestart);
++    assert.equal(PiProviderCapabilitiesV2.turns.terminalStatusQuality, "strong");
++    assert.isFalse(PiProviderCapabilitiesV2.approvals.supportsCommandApproval);
++    assert.isFalse(PiProviderCapabilitiesV2.tools.supportsMcpTools);
++    assert.equal(PiProviderCapabilitiesV2.identity.nativeThreadIds, "strong");
++  });
++
++  it.effect("registers the thread from get_state and resumes via switch_session", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      assert.equal(providerThread.nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
++      assert.equal(providerThread.driver, PI_PROVIDER);
++
++      yield* runtime.resumeThread({ providerThread });
++      const switchRequest = yield* fake.takeRequest("switch_session");
++      assert.equal(switchRequest["sessionPath"], FAKE_SESSION_FILE);
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("streams assistant text and settles a completed turn on agent_settled", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      const prompt = yield* fake.takeRequest("prompt");
++      assert.equal(prompt["message"], "Hello pi");
++
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
++      yield* fake.emit({
++        type: "message_update",
++        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hel" },
++      });
++      yield* fake.emit({
++        type: "message_update",
++        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "lo" },
++      });
++      yield* fake.emit({
++        type: "message_update",
++        assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Hello" },
++      });
++      yield* fake.emit({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "Hello" }],
++          stopReason: "stop",
++        },
++      });
++      yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
++      yield* fake.emit({ type: "agent_settled" });
++
++      const assistantItem = yield* takeEvent(
++        (event) =>
++          event.type === "turn_item.updated" &&
++          event.turnItem.type === "assistant_message" &&
++          event.turnItem.streaming === false,
++      );
++      assert.isTrue(
++        assistantItem.type === "turn_item.updated" &&
++          assistantItem.turnItem.type === "assistant_message" &&
++          assistantItem.turnItem.text === "Hello",
++      );
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("keeps the turn open across agent_end and fails it on final retry failure", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({ type: "agent_end", messages: [], willRetry: true });
++      yield* fake.emit({
++        type: "auto_retry_end",
++        success: false,
++        attempt: 3,
++        finalError: "529 overloaded",
++      });
++      yield* fake.emit({ type: "agent_settled" });
++
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "failed");
++      assert.isTrue(
++        terminal.type === "turn.terminal" &&
++          terminal.status === "failed" &&
++          terminal.failure.message.includes("overloaded"),
++      );
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("interrupts with abort and settles the turn as interrupted", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++
++      const running = yield* takeEvent(
++        (event) =>
++          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
++      );
++      assert.equal(running.type, "provider_turn.updated");
++      const providerTurnId =
++        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
++      assert.isDefined(providerTurnId);
++
++      yield* runtime.interruptTurn({ providerThread, providerTurnId: providerTurnId! });
++      yield* fake.takeRequest("abort");
++      yield* fake.emit({ type: "agent_settled" });
++
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "interrupted");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect(
++    "applies an explicit model before prompting and skips set_model for the Pi default",
++    () =>
++      Effect.gen(function* () {
++        const fake = yield* makeFakePi;
++        const { runtime } = yield* openRuntime(fake, "anthropic/claude-sonnet-5");
++        const providerThread = yield* runtime.ensureThread({
++          threadId: THREAD_ID,
++          modelSelection: modelSelection("anthropic/claude-sonnet-5"),
++          runtimePolicy,
++        });
++        yield* startTurn(runtime, providerThread, "anthropic/claude-sonnet-5");
++        const setModel = yield* fake.takeRequest("set_model");
++        assert.equal(setModel["provider"], "anthropic");
++        assert.equal(setModel["modelId"], "claude-sonnet-5");
++        yield* fake.takeRequest("prompt");
++      }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("bridges extension select dialogs to runtime requests and answers them", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({
++        type: "extension_ui_request",
++        id: "ui-1",
++        method: "select",
++        title: "Pick one",
++        options: ["Allow", "Block"],
++      });
++
++      const pending = yield* takeEvent(
++        (event) =>
++          event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending",
++      );
++      assert.isTrue(
++        pending.type === "runtime_request.updated" && pending.runtimeRequest.kind === "user_input",
++      );
++      const requestItem = yield* takeEvent(
++        (event) =>
++          event.type === "turn_item.updated" && event.turnItem.type === "user_input_request",
++      );
++      assert.isTrue(
++        requestItem.type === "turn_item.updated" &&
++          requestItem.turnItem.type === "user_input_request" &&
++          requestItem.turnItem.questions[0]?.options.length === 2,
++      );
++
++      const requestId =
++        pending.type === "runtime_request.updated" ? pending.runtimeRequest.id : undefined;
++      yield* runtime.respondToRuntimeRequest({
++        requestId: requestId!,
++        answers: { "ui-1": "Allow" },
++      });
++      const uiResponse = yield* fake.takeRequest("extension_ui_response");
++      assert.equal(uiResponse["id"], "ui-1");
++      assert.equal(uiResponse["value"], "Allow");
++
++      const resolved = yield* takeEvent(
++        (event) =>
++          event.type === "runtime_request.updated" && event.runtimeRequest.status === "resolved",
++      );
++      assert.equal(resolved.type, "runtime_request.updated");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("cancels unanswered extension dialogs when the turn settles", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({
++        type: "extension_ui_request",
++        id: "ui-2",
++        method: "confirm",
++        title: "Continue?",
++        message: "Really continue?",
++      });
++      yield* takeEvent(
++        (event) =>
++          event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending",
++      );
++      yield* fake.emit({ type: "agent_settled" });
++
++      const cancelledResponse = yield* fake.takeRequest("extension_ui_response");
++      assert.equal(cancelledResponse["id"], "ui-2");
++      assert.equal(cancelledResponse["cancelled"], true);
++      const cancelled = yield* takeEvent(
++        (event) =>
++          event.type === "runtime_request.updated" && event.runtimeRequest.status === "cancelled",
++      );
++      assert.equal(cancelled.type, "runtime_request.updated");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("steers the active turn through pi's native steer command", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      const running = yield* takeEvent(
++        (event) =>
++          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
++      );
++      const providerTurnId =
++        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
++
++      yield* runtime.steerTurn({
++        threadId: THREAD_ID,
++        runId: RunId.make("run:thread-pi-test:1"),
++        providerThread,
++        providerTurnId: providerTurnId!,
++        message: {
++          messageId: "message:thread-pi-test:steer" as never,
++          text: "Focus on tests",
++          attachments: [],
++          createdBy: "user",
++          creationSource: "web",
++        },
++      });
++      const steer = yield* fake.takeRequest("steer");
++      assert.equal(steer["message"], "Focus on tests");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++});
++
++describe("PiRpc framing", () => {
++  it.effect("reassembles records across chunk boundaries and strips CR", () =>
++    Effect.gen(function* () {
++      const stdout = yield* Queue.unbounded<Uint8Array>();
++      const spawner = ChildProcessSpawner.make(() =>
++        Effect.succeed(
++          ChildProcessSpawner.makeHandle({
++            pid: ChildProcessSpawner.ProcessId(FAKE_PID),
++            exitCode: Effect.never,
++            isRunning: Effect.succeed(true),
++            kill: () => Effect.void,
++            unref: Effect.succeed(Effect.void),
++            stdin: Sink.drain,
++            stdout: Stream.fromQueue(stdout),
++            stderr: Stream.empty,
++            all: Stream.empty,
++            getInputFd: () => Sink.drain,
++            getOutputFd: () => Stream.empty,
++          }),
++        ),
++      );
++      const connection = yield* makePiRpcConnection({
++        command: "pi",
++        args: ["--mode", "rpc"],
++        cwd: undefined,
++        env: {},
++      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
++
++      const push = (text: string) =>
++        Queue.offer(stdout, new TextEncoder().encode(text)).pipe(Effect.asVoid);
++      yield* push('{"type":"agent_');
++      yield* push('start"}\r\n{"type":"agent_settled"}\nnot json\n{"type":"queue_update"}\n');
++
++      const first = yield* Queue.take(connection.events);
++      assert.equal(first["type"], "agent_start");
++      const second = yield* Queue.take(connection.events);
++      assert.equal(second["type"], "agent_settled");
++      const third = yield* Queue.take(connection.events);
++      assert.equal(third["type"], "queue_update");
++    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
++  );
++});
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+new file mode 100644
+index 000000000..525572213
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -0,0 +1,1526 @@
++/**
++ * PiAdapterV2 — orchestrator-v2 adapter for the Pi coding agent
++ * (https://pi.dev), driving `pi --mode rpc` over stdio JSONL via `PiRpc.ts`.
++ *
++ * Design intent: honor the user's Pi customizations. The process is spawned
++ * with no `--no-*` flags, so the user's extensions, skills, prompt templates,
++ * AGENTS.md / SYSTEM.md context, settings.json, custom models, and auth all
++ * load exactly as they do in the `pi` TUI. Sessions are stored by Pi itself
++ * (default `~/.pi/agent/sessions/`), and the session file path is the durable
++ * `nativeThreadRef`, so a thread started in T3 can be resumed from the TUI
++ * and vice versa.
++ *
++ * Turn lifecycle: `agent_settled` is the only terminal signal. `agent_end`
++ * merely closes one low-level run — compaction retries, auto-retries, and
++ * queued continuations may still follow it, so the turn stays open until Pi
++ * reports the session settled.
++ *
++ * Extension UI: Pi extensions raise dialogs through `extension_ui_request`.
++ * Dialog methods become v2 runtime requests (`confirm` → approval_request,
++ * `select`/`input`/`editor` → user_input_request); answers travel back as
++ * `extension_ui_response`. `notify` becomes a completed activity item;
++ * remaining fire-and-forget surfaces (`setStatus`/`setWidget`/`setTitle`)
++ * are dropped until a dedicated Pi panel exists.
++ */
++import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
++import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
++import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
++import {
++  defaultInstanceIdForDriver,
++  PiSettings,
++  ProviderDriverKind,
++  type ChatAttachment,
++  type ModelSelection,
++  type OrchestrationV2ExecutionNode,
++  type OrchestrationV2ProviderCapabilities,
++  type OrchestrationV2ProviderRef,
++  type OrchestrationV2ProviderSession,
++  type OrchestrationV2ProviderThread,
++  type OrchestrationV2ProviderTurn,
++  type OrchestrationV2RuntimeRequest,
++  type OrchestrationV2TurnItem,
++  type OrchestrationV2UserInputQuestion,
++  type ProviderApprovalDecision,
++  type ProviderInstanceId,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import * as Duration from "effect/Duration";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Queue from "effect/Queue";
++import * as Schema from "effect/Schema";
++import * as Stream from "effect/Stream";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import { resolveAttachmentPath } from "../../attachmentStore.ts";
++import { ServerConfig } from "../../config.ts";
++import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
++import { IdAllocatorV2 } from "../IdAllocator.ts";
++import {
++  ProviderAdapterEnsureThreadError,
++  ProviderAdapterEventStreamError,
++  ProviderAdapterForkThreadError,
++  ProviderAdapterInterruptError,
++  ProviderAdapterOpenSessionError,
++  ProviderAdapterProtocolError,
++  ProviderAdapterReadThreadSnapshotError,
++  ProviderAdapterResumeThreadError,
++  ProviderAdapterRollbackThreadError,
++  ProviderAdapterRuntimeRequestResponseError,
++  ProviderAdapterSteerRunError,
++  ProviderAdapterTurnStartError,
++  ProviderAdapterV2,
++  type ProviderAdapterV2Error,
++  type ProviderAdapterV2Event,
++  type ProviderAdapterV2EnsureThreadInput,
++  type ProviderAdapterV2OpenSessionInput,
++  type ProviderAdapterV2SessionRuntime,
++  type ProviderAdapterV2Shape,
++  type ProviderAdapterV2SteerInput,
++  type ProviderAdapterV2TurnInput,
++} from "../ProviderAdapter.ts";
++import {
++  ProviderAdapterDriverCreateError,
++  type ProviderAdapterDriver,
++  type ProviderAdapterDriverCreateInput,
++} from "../ProviderAdapterDriver.ts";
++import { makeProviderFailure } from "../ProviderFailure.ts";
++import { turnScopedSelectionTransition } from "../ProviderSelectionTransition.ts";
++import { makePiRpcConnection, type PiRpcConnection, type PiRpcRecord } from "./PiRpc.ts";
++
++export const PI_PROVIDER = ProviderDriverKind.make("pi");
++export const PI_DRIVER_KIND = PI_PROVIDER;
++export const PI_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(PI_DRIVER_KIND);
++const DEFAULT_PI_SETTINGS = Schema.decodeSync(PiSettings)({});
++
++/**
++ * Sentinel model slug meaning "do not call set_model": Pi resolves the model
++ * from the user's own settings.json (`defaultProvider`/`defaultModel`).
++ */
++export const PI_INHERIT_MODEL_SLUG = "default";
++/** Thinking-level option value meaning "do not call set_thinking_level". */
++export const PI_INHERIT_THINKING_VALUE = "inherit";
++
++const STREAM_FLUSH_MS = 50;
++const PI_REQUEST_TIMEOUT_MS = 15_000;
++
++export const PiProviderCapabilitiesV2 = {
++  sessions: {
++    supportsMultipleProviderThreadsPerSession: false,
++    supportsModelSwitchInSession: true,
++    supportsProviderSwitchingViaHandoff: true,
++    supportsRuntimeModeSwitchInSession: false,
++    pendingRequestsSurviveRestart: false,
++  },
++  threads: {
++    canCreateEmptyThread: true,
++    canReadThreadSnapshot: false,
++    canRollbackThread: false,
++    canForkThread: false,
++    canForkFromTurn: false,
++    canForkFromSubagentThread: false,
++    exposesNativeThreadId: true,
++  },
++  turns: {
++    exposesNativeTurnId: false,
++    emitsTurnStarted: true,
++    emitsTurnCompleted: true,
++    supportsInterrupt: true,
++    supportsActiveSteering: true,
++    supportsSteeringByInterruptRestart: false,
++    supportsQueuedMessages: true,
++    terminalStatusQuality: "strong",
++  },
++  streaming: {
++    streamsAssistantText: true,
++    streamsReasoning: true,
++    streamsToolOutput: true,
++    streamsPlanText: false,
++    emitsMessageCompleted: true,
++  },
++  tools: {
++    exposesToolItemIds: true,
++    emitsToolStarted: true,
++    emitsToolCompleted: true,
++    emitsToolOutput: true,
++    supportsMcpTools: false,
++    supportsDynamicToolCallbacks: false,
++  },
++  approvals: {
++    // Pi has no native permission system; the only prompts are the ones the
++    // user's own extensions raise through the extension UI protocol.
++    supportsCommandApproval: false,
++    supportsFileReadApproval: false,
++    supportsFileChangeApproval: false,
++    supportsApplyPatchApproval: false,
++    approvalsHaveNativeRequestIds: true,
++    approvalCallbacksAreLiveOnly: true,
++    approvalsCanOriginateFromSubagents: false,
++  },
++  planning: {
++    emitsPlanUpdated: false,
++    emitsTodoList: false,
++    emitsProposedPlan: false,
++    supportsStructuredQuestions: true,
++    planDeltasHaveItemIds: false,
++  },
++  subagents: {
++    supportsSubagents: false,
++    exposesSubagentThreadIds: false,
++    emitsSubagentLifecycle: false,
++    canWaitForSubagents: false,
++    canCloseSubagents: false,
++    canForkSubagentThread: false,
++  },
++  context: {
++    acceptsSystemContext: false,
++    acceptsDeveloperContext: false,
++    acceptsSyntheticUserContext: true,
++    canGenerateSummaries: false,
++    canConsumeHandoffSummaries: true,
++    supportsDeltaHandoff: false,
++    supportsFullThreadHandoff: true,
++    maxRecommendedHandoffChars: null,
++  },
++  checkpointing: {
++    appCanCheckpointFilesystem: true,
++    supportsNestedCheckpointScopes: false,
++    providerCanRollbackConversation: false,
++    providerRollbackReturnsSnapshot: false,
++    providerCanReadConversationSnapshot: false,
++  },
++  identity: {
++    nativeThreadIds: "strong",
++    nativeTurnIds: "weak",
++    nativeItemIds: "strong",
++    nativeRequestIds: "strong",
++  },
++} satisfies OrchestrationV2ProviderCapabilities;
++
++export interface PiAdapterV2Options {
++  readonly instanceId: ProviderInstanceId;
++  readonly settings: PiSettings;
++  readonly environment: NodeJS.ProcessEnv;
++  readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
++  readonly fileSystem: FileSystem.FileSystem;
++  readonly idAllocator: IdAllocatorV2["Service"];
++  readonly serverConfig: ServerConfig["Service"];
++}
++
++// ── record helpers ────────────────────────────────────────────
++
++function recordField(input: unknown, key: string): unknown {
++  if (typeof input !== "object" || input === null) return undefined;
++  return (input as Record<string, unknown>)[key];
++}
++
++function recordString(input: unknown, key: string): string | undefined {
++  const value = recordField(input, key);
++  return typeof value === "string" ? value : undefined;
++}
++
++function recordNumber(input: unknown, key: string): number | undefined {
++  const value = recordField(input, key);
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++/** Concatenate the `text` fields of a Pi content-block array. */
++function contentText(content: unknown): string {
++  if (!Array.isArray(content)) {
++    return typeof content === "string" ? content : "";
++  }
++  return content
++    .map((block) => {
++      if (recordField(block, "type") === "text") return recordString(block, "text") ?? "";
++      return "";
++    })
++    .join("");
++}
++
++function parsePiModelSlug(slug: string): { provider: string; modelId: string } | null {
++  const separator = slug.indexOf("/");
++  if (separator <= 0 || separator === slug.length - 1) return null;
++  return { provider: slug.slice(0, separator), modelId: slug.slice(separator + 1) };
++}
++
++function providerRef(
++  nativeId: string,
++  strength: "strong" | "weak" = "strong",
++): OrchestrationV2ProviderRef {
++  return { driver: PI_PROVIDER, nativeId, strength };
++}
++
++const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
++
++// ── per-session state ─────────────────────────────────────────
++
++interface PiStreamItemState {
++  readonly nativeItemId: string;
++  readonly kind: "assistant_message" | "reasoning";
++  text: string;
++  completed: boolean;
++  flushScheduled: boolean;
++  readonly startedAt: DateTime.Utc;
++}
++
++interface ActivePiTurn {
++  readonly turnInput: ProviderAdapterV2TurnInput;
++  readonly providerTurn: OrchestrationV2ProviderTurn;
++  readonly startedAt: DateTime.Utc;
++  readonly itemOrdinals: Map<string, number>;
++  nextItemOrdinal: number;
++  /** Increments on assistant `message_start` so content indexes stay unique. */
++  messageOrdinal: number;
++  readonly streamItems: Map<string, PiStreamItemState>;
++  readonly toolArgs: Map<string, unknown>;
++  interrupted: boolean;
++  failure: ReturnType<typeof makeProviderFailure> | null;
++}
++
++interface PendingPiPrompt {
++  readonly nativeRequestId: string;
++  readonly method: "select" | "confirm" | "input" | "editor";
++  readonly questionId: string;
++  runtimeRequest: OrchestrationV2RuntimeRequest;
++  readonly node: OrchestrationV2ExecutionNode;
++  readonly turnItem: OrchestrationV2TurnItem;
++}
++
++interface PiThreadState {
++  providerThread: OrchestrationV2ProviderThread;
++  activeTurn: ActivePiTurn | null;
++}
++
++// ── adapter ───────────────────────────────────────────────────
++
++export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2Shape {
++  const { idAllocator } = options;
++
++  const protocolError = (detail: string, payload?: unknown) =>
++    new ProviderAdapterProtocolError({
++      driver: PI_PROVIDER,
++      detail,
++      ...(payload === undefined ? {} : { payload }),
++    });
++
++  return ProviderAdapterV2.of({
++    instanceId: options.instanceId,
++    driver: PI_PROVIDER,
++    getCapabilities: () => Effect.succeed(PiProviderCapabilitiesV2),
++    planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
++    openSession: Effect.fn("PiAdapterV2.openSession")(function* (
++      input: ProviderAdapterV2OpenSessionInput,
++    ) {
++      const scope = yield* Effect.scope;
++      const cwd = input.runtimePolicy.cwd ?? options.serverConfig.cwd;
++      const connection: PiRpcConnection = yield* makePiRpcConnection({
++        command: options.settings.binaryPath || "pi",
++        args: ["--mode", "rpc", ...tokenizeCliArgs(options.settings.launchArgs)],
++        cwd,
++        env: options.environment,
++      }).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, options.spawner),
++        Effect.mapError(
++          (cause) =>
++            new ProviderAdapterOpenSessionError({
++              driver: PI_PROVIDER,
++              providerSessionId: input.providerSessionId,
++              cause,
++            }),
++        ),
++      );
++
++      const now = yield* DateTime.now;
++      let sessionEntity: OrchestrationV2ProviderSession = {
++        id: input.providerSessionId,
++        driver: PI_PROVIDER,
++        providerInstanceId: options.instanceId,
++        status: "ready",
++        cwd,
++        model: input.modelSelection.model,
++        capabilities: PiProviderCapabilitiesV2,
++        createdAt: now,
++        updatedAt: now,
++        lastError: null,
++      };
++      const events = yield* Queue.unbounded<ProviderAdapterV2Event, ProviderAdapterV2Error>();
++      const pendingPrompts = new Map<string, PendingPiPrompt>();
++      let threadState: PiThreadState | null = null;
++      let appliedModel: string | null = null;
++      let appliedThinking: string | null = null;
++
++      const emit = (event: ProviderAdapterV2Event) =>
++        Queue.offer(events, event).pipe(Effect.asVoid);
++
++      const updateProviderSession = (
++        status: OrchestrationV2ProviderSession["status"],
++        lastError: string | null = sessionEntity.lastError,
++      ) =>
++        Effect.gen(function* () {
++          const updatedAt = yield* DateTime.now;
++          sessionEntity = { ...sessionEntity, status, lastError, updatedAt };
++          yield* emit({
++            type: "provider_session.updated",
++            driver: PI_PROVIDER,
++            providerSession: sessionEntity,
++          });
++        });
++
++      const updateProviderThread = (
++        state: PiThreadState,
++        patch: Partial<OrchestrationV2ProviderThread>,
++      ) =>
++        Effect.gen(function* () {
++          const updatedAt = yield* DateTime.now;
++          state.providerThread = { ...state.providerThread, ...patch, updatedAt };
++          yield* emit({
++            type: "provider_thread.updated",
++            driver: PI_PROVIDER,
++            providerThread: state.providerThread,
++          });
++        });
++
++      const itemOrdinal = (turn: ActivePiTurn, nativeItemId: string): number => {
++        const existing = turn.itemOrdinals.get(nativeItemId);
++        if (existing !== undefined) return existing;
++        const ordinal = turn.nextItemOrdinal++;
++        turn.itemOrdinals.set(nativeItemId, ordinal);
++        return ordinal;
++      };
++
++      const request = (record: PiRpcRecord, timeoutMs = PI_REQUEST_TIMEOUT_MS) =>
++        connection.request(record, timeoutMs);
++
++      const baseItemFields = (
++        turn: ActivePiTurn,
++        nativeItemId: string,
++        startedAt: DateTime.Utc,
++        updatedAt: DateTime.Utc,
++      ) => ({
++        id: idAllocator.derive.turnItemFromProviderItem({
++          driver: PI_PROVIDER,
++          nativeItemId,
++        }),
++        threadId: turn.turnInput.threadId,
++        runId: turn.turnInput.runId,
++        nodeId: idAllocator.derive.nodeFromProviderItem({
++          driver: PI_PROVIDER,
++          nativeItemId,
++        }),
++        providerThreadId: turn.turnInput.providerThread.id,
++        providerTurnId: turn.providerTurn.id,
++        nativeItemRef: providerRef(nativeItemId),
++        parentItemId: null,
++        ordinal: itemOrdinal(turn, nativeItemId),
++        startedAt,
++        updatedAt,
++      });
++
++      const emitItemNode = (
++        turn: ActivePiTurn,
++        nativeItemId: string,
++        kind: OrchestrationV2ExecutionNode["kind"],
++        status: OrchestrationV2ExecutionNode["status"],
++        startedAt: DateTime.Utc,
++        completedAt: DateTime.Utc | null,
++      ) =>
++        emit({
++          type: "node.updated",
++          driver: PI_PROVIDER,
++          node: {
++            id: idAllocator.derive.nodeFromProviderItem({
++              driver: PI_PROVIDER,
++              nativeItemId,
++            }),
++            threadId: turn.turnInput.threadId,
++            runId: turn.turnInput.runId,
++            parentNodeId: turn.turnInput.rootNodeId,
++            rootNodeId: turn.turnInput.rootNodeId,
++            kind,
++            status,
++            countsForRun: false,
++            providerThreadId: turn.turnInput.providerThread.id,
++            providerTurnId: turn.providerTurn.id,
++            nativeItemRef: providerRef(nativeItemId),
++            runtimeRequestId: null,
++            checkpointScopeId: null,
++            startedAt,
++            completedAt,
++          },
++        });
++
++      // ── streaming text / reasoning ────────────────────────
++
++      const emitStreamItem = (turn: ActivePiTurn, item: PiStreamItemState, streaming: boolean) =>
++        Effect.gen(function* () {
++          const emittedAt = yield* DateTime.now;
++          const base = baseItemFields(turn, item.nativeItemId, item.startedAt, emittedAt);
++          yield* emitItemNode(
++            turn,
++            item.nativeItemId,
++            item.kind,
++            streaming ? "running" : "completed",
++            item.startedAt,
++            streaming ? null : emittedAt,
++          );
++          if (item.kind === "assistant_message") {
++            const messageId = idAllocator.derive.messageFromProviderItem({
++              driver: PI_PROVIDER,
++              nativeItemId: item.nativeItemId,
++            });
++            yield* emit({
++              type: "turn_item.updated",
++              driver: PI_PROVIDER,
++              turnItem: {
++                ...base,
++                status: streaming ? "running" : "completed",
++                title: null,
++                completedAt: streaming ? null : emittedAt,
++                type: "assistant_message",
++                messageId,
++                text: item.text,
++                streaming,
++              },
++            });
++            yield* emit({
++              type: "message.updated",
++              driver: PI_PROVIDER,
++              message: {
++                id: messageId,
++                threadId: turn.turnInput.threadId,
++                runId: turn.turnInput.runId,
++                nodeId: idAllocator.derive.nodeFromProviderItem({
++                  driver: PI_PROVIDER,
++                  nativeItemId: item.nativeItemId,
++                }),
++                role: "assistant",
++                text: item.text,
++                attachments: [],
++                streaming,
++                createdBy: "agent",
++                creationSource: "provider",
++                createdAt: item.startedAt,
++                updatedAt: emittedAt,
++              },
++            });
++            return;
++          }
++          yield* emit({
++            type: "turn_item.updated",
++            driver: PI_PROVIDER,
++            turnItem: {
++              ...base,
++              status: streaming ? "running" : "completed",
++              title: null,
++              completedAt: streaming ? null : emittedAt,
++              type: "reasoning",
++              text: item.text,
++              streaming,
++            },
++          });
++        });
++
++      const scheduleStreamFlush = (turn: ActivePiTurn, item: PiStreamItemState) =>
++        Effect.gen(function* () {
++          if (item.flushScheduled || item.completed) return;
++          item.flushScheduled = true;
++          yield* Effect.sleep(Duration.millis(STREAM_FLUSH_MS)).pipe(
++            Effect.andThen(
++              Effect.suspend(() => {
++                item.flushScheduled = false;
++                return item.completed ? Effect.void : emitStreamItem(turn, item, true);
++              }),
++            ),
++            Effect.forkIn(scope),
++          );
++        });
++
++      const streamItemFor = Effect.fnUntraced(function* (
++        turn: ActivePiTurn,
++        kind: PiStreamItemState["kind"],
++        contentIndex: number,
++      ) {
++        const nativeItemId = `${turn.providerTurn.id}:m${turn.messageOrdinal}:c${contentIndex}`;
++        const existing = turn.streamItems.get(nativeItemId);
++        if (existing !== undefined) return existing;
++        const startedAt = yield* DateTime.now;
++        const item: PiStreamItemState = {
++          nativeItemId,
++          kind,
++          text: "",
++          completed: false,
++          flushScheduled: false,
++          startedAt,
++        };
++        turn.streamItems.set(nativeItemId, item);
++        // Ordinal reserved on first delta so items appear in stream order.
++        itemOrdinal(turn, nativeItemId);
++        return item;
++      });
++
++      const completeStreamItem = (turn: ActivePiTurn, item: PiStreamItemState, text?: string) =>
++        Effect.suspend(() => {
++          if (item.completed) return Effect.void;
++          item.completed = true;
++          if (text !== undefined && text.length > 0) item.text = text;
++          return item.text.length === 0 ? Effect.void : emitStreamItem(turn, item, false);
++        });
++
++      const completeOpenStreamItems = (turn: ActivePiTurn) =>
++        Effect.forEach(
++          Array.from(turn.streamItems.values()).filter((item) => !item.completed),
++          (item) => completeStreamItem(turn, item),
++          { discard: true },
++        );
++
++      // ── tools ─────────────────────────────────────────────
++
++      const emitToolItem = Effect.fnUntraced(function* (
++        turn: ActivePiTurn,
++        event: PiRpcRecord,
++        phase: "start" | "update" | "end",
++      ) {
++        const toolCallId = recordString(event, "toolCallId");
++        const toolName = recordString(event, "toolName") ?? "tool";
++        if (toolCallId === undefined) return;
++        if (phase === "start") {
++          turn.toolArgs.set(toolCallId, event["args"]);
++        }
++        const args = event["args"] ?? turn.toolArgs.get(toolCallId);
++        const emittedAt = yield* DateTime.now;
++        const completed = phase === "end";
++        const isError = event["isError"] === true;
++        const resultRecord = completed ? event["result"] : event["partialResult"];
++        const outputText = contentText(recordField(resultRecord, "content"));
++        const status = completed ? (isError ? "failed" : "completed") : "running";
++        const base = baseItemFields(turn, toolCallId, emittedAt, emittedAt);
++        yield* emitItemNode(
++          turn,
++          toolCallId,
++          "tool_call",
++          status,
++          emittedAt,
++          completed ? emittedAt : null,
++        );
++        const shared = {
++          ...base,
++          status,
++          completedAt: completed ? emittedAt : null,
++        } as const;
++        if (toolName === "bash") {
++          const exitCode = recordNumber(recordField(resultRecord, "details"), "exitCode");
++          yield* emit({
++            type: "turn_item.updated",
++            driver: PI_PROVIDER,
++            turnItem: {
++              ...shared,
++              title: toolName,
++              type: "command_execution",
++              input: recordString(args, "command") ?? "",
++              ...(outputText.length > 0 ? { output: outputText } : {}),
++              ...(exitCode === undefined ? {} : { exitCode }),
++            },
++          });
++          return;
++        }
++        if (toolName === "edit" || toolName === "write") {
++          const fileName = recordString(args, "path") ?? recordString(args, "file_path");
++          if (fileName !== undefined) {
++            yield* emit({
++              type: "turn_item.updated",
++              driver: PI_PROVIDER,
++              turnItem: {
++                ...shared,
++                title: toolName,
++                type: "file_change",
++                fileName,
++              },
++            });
++            return;
++          }
++        }
++        yield* emit({
++          type: "turn_item.updated",
++          driver: PI_PROVIDER,
++          turnItem: {
++            ...shared,
++            title: toolName,
++            type: "dynamic_tool",
++            toolName,
++            input: args ?? {},
++            ...(outputText.length > 0 ? { output: outputText } : {}),
++          },
++        });
++      });
++
++      // ── extension UI prompts ──────────────────────────────
++
++      const cancelPrompt = (pending: PendingPiPrompt, resolvedAt: DateTime.Utc) =>
++        Effect.gen(function* () {
++          yield* connection
++            .send({
++              type: "extension_ui_response",
++              id: pending.nativeRequestId,
++              cancelled: true,
++            })
++            .pipe(Effect.ignore);
++          pending.runtimeRequest = {
++            ...pending.runtimeRequest,
++            status: "cancelled",
++            resolvedAt,
++          };
++          yield* emit({
++            type: "runtime_request.updated",
++            driver: PI_PROVIDER,
++            threadId: pending.node.threadId,
++            runtimeRequest: pending.runtimeRequest,
++          });
++          yield* emit({
++            type: "node.updated",
++            driver: PI_PROVIDER,
++            node: { ...pending.node, status: "cancelled", completedAt: resolvedAt },
++          });
++          yield* emit({
++            type: "turn_item.updated",
++            driver: PI_PROVIDER,
++            turnItem: {
++              ...pending.turnItem,
++              status: "cancelled",
++              completedAt: resolvedAt,
++              updatedAt: resolvedAt,
++            },
++          });
++        });
++
++      const cancelPendingPrompts = (resolvedAt: DateTime.Utc) =>
++        Effect.gen(function* () {
++          const pending = Array.from(pendingPrompts.values());
++          pendingPrompts.clear();
++          yield* Effect.forEach(pending, (prompt) => cancelPrompt(prompt, resolvedAt), {
++            discard: true,
++          });
++        });
++
++      const handleExtensionUiRequest = Effect.fnUntraced(function* (event: PiRpcRecord) {
++        const method = recordString(event, "method");
++        const nativeRequestId = recordString(event, "id");
++        if (method === undefined) return;
++        if (method === "notify") {
++          const state = threadState;
++          const turn = state?.activeTurn ?? null;
++          const message = recordString(event, "message") ?? "";
++          if (turn === null || message.length === 0) return;
++          const emittedAt = yield* DateTime.now;
++          const nativeItemId = `notify:${turn.nextItemOrdinal}`;
++          yield* emitItemNode(turn, nativeItemId, "system", "completed", emittedAt, emittedAt);
++          yield* emit({
++            type: "turn_item.updated",
++            driver: PI_PROVIDER,
++            turnItem: {
++              ...baseItemFields(turn, nativeItemId, emittedAt, emittedAt),
++              status: "completed",
++              completedAt: emittedAt,
++              title: "notify",
++              type: "dynamic_tool",
++              toolName: "notify",
++              input: {
++                message,
++                notifyType: recordString(event, "notifyType") ?? "info",
++              },
++            },
++          });
++          return;
++        }
++        if (
++          method !== "select" &&
++          method !== "confirm" &&
++          method !== "input" &&
++          method !== "editor"
++        ) {
++          // setStatus / setWidget / setTitle / set_editor_text: no Pi panel
++          // yet, so these fire-and-forget surfaces are dropped.
++          yield* Effect.logDebug("Ignoring pi extension UI update.", { method });
++          return;
++        }
++        if (nativeRequestId === undefined) return;
++        const state = threadState;
++        const turn = state?.activeTurn ?? null;
++        if (state === null || turn === null) {
++          // No turn to attach UI to; cancel so the extension is not stuck.
++          yield* connection
++            .send({ type: "extension_ui_response", id: nativeRequestId, cancelled: true })
++            .pipe(Effect.ignore);
++          return;
++        }
++        const createdAt = yield* DateTime.now;
++        const requestId = yield* idAllocator.allocate.runtimeRequest({
++          driver: PI_PROVIDER,
++          providerTurnId: turn.providerTurn.id,
++          nativeRequestId,
++        });
++        const nodeId = idAllocator.derive.approvalNode({ requestId });
++        const title = recordString(event, "title") ?? method;
++        const runtimeRequest: OrchestrationV2RuntimeRequest = {
++          id: requestId,
++          nodeId,
++          providerTurnId: turn.providerTurn.id,
++          nativeRequestRef: providerRef(nativeRequestId),
++          kind: method === "confirm" ? "command" : "user_input",
++          status: "pending",
++          responseCapability: { type: "live", providerSessionId: input.providerSessionId },
++          createdAt,
++          resolvedAt: null,
++        };
++        const node: OrchestrationV2ExecutionNode = {
++          id: nodeId,
++          threadId: turn.turnInput.threadId,
++          runId: turn.turnInput.runId,
++          parentNodeId: turn.turnInput.rootNodeId,
++          rootNodeId: turn.turnInput.rootNodeId,
++          kind: method === "confirm" ? "approval_request" : "user_input_request",
++          status: "waiting",
++          countsForRun: false,
++          providerThreadId: turn.turnInput.providerThread.id,
++          providerTurnId: turn.providerTurn.id,
++          nativeItemRef: providerRef(nativeRequestId),
++          runtimeRequestId: requestId,
++          checkpointScopeId: null,
++          startedAt: createdAt,
++          completedAt: null,
++        };
++        const itemBase = {
++          id: idAllocator.derive.approvalTurnItem({ requestId }),
++          threadId: turn.turnInput.threadId,
++          runId: turn.turnInput.runId,
++          nodeId,
++          providerThreadId: turn.turnInput.providerThread.id,
++          providerTurnId: turn.providerTurn.id,
++          nativeItemRef: providerRef(nativeRequestId),
++          parentItemId: null,
++          ordinal: itemOrdinal(turn, nativeRequestId),
++          status: "waiting" as const,
++          title,
++          startedAt: createdAt,
++          completedAt: null,
++          updatedAt: createdAt,
++        };
++        const turnItem: OrchestrationV2TurnItem =
++          method === "confirm"
++            ? {
++                ...itemBase,
++                type: "approval_request",
++                requestId,
++                requestKind: "command",
++                prompt: recordString(event, "message") ?? title,
++              }
++            : {
++                ...itemBase,
++                type: "user_input_request",
++                requestId,
++                questions: [piQuestion(nativeRequestId, method, title, event)],
++              };
++        pendingPrompts.set(String(requestId), {
++          nativeRequestId,
++          method,
++          questionId: nativeRequestId,
++          runtimeRequest,
++          node,
++          turnItem,
++        });
++        yield* emit({
++          type: "runtime_request.updated",
++          driver: PI_PROVIDER,
++          threadId: turn.turnInput.threadId,
++          runtimeRequest,
++        });
++        yield* emit({ type: "node.updated", driver: PI_PROVIDER, node });
++        yield* emit({ type: "turn_item.updated", driver: PI_PROVIDER, turnItem });
++      });
++
++      // ── turn lifecycle ────────────────────────────────────
++
++      const finalizeTurn = Effect.fnUntraced(function* (state: PiThreadState) {
++        const turn = state.activeTurn;
++        if (turn === null) return;
++        state.activeTurn = null;
++        const completedAt = yield* DateTime.now;
++        yield* completeOpenStreamItems(turn);
++        yield* cancelPendingPrompts(completedAt);
++        const failure = turn.interrupted ? null : turn.failure;
++        yield* emit({
++          type: "provider_turn.updated",
++          driver: PI_PROVIDER,
++          threadId: turn.turnInput.threadId,
++          providerTurn: {
++            ...turn.providerTurn,
++            status: turn.interrupted ? "interrupted" : failure !== null ? "failed" : "completed",
++            completedAt,
++          },
++        });
++        yield* updateProviderThread(state, { status: "idle" });
++        yield* updateProviderSession(failure !== null ? "error" : "ready");
++        if (failure !== null) {
++          const failureItemId = `terminal-failure:${turn.providerTurn.id}`;
++          yield* emit({
++            type: "turn_item.updated",
++            driver: PI_PROVIDER,
++            turnItem: {
++              ...baseItemFields(turn, failureItemId, completedAt, completedAt),
++              status: "failed",
++              title: null,
++              completedAt,
++              type: "error",
++              failure,
++            },
++          });
++          yield* emit({
++            type: "turn.terminal",
++            driver: PI_PROVIDER,
++            providerThreadId: state.providerThread.id,
++            providerTurnId: turn.providerTurn.id,
++            runOrdinal: turn.turnInput.runOrdinal,
++            failureItemOrdinal: itemOrdinal(turn, failureItemId),
++            status: "failed",
++            failure,
++            threadDisposition: "reusable",
++          });
++          return;
++        }
++        yield* emit({
++          type: "turn.terminal",
++          driver: PI_PROVIDER,
++          providerThreadId: state.providerThread.id,
++          providerTurnId: turn.providerTurn.id,
++          runOrdinal: turn.turnInput.runOrdinal,
++          status: turn.interrupted ? "interrupted" : "completed",
++          failure: null,
++          threadDisposition: "reusable",
++        });
++      });
++
++      // ── event pump ────────────────────────────────────────
++
++      const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
++        const state = threadState;
++        const turn = state?.activeTurn ?? null;
++        switch (event["type"]) {
++          case "message_start": {
++            if (turn !== null && recordString(event["message"], "role") === "assistant") {
++              turn.messageOrdinal += 1;
++            }
++            return;
++          }
++          case "message_update": {
++            if (turn === null) return;
++            const delta = event["assistantMessageEvent"];
++            const deltaType = recordString(delta, "type");
++            const contentIndex = recordNumber(delta, "contentIndex") ?? 0;
++            if (deltaType === "text_delta" || deltaType === "thinking_delta") {
++              const item = yield* streamItemFor(
++                turn,
++                deltaType === "text_delta" ? "assistant_message" : "reasoning",
++                contentIndex,
++              );
++              item.text += recordString(delta, "delta") ?? "";
++              yield* scheduleStreamFlush(turn, item);
++              return;
++            }
++            if (deltaType === "text_end" || deltaType === "thinking_end") {
++              const item = yield* streamItemFor(
++                turn,
++                deltaType === "text_end" ? "assistant_message" : "reasoning",
++                contentIndex,
++              );
++              yield* completeStreamItem(
++                turn,
++                item,
++                recordString(delta, "content") ?? recordString(delta, "thinking"),
++              );
++              return;
++            }
++            return;
++          }
++          case "message_end": {
++            if (turn === null) return;
++            const message = event["message"];
++            if (recordString(message, "role") !== "assistant") return;
++            yield* completeOpenStreamItems(turn);
++            if (recordString(message, "stopReason") === "error" && turn.failure === null) {
++              turn.failure = makeProviderFailure({
++                message: recordString(message, "errorMessage") ?? "Pi reported a model error.",
++                class: "provider_error",
++              });
++            }
++            return;
++          }
++          case "tool_execution_start":
++            if (turn !== null) yield* emitToolItem(turn, event, "start");
++            return;
++          case "tool_execution_update":
++            if (turn !== null) yield* emitToolItem(turn, event, "update");
++            return;
++          case "tool_execution_end":
++            if (turn !== null) yield* emitToolItem(turn, event, "end");
++            return;
++          case "compaction_end": {
++            if (turn === null) return;
++            const emittedAt = yield* DateTime.now;
++            const result = event["result"];
++            if (result === null || result === undefined) return;
++            const nativeItemId = `compaction:${turn.nextItemOrdinal}`;
++            yield* emit({
++              type: "turn_item.updated",
++              driver: PI_PROVIDER,
++              turnItem: {
++                ...baseItemFields(turn, nativeItemId, emittedAt, emittedAt),
++                status: "completed",
++                title: null,
++                completedAt: emittedAt,
++                type: "compaction",
++                driver: PI_PROVIDER,
++                ...(recordString(result, "summary") === undefined
++                  ? {}
++                  : { summary: recordString(result, "summary") }),
++                ...(recordNumber(result, "tokensBefore") === undefined
++                  ? {}
++                  : { beforeTokenCount: recordNumber(result, "tokensBefore") }),
++                ...(recordNumber(result, "estimatedTokensAfter") === undefined
++                  ? {}
++                  : { afterTokenCount: recordNumber(result, "estimatedTokensAfter") }),
++              },
++            });
++            return;
++          }
++          case "auto_retry_end": {
++            if (turn === null) return;
++            if (event["success"] === true) return;
++            turn.failure = makeProviderFailure({
++              message: recordString(event, "finalError") ?? "Pi auto-retry failed.",
++              class: "provider_error",
++              retryable: false,
++            });
++            return;
++          }
++          case "extension_ui_request":
++            yield* handleExtensionUiRequest(event);
++            return;
++          case "extension_error": {
++            yield* Effect.logWarning("Pi extension error.", {
++              extensionPath: recordString(event, "extensionPath"),
++              event: recordString(event, "event"),
++              error: recordString(event, "error"),
++            });
++            return;
++          }
++          case "agent_settled": {
++            if (state !== null) yield* finalizeTurn(state);
++            return;
++          }
++          default:
++            return;
++        }
++      });
++
++      yield* Effect.gen(function* () {
++        while (true) {
++          const event = yield* Queue.take(connection.events);
++          yield* handleSessionEvent(event);
++        }
++      }).pipe(
++        Effect.catchCause((cause) =>
++          Effect.gen(function* () {
++            // Transport death: fail any live turn, then surface the error.
++            const state = threadState;
++            if (state?.activeTurn != null) {
++              state.activeTurn.failure = makeProviderFailure({
++                cause,
++                message: "Pi process exited unexpectedly.",
++                class: "transport_error",
++              });
++              yield* finalizeTurn(state);
++            }
++            yield* updateProviderSession("error", "Pi process exited unexpectedly.");
++            yield* Queue.fail(
++              events,
++              new ProviderAdapterEventStreamError({
++                driver: PI_PROVIDER,
++                providerSessionId: input.providerSessionId,
++                cause,
++              }),
++            );
++          }),
++        ),
++        Effect.forkIn(scope),
++      );
++
++      // ── session runtime ───────────────────────────────────
++
++      const registerThread = Effect.fnUntraced(function* (
++        threadInput: ProviderAdapterV2EnsureThreadInput,
++      ) {
++        const existing = threadInput.existingProviderThread;
++        if (existing?.nativeThreadRef?.nativeId != null) {
++          yield* request({
++            type: "switch_session",
++            sessionPath: existing.nativeThreadRef.nativeId,
++          });
++        }
++        const stateData = yield* request({ type: "get_state" });
++        const nativeId =
++          recordString(stateData, "sessionFile") ?? recordString(stateData, "sessionId");
++        if (nativeId === undefined) {
++          return yield* protocolError(
++            "get_state returned neither sessionFile nor sessionId",
++            stateData,
++          );
++        }
++        const createdAt = yield* DateTime.now;
++        const providerThread: OrchestrationV2ProviderThread =
++          existing !== undefined
++            ? {
++                ...existing,
++                providerSessionId: input.providerSessionId,
++                nativeThreadRef: providerRef(nativeId),
++                status: "idle",
++                updatedAt: createdAt,
++              }
++            : {
++                id: idAllocator.derive.providerThread({
++                  driver: PI_PROVIDER,
++                  nativeThreadId: nativeId,
++                }),
++                driver: PI_PROVIDER,
++                providerInstanceId: options.instanceId,
++                providerSessionId: input.providerSessionId,
++                appThreadId: threadInput.threadId,
++                ownerNodeId: null,
++                nativeThreadRef: providerRef(nativeId),
++                nativeConversationHeadRef: null,
++                status: "idle",
++                firstRunOrdinal: null,
++                lastRunOrdinal: null,
++                handoffIds: [],
++                forkedFrom: null,
++                pendingBackgroundTasks: [],
++                createdAt,
++                updatedAt: createdAt,
++              };
++        threadState = { providerThread, activeTurn: null };
++        yield* emit({
++          type: "provider_thread.updated",
++          driver: PI_PROVIDER,
++          providerThread,
++        });
++        return providerThread;
++      });
++
++      const applySelection = Effect.fnUntraced(function* (modelSelection: ModelSelection) {
++        if (
++          modelSelection.model !== PI_INHERIT_MODEL_SLUG &&
++          modelSelection.model !== appliedModel
++        ) {
++          const parsed = parsePiModelSlug(modelSelection.model);
++          if (parsed === null) {
++            return yield* protocolError(
++              `Pi model '${modelSelection.model}' must use provider/model format`,
++            );
++          }
++          yield* request({
++            type: "set_model",
++            provider: parsed.provider,
++            modelId: parsed.modelId,
++          });
++          appliedModel = modelSelection.model;
++          const updatedAt = yield* DateTime.now;
++          sessionEntity = { ...sessionEntity, model: modelSelection.model, updatedAt };
++          yield* emit({
++            type: "provider_session.updated",
++            driver: PI_PROVIDER,
++            providerSession: sessionEntity,
++          });
++        }
++        const thinking = getModelSelectionStringOptionValue(modelSelection, "thinking");
++        if (
++          thinking !== undefined &&
++          thinking !== PI_INHERIT_THINKING_VALUE &&
++          thinking !== appliedThinking &&
++          PI_THINKING_LEVELS.has(thinking)
++        ) {
++          yield* request({ type: "set_thinking_level", level: thinking });
++          appliedThinking = thinking;
++        }
++      });
++
++      const resolvePromptPayload = Effect.fnUntraced(function* (
++        text: string,
++        attachments: ReadonlyArray<ChatAttachment>,
++      ) {
++        const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
++        const extraLines: Array<string> = [];
++        for (const attachment of attachments) {
++          const path = resolveAttachmentPath({
++            attachmentsDir: options.serverConfig.attachmentsDir,
++            attachment,
++          });
++          if (path === null) continue;
++          if (attachment.mimeType.startsWith("image/")) {
++            const bytes = yield* options.fileSystem.readFile(path);
++            images.push({
++              type: "image",
++              data: Buffer.from(bytes).toString("base64"),
++              mimeType: attachment.mimeType,
++            });
++          } else {
++            extraLines.push(`[Attachment saved at ${path}]`);
++          }
++        }
++        const message = extraLines.length === 0 ? text : `${text}\n\n${extraLines.join("\n")}`;
++        return { message, images };
++      });
++
++      const runtime: ProviderAdapterV2SessionRuntime = {
++        instanceId: options.instanceId,
++        driver: PI_PROVIDER,
++        providerSessionId: input.providerSessionId,
++        providerSession: sessionEntity,
++        events: Stream.fromQueue(events),
++        ensureThread: (threadInput) =>
++          registerThread(threadInput).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterEnsureThreadError({
++                  driver: PI_PROVIDER,
++                  threadId: threadInput.threadId,
++                  cause,
++                }),
++            ),
++          ),
++        resumeThread: (threadInput) =>
++          registerThread({
++            threadId:
++              threadInput.threadId ?? threadInput.providerThread.appThreadId ?? input.threadId,
++            modelSelection: threadInput.modelSelection ?? input.modelSelection,
++            runtimePolicy: threadInput.runtimePolicy ?? input.runtimePolicy,
++            existingProviderThread: threadInput.providerThread,
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterResumeThreadError({
++                  driver: PI_PROVIDER,
++                  providerSessionId: input.providerSessionId,
++                  providerThreadId: threadInput.providerThread.id,
++                  cause,
++                }),
++            ),
++          ),
++        startTurn: (turnInput) =>
++          Effect.gen(function* () {
++            const state = threadState;
++            if (state === null) {
++              return yield* protocolError("Pi session has no registered thread");
++            }
++            if (state.activeTurn !== null) {
++              return yield* protocolError(
++                `Pi provider thread ${turnInput.providerThread.id} already has an active turn`,
++              );
++            }
++            yield* applySelection(turnInput.modelSelection);
++            const startedAt = yield* DateTime.now;
++            const syntheticNativeTurnId = `${state.providerThread.id}:attempt:${turnInput.attemptId}`;
++            const providerTurn: OrchestrationV2ProviderTurn = {
++              id: idAllocator.derive.providerTurn({
++                driver: PI_PROVIDER,
++                nativeTurnId: syntheticNativeTurnId,
++              }),
++              providerThreadId: turnInput.providerThread.id,
++              nodeId: turnInput.rootNodeId,
++              runAttemptId: turnInput.attemptId,
++              nativeTurnRef: providerRef(syntheticNativeTurnId, "weak"),
++              ordinal: turnInput.providerTurnOrdinal,
++              status: "running",
++              startedAt,
++              completedAt: null,
++            };
++            state.activeTurn = {
++              turnInput,
++              providerTurn,
++              startedAt,
++              itemOrdinals: new Map(),
++              nextItemOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
++              messageOrdinal: 0,
++              streamItems: new Map(),
++              toolArgs: new Map(),
++              interrupted: false,
++              failure: null,
++            };
++            yield* emit({
++              type: "provider_turn.updated",
++              driver: PI_PROVIDER,
++              threadId: turnInput.threadId,
++              providerTurn,
++            });
++            yield* updateProviderThread(state, {
++              status: "active",
++              firstRunOrdinal: state.providerThread.firstRunOrdinal ?? turnInput.runOrdinal,
++              lastRunOrdinal: turnInput.runOrdinal,
++            });
++            yield* updateProviderSession("running", null);
++            const payload = yield* resolvePromptPayload(
++              turnInput.message.text,
++              turnInput.message.attachments,
++            );
++            yield* request({
++              type: "prompt",
++              message: payload.message,
++              ...(payload.images.length === 0 ? {} : { images: payload.images }),
++            }).pipe(
++              Effect.tapError(() =>
++                Effect.gen(function* () {
++                  const current = threadState;
++                  if (current?.activeTurn?.providerTurn.id === providerTurn.id) {
++                    current.activeTurn.failure = makeProviderFailure({
++                      message: "Pi rejected the prompt.",
++                      class: "provider_error",
++                    });
++                    yield* finalizeTurn(current);
++                  }
++                }),
++              ),
++            );
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterTurnStartError({
++                  driver: PI_PROVIDER,
++                  threadId: turnInput.threadId,
++                  providerThreadId: turnInput.providerThread.id,
++                  runId: turnInput.runId,
++                  cause,
++                }),
++            ),
++          ),
++        steerTurn: (steerInput: ProviderAdapterV2SteerInput) =>
++          Effect.gen(function* () {
++            const turn = threadState?.activeTurn ?? null;
++            if (turn === null || turn.providerTurn.id !== steerInput.providerTurnId) {
++              return yield* protocolError(`Pi turn ${steerInput.providerTurnId} is not active`);
++            }
++            const payload = yield* resolvePromptPayload(
++              steerInput.message.text,
++              steerInput.message.attachments,
++            );
++            yield* request({
++              type: "steer",
++              message: payload.message,
++              ...(payload.images.length === 0 ? {} : { images: payload.images }),
++            });
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterSteerRunError({
++                  driver: PI_PROVIDER,
++                  providerThreadId: steerInput.providerThread.id,
++                  providerTurnId: steerInput.providerTurnId,
++                  cause,
++                }),
++            ),
++          ),
++        interruptTurn: (interruptInput) =>
++          Effect.gen(function* () {
++            const turn = threadState?.activeTurn ?? null;
++            if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
++              return yield* protocolError(`Pi turn ${interruptInput.providerTurnId} is not active`);
++            }
++            turn.interrupted = true;
++            yield* request({ type: "abort" }).pipe(
++              Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
++            );
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterInterruptError({
++                  driver: PI_PROVIDER,
++                  providerThreadId: interruptInput.providerThread.id,
++                  providerTurnId: interruptInput.providerTurnId,
++                  cause,
++                }),
++            ),
++          ),
++        respondToRuntimeRequest: (requestInput) =>
++          Effect.gen(function* () {
++            const pending = pendingPrompts.get(String(requestInput.requestId));
++            if (pending === undefined) {
++              return yield* protocolError(
++                `No pending Pi extension request ${requestInput.requestId}`,
++              );
++            }
++            pendingPrompts.delete(String(requestInput.requestId));
++            const response = piUiResponse(pending, requestInput.decision, requestInput.answers);
++            yield* connection.send({
++              type: "extension_ui_response",
++              id: pending.nativeRequestId,
++              ...response,
++            });
++            const resolvedAt = yield* DateTime.now;
++            pending.runtimeRequest = {
++              ...pending.runtimeRequest,
++              status: "resolved",
++              resolvedAt,
++            };
++            yield* emit({
++              type: "runtime_request.updated",
++              driver: PI_PROVIDER,
++              threadId: pending.node.threadId,
++              runtimeRequest: pending.runtimeRequest,
++            });
++            yield* emit({
++              type: "node.updated",
++              driver: PI_PROVIDER,
++              node: { ...pending.node, status: "completed", completedAt: resolvedAt },
++            });
++            yield* emit({
++              type: "turn_item.updated",
++              driver: PI_PROVIDER,
++              turnItem: {
++                ...pending.turnItem,
++                status: "completed",
++                completedAt: resolvedAt,
++                updatedAt: resolvedAt,
++              },
++            });
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterRuntimeRequestResponseError({
++                  driver: PI_PROVIDER,
++                  requestId: requestInput.requestId,
++                  cause,
++                }),
++            ),
++          ),
++        readThreadSnapshot: (snapshotInput) =>
++          Effect.fail(
++            new ProviderAdapterReadThreadSnapshotError({
++              driver: PI_PROVIDER,
++              providerThreadId: snapshotInput.providerThread.id,
++            }),
++          ),
++        rollbackThread: (rollbackInput) =>
++          Effect.fail(
++            new ProviderAdapterRollbackThreadError({
++              driver: PI_PROVIDER,
++              providerThreadId: rollbackInput.providerThread.id,
++            }),
++          ),
++        forkThread: (forkInput) =>
++          Effect.fail(
++            new ProviderAdapterForkThreadError({
++              driver: PI_PROVIDER,
++              providerThreadId: forkInput.sourceProviderThread.id,
++            }),
++          ),
++      };
++      return runtime;
++    }),
++  });
++}
++
++function piQuestion(
++  questionId: string,
++  method: "select" | "input" | "editor",
++  title: string,
++  event: PiRpcRecord,
++): OrchestrationV2UserInputQuestion {
++  const options =
++    method === "select" && Array.isArray(event["options"])
++      ? event["options"]
++          .filter((option): option is string => typeof option === "string")
++          .map((option) => ({ label: option, description: option }))
++      : [];
++  return {
++    id: questionId,
++    header: title,
++    question: recordString(event, "message") ?? recordString(event, "placeholder") ?? title,
++    options,
++  };
++}
++
++function piUiResponse(
++  pending: PendingPiPrompt,
++  decision: ProviderApprovalDecision | undefined,
++  answers: Record<string, unknown> | undefined,
++): PiRpcRecord {
++  if (pending.method === "confirm") {
++    if (decision === "accept" || decision === "acceptForSession") return { confirmed: true };
++    if (decision === "decline") return { confirmed: false };
++    return { cancelled: true };
++  }
++  const answer = answers?.[pending.questionId];
++  if (typeof answer === "string" && answer.length > 0) return { value: answer };
++  return { cancelled: true };
++}
++
++// ── driver ────────────────────────────────────────────────────
++
++export type PiAdapterV2DriverEnv =
++  | ChildProcessSpawner.ChildProcessSpawner
++  | FileSystem.FileSystem
++  | IdAllocatorV2
++  | ServerConfig;
++
++export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2DriverEnv> = {
++  driverKind: PI_DRIVER_KIND,
++  configSchema: PiSettings,
++  defaultConfig: (): PiSettings => DEFAULT_PI_SETTINGS,
++  create: Effect.fn("PiAdapterV2Driver.create")(
++    function* (input: ProviderAdapterDriverCreateInput<PiSettings>) {
++      const hostEnvironment = yield* HostProcessEnvironment;
++      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++      const fileSystem = yield* FileSystem.FileSystem;
++      const idAllocator = yield* IdAllocatorV2;
++      const serverConfig = yield* ServerConfig;
++      return makePiAdapterV2({
++        instanceId: input.instanceId,
++        settings: { ...input.config, enabled: input.enabled },
++        environment: mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
++        spawner,
++        fileSystem,
++        idAllocator,
++        serverConfig,
++      });
++    },
++    (effect, input) =>
++      effect.pipe(
++        Effect.mapError(
++          (cause) =>
++            new ProviderAdapterDriverCreateError({
++              driver: PI_DRIVER_KIND,
++              instanceId: input.instanceId,
++              detail: "Failed to create Pi adapter.",
++              cause,
++            }),
++        ),
++      ),
++  ),
++};
++
++export const layer: Layer.Layer<ProviderAdapterV2, never, PiAdapterV2DriverEnv> = Layer.effect(
++  ProviderAdapterV2,
++  Effect.gen(function* () {
++    const hostEnvironment = yield* HostProcessEnvironment;
++    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++    const fileSystem = yield* FileSystem.FileSystem;
++    const idAllocator = yield* IdAllocatorV2;
++    const serverConfig = yield* ServerConfig;
++    return makePiAdapterV2({
++      instanceId: PI_DEFAULT_INSTANCE_ID,
++      settings: DEFAULT_PI_SETTINGS,
++      environment: hostEnvironment,
++      spawner,
++      fileSystem,
++      idAllocator,
++      serverConfig,
++    });
++  }),
++);
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+new file mode 100644
+index 000000000..8d3078935
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+@@ -0,0 +1,293 @@
++/**
++ * PiRpc — stdio JSONL transport for the Pi coding agent's RPC mode.
++ *
++ * Spawns `pi --mode rpc` and speaks Pi's line-delimited JSON protocol:
++ * requests go to stdin as `{"type": "...", "id": "..."}` records, responses
++ * come back as `{"type": "response", "id": ..., "success": ...}` and are
++ * correlated by `id`; every other stdout record is a session event and is
++ * surfaced on the `events` queue in arrival order.
++ *
++ * Framing follows Pi's spec: LF-delimited only, with a trailing `\r`
++ * stripped. Lines are split manually (never with `readline`, which also
++ * splits on U+2028/U+2029 and would corrupt frames). Records that fail to
++ * parse as JSON are dropped with a debug log rather than failing the
++ * transport, so a chatty extension cannot take the session down.
++ *
++ * Used by `PiAdapterV2` for sessions and by `PiTextGeneration` /
++ * `PiProvider` for ephemeral one-shot processes.
++ */
++import * as Deferred from "effect/Deferred";
++import * as Duration from "effect/Duration";
++import * as Effect from "effect/Effect";
++import * as Queue from "effect/Queue";
++import * as Scope from "effect/Scope";
++import * as Schema from "effect/Schema";
++import * as Stream from "effect/Stream";
++import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
++import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
++import { resolveSpawnCommand } from "@t3tools/shared/shell";
++
++export class PiRpcError extends Schema.TaggedErrorClass<PiRpcError>()("PiRpcError", {
++  operation: Schema.String,
++  detail: Schema.optional(Schema.String),
++  cause: Schema.optional(Schema.Defect()),
++}) {
++  override get message(): string {
++    return `Pi RPC ${this.operation} failed${this.detail === undefined ? "" : `: ${this.detail}`}.`;
++  }
++}
++
++export type PiRpcRecord = Record<string, unknown>;
++
++export interface PiRpcSpawnOptions {
++  readonly command: string;
++  readonly args: ReadonlyArray<string>;
++  readonly cwd: string | undefined;
++  readonly env: NodeJS.ProcessEnv;
++}
++
++export interface PiRpcConnection {
++  /** Fire-and-forget write (used for `extension_ui_response`). */
++  readonly send: (record: PiRpcRecord) => Effect.Effect<void, PiRpcError>;
++  /**
++   * Correlated request: assigns an `id`, waits for the matching response
++   * record, and returns its `data` (undefined when the command carries none).
++   * Fails on `success: false`, transport death, or timeout.
++   */
++  readonly request: (record: PiRpcRecord, timeoutMs?: number) => Effect.Effect<unknown, PiRpcError>;
++  /** Session events (every non-response stdout record) in arrival order. */
++  readonly events: Queue.Dequeue<PiRpcRecord, PiRpcError>;
++  /** Resolves when the process has exited, with its exit code. */
++  readonly exited: Effect.Effect<number, PiRpcError>;
++}
++
++const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
++const TERMINATION_GRACE = Duration.seconds(1);
++
++interface PendingPiRequest {
++  readonly deferred: Deferred.Deferred<unknown, PiRpcError>;
++}
++
++function splitJsonlChunks(buffer: string, chunk: string): readonly [ReadonlyArray<string>, string] {
++  const combined = buffer + chunk;
++  const parts = combined.split("\n");
++  const remainder = parts.pop() ?? "";
++  const lines = parts
++    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
++    .filter((line) => line.length > 0);
++  return [lines, remainder];
++}
++
++const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
++const decodeJsonLine = Schema.decodeSync(UnknownFromJsonString);
++const encodeJsonLine = Schema.encodeSync(UnknownFromJsonString);
++
++function parsePiRecord(line: string): PiRpcRecord | undefined {
++  try {
++    const parsed: unknown = decodeJsonLine(line);
++    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
++      return parsed as PiRpcRecord;
++    }
++    return undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/** Kill the pi process group: SIGTERM, short grace, then SIGKILL. */
++const terminatePiProcess = (pid: number, kill: (signal: NodeJS.Signals) => boolean) =>
++  Effect.gen(function* () {
++    if (!kill("SIGTERM")) return;
++    yield* Effect.sleep(TERMINATION_GRACE);
++    kill("SIGKILL");
++  });
++
++export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSpawnOptions) {
++  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++  const platform = yield* HostProcessPlatform;
++  const scope = yield* Effect.scope;
++
++  const spawnCommand = yield* resolveSpawnCommand(options.command, [...options.args], {
++    env: options.env,
++  }).pipe(Effect.mapError((cause) => new PiRpcError({ operation: "spawn", cause })));
++  const child = yield* spawner
++    .spawn(
++      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
++        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
++        env: options.env,
++        extendEnv: false,
++        shell: spawnCommand.shell,
++        detached: platform !== "win32",
++      }),
++    )
++    .pipe(Effect.mapError((cause) => new PiRpcError({ operation: "spawn", cause })));
++
++  const killProcessGroup = (signal: NodeJS.Signals): boolean => {
++    try {
++      if (platform === "win32") {
++        process.kill(Number(child.pid), signal);
++      } else {
++        process.kill(-Number(child.pid), signal);
++      }
++      return true;
++    } catch {
++      return false;
++    }
++  };
++
++  const pendingRequests = new Map<string, PendingPiRequest>();
++  const events = yield* Queue.unbounded<PiRpcRecord, PiRpcError>();
++  const outgoing = yield* Queue.unbounded<Uint8Array>();
++  const transportDown = yield* Deferred.make<never, PiRpcError>();
++  const exitDeferred = yield* Deferred.make<number, PiRpcError>();
++  let nextRequestId = 0;
++
++  const failTransport = (error: PiRpcError) =>
++    Effect.gen(function* () {
++      yield* Deferred.fail(transportDown, error);
++      for (const [key, pending] of pendingRequests) {
++        pendingRequests.delete(key);
++        yield* Deferred.fail(pending.deferred, error);
++      }
++      yield* Queue.fail(events, error);
++    });
++
++  // Writer: drain the outgoing queue into the child's stdin. If the writer
++  // dies, the transport is failed so later sends surface the error instead of
++  // silently queueing into a dead pipe.
++  yield* Stream.fromQueue(outgoing).pipe(
++    Stream.run(child.stdin),
++    Effect.catchCause((cause) => failTransport(new PiRpcError({ operation: "write", cause }))),
++    Effect.forkIn(scope),
++  );
++
++  const routeRecord = (record: PiRpcRecord) =>
++    Effect.gen(function* () {
++      if (record["type"] === "response" && typeof record["id"] === "string") {
++        const pending = pendingRequests.get(record["id"]);
++        if (pending !== undefined) {
++          pendingRequests.delete(record["id"]);
++          if (record["success"] === true) {
++            yield* Deferred.succeed(pending.deferred, record["data"]);
++          } else {
++            yield* Deferred.fail(
++              pending.deferred,
++              new PiRpcError({
++                operation: String(record["command"] ?? "request"),
++                detail: String(record["error"] ?? "unknown error"),
++              }),
++            );
++          }
++          return;
++        }
++      }
++      yield* Queue.offer(events, record);
++    });
++
++  // Reader: decode stdout into LF-delimited JSON records.
++  yield* Effect.gen(function* () {
++    let buffer = "";
++    yield* child.stdout.pipe(
++      Stream.decodeText(),
++      Stream.runForEach((chunk) =>
++        Effect.gen(function* () {
++          const [lines, remainder] = splitJsonlChunks(buffer, chunk);
++          buffer = remainder;
++          for (const line of lines) {
++            const record = parsePiRecord(line);
++            if (record === undefined) {
++              yield* Effect.logDebug("Dropping non-JSON pi stdout line.", {
++                lineLength: line.length,
++              });
++              continue;
++            }
++            yield* routeRecord(record);
++          }
++        }),
++      ),
++    );
++    const trailing = buffer.length > 0 ? parsePiRecord(buffer) : undefined;
++    if (trailing !== undefined) {
++      yield* routeRecord(trailing);
++    }
++  }).pipe(
++    Effect.matchCauseEffect({
++      onFailure: (cause) => failTransport(new PiRpcError({ operation: "read", cause })),
++      onSuccess: () =>
++        failTransport(new PiRpcError({ operation: "read", detail: "pi process closed stdout" })),
++    }),
++    Effect.forkIn(scope),
++  );
++
++  // Surface stderr as debug logs; pi reserves stdout for the protocol.
++  yield* child.stderr.pipe(
++    Stream.decodeText(),
++    Stream.runForEach((chunk) =>
++      chunk.trim().length === 0
++        ? Effect.void
++        : Effect.logDebug("pi stderr", { chunk: chunk.slice(0, 2_000) }),
++    ),
++    Effect.ignore,
++    Effect.forkIn(scope),
++  );
++
++  yield* child.exitCode.pipe(
++    Effect.matchEffect({
++      onFailure: (cause) =>
++        Deferred.fail(exitDeferred, new PiRpcError({ operation: "exit", cause })),
++      onSuccess: (code) => Deferred.succeed(exitDeferred, Number(code)),
++    }),
++    Effect.forkIn(scope),
++  );
++
++  yield* Scope.addFinalizer(
++    scope,
++    terminatePiProcess(Number(child.pid), killProcessGroup).pipe(
++      Effect.ignore,
++      Effect.uninterruptible,
++    ),
++  );
++
++  const send = (record: PiRpcRecord): Effect.Effect<void, PiRpcError> =>
++    Effect.gen(function* () {
++      const down = yield* Deferred.isDone(transportDown);
++      if (down) {
++        return yield* Deferred.await(transportDown);
++      }
++      yield* Queue.offer(outgoing, new TextEncoder().encode(`${encodeJsonLine(record)}\n`));
++    });
++
++  const request = (
++    record: PiRpcRecord,
++    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
++  ): Effect.Effect<unknown, PiRpcError> =>
++    Effect.gen(function* () {
++      const id = `t3-${nextRequestId++}`;
++      const deferred = yield* Deferred.make<unknown, PiRpcError>();
++      pendingRequests.set(id, { deferred });
++      yield* send({ ...record, id }).pipe(
++        Effect.tapError(() => Effect.sync(() => pendingRequests.delete(id))),
++      );
++      return yield* Deferred.await(deferred).pipe(
++        Effect.timeoutOrElse({
++          duration: Duration.millis(timeoutMs),
++          orElse: () =>
++            Effect.fail(
++              new PiRpcError({
++                operation: String(record["type"] ?? "request"),
++                detail: `timed out after ${timeoutMs}ms`,
++              }),
++            ),
++        }),
++        Effect.onInterrupt(() => Effect.sync(() => pendingRequests.delete(id))),
++        Effect.onError(() => Effect.sync(() => pendingRequests.delete(id))),
++      );
++    });
++
++  return {
++    send,
++    request,
++    events,
++    exited: Deferred.await(exitDeferred),
++  } satisfies PiRpcConnection;
++});
+diff --git a/apps/server/src/orchestration-v2/builtInProviderAdapterDrivers.ts b/apps/server/src/orchestration-v2/builtInProviderAdapterDrivers.ts
+index 1ef37a2bf..8f9db9248 100644
+--- a/apps/server/src/orchestration-v2/builtInProviderAdapterDrivers.ts
++++ b/apps/server/src/orchestration-v2/builtInProviderAdapterDrivers.ts
+@@ -18,6 +18,7 @@ import {
+   OpenCodeAdapterV2Driver,
+   type OpenCodeAdapterV2DriverEnv,
+ } from "./Adapters/OpenCodeAdapterV2.ts";
++import { PiAdapterV2Driver, type PiAdapterV2DriverEnv } from "./Adapters/PiAdapterV2.ts";
+ import type { AnyProviderAdapterDriver } from "./ProviderAdapterDriver.ts";
+ 
+ export type BuiltInProviderAdapterDriversV2Env =
+@@ -26,7 +27,8 @@ export type BuiltInProviderAdapterDriversV2Env =
+   | CodexAdapterV2DriverEnv
+   | CursorAdapterV2DriverEnv
+   | GrokAdapterV2DriverEnv
+-  | OpenCodeAdapterV2DriverEnv;
++  | OpenCodeAdapterV2DriverEnv
++  | PiAdapterV2DriverEnv;
+ 
+ export const BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2: ReadonlyArray<
+   AnyProviderAdapterDriver<BuiltInProviderAdapterDriversV2Env>
+@@ -36,6 +38,7 @@ export const BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2: ReadonlyArray<
+   CursorAdapterV2Driver,
+   OpenCodeAdapterV2Driver,
+   GrokAdapterV2Driver,
++  PiAdapterV2Driver,
+   AcpRegistryAdapterV2Driver,
+ ];
+ 
+diff --git a/apps/server/src/provider/Drivers/PiDriver.ts b/apps/server/src/provider/Drivers/PiDriver.ts
+new file mode 100644
+index 000000000..1d6bb08d6
+--- /dev/null
++++ b/apps/server/src/provider/Drivers/PiDriver.ts
+@@ -0,0 +1,181 @@
++/**
++ * PiDriver — v1 `ProviderDriver` for the Pi coding agent, composing the
++ * orchestrator-v2 adapter (`PiAdapterV2`), the snapshot/probe layer
++ * (`PiProvider`), and Pi-backed text generation.
++ *
++ * Pi state (sessions, settings, extensions, auth) lives in the user's own
++ * `~/.pi/agent`, so continuation identity uses the default instance grouping.
++ */
++import { PiSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import { HttpClient } from "effect/unstable/http";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
++import { ServerConfig } from "../../config.ts";
++import { ServerSettingsService } from "../../serverSettings.ts";
++import { makePiTextGeneration } from "../../textGeneration/PiTextGeneration.ts";
++import {
++  PiAdapterV2Driver,
++  type PiAdapterV2DriverEnv,
++} from "../../orchestration-v2/Adapters/PiAdapterV2.ts";
++import { ProviderDriverError } from "../Errors.ts";
++import {
++  buildInitialPiProviderSnapshot,
++  checkPiProviderStatus,
++  enrichPiSnapshot,
++} from "../Layers/PiProvider.ts";
++import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
++import {
++  defaultProviderContinuationIdentity,
++  type ProviderDriver,
++  type ProviderInstance,
++} from "../ProviderDriver.ts";
++import type { ServerProviderDraft } from "../providerSnapshot.ts";
++import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
++import {
++  makePackageManagedProviderMaintenanceResolver,
++  resolveProviderMaintenanceCapabilitiesEffect,
++} from "../providerMaintenance.ts";
++import {
++  haveProviderSnapshotSettingsChanged,
++  makeProviderSnapshotSettingsSource,
++  type ProviderSnapshotSettings,
++} from "../providerUpdateSettings.ts";
++
++const decodePiSettings = Schema.decodeSync(PiSettings);
++
++const DRIVER_KIND = ProviderDriverKind.make("pi");
++const UPDATE = makePackageManagedProviderMaintenanceResolver({
++  provider: DRIVER_KIND,
++  npmPackageName: "@earendil-works/pi-coding-agent",
++  homebrewFormula: null,
++  nativeUpdate: null,
++});
++
++export type PiDriverEnv =
++  | PiAdapterV2DriverEnv
++  | BackgroundPolicy.BackgroundPolicy
++  | ChildProcessSpawner.ChildProcessSpawner
++  | FileSystem.FileSystem
++  | HttpClient.HttpClient
++  | Path.Path
++  | ServerConfig
++  | ServerSettingsService;
++
++const withInstanceIdentity =
++  (input: {
++    readonly instanceId: ProviderInstance["instanceId"];
++    readonly displayName: string | undefined;
++    readonly accentColor: string | undefined;
++    readonly continuationGroupKey: string;
++  }) =>
++  (snapshot: ServerProviderDraft): ServerProvider => ({
++    ...snapshot,
++    instanceId: input.instanceId,
++    driver: DRIVER_KIND,
++    ...(input.displayName ? { displayName: input.displayName } : {}),
++    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
++    continuation: { groupKey: input.continuationGroupKey },
++  });
++
++export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
++  driverKind: DRIVER_KIND,
++  metadata: {
++    displayName: "Pi",
++    supportsMultipleInstances: true,
++  },
++  configSchema: PiSettings,
++  defaultConfig: (): PiSettings => decodePiSettings({}),
++  create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
++    Effect.gen(function* () {
++      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++      const httpClient = yield* HttpClient.HttpClient;
++      const serverSettings = yield* ServerSettingsService;
++      const processEnv = mergeProviderInstanceEnvironment(environment);
++      const continuationIdentity = defaultProviderContinuationIdentity({
++        driverKind: DRIVER_KIND,
++        instanceId,
++      });
++      const stampIdentity = withInstanceIdentity({
++        instanceId,
++        displayName,
++        accentColor,
++        continuationGroupKey: continuationIdentity.continuationKey,
++      });
++      const effectiveConfig = { ...config, enabled } satisfies PiSettings;
++      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
++        binaryPath: effectiveConfig.binaryPath,
++        env: processEnv,
++      });
++
++      const orchestrationAdapter = yield* PiAdapterV2Driver.create({
++        instanceId,
++        displayName,
++        accentColor,
++        environment,
++        enabled,
++        config,
++      }).pipe(
++        Effect.mapError(
++          (cause) =>
++            new ProviderDriverError({
++              driver: DRIVER_KIND,
++              instanceId,
++              detail: "Failed to build Pi orchestration adapter.",
++              cause,
++            }),
++        ),
++      );
++      const textGeneration = yield* makePiTextGeneration(effectiveConfig, processEnv);
++
++      const checkProvider = checkPiProviderStatus(effectiveConfig, processEnv).pipe(
++        Effect.map(stampIdentity),
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
++      );
++
++      const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
++      const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<PiSettings>>({
++        maintenanceCapabilities,
++        getSettings: snapshotSettings.getSettings,
++        streamSettings: snapshotSettings.streamSettings,
++        haveSettingsChanged: haveProviderSnapshotSettingsChanged,
++        initialSnapshot: (settings) =>
++          buildInitialPiProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
++        checkProvider,
++        enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
++          enrichPiSnapshot({
++            snapshot: currentSnapshot,
++            maintenanceCapabilities,
++            enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
++            publishSnapshot,
++            httpClient,
++          }),
++      }).pipe(
++        Effect.mapError(
++          (cause) =>
++            new ProviderDriverError({
++              driver: DRIVER_KIND,
++              instanceId,
++              detail: `Failed to build Pi snapshot: ${cause.message ?? String(cause)}`,
++              cause,
++            }),
++        ),
++      );
++
++      return {
++        instanceId,
++        driverKind: DRIVER_KIND,
++        continuationIdentity,
++        displayName,
++        accentColor,
++        enabled,
++        snapshot,
++        orchestrationAdapter,
++        textGeneration,
++      } satisfies ProviderInstance;
++    }),
++};
+diff --git a/apps/server/src/provider/Layers/PiProvider.ts b/apps/server/src/provider/Layers/PiProvider.ts
+new file mode 100644
+index 000000000..a5cc3b6c9
+--- /dev/null
++++ b/apps/server/src/provider/Layers/PiProvider.ts
+@@ -0,0 +1,414 @@
++/**
++ * PiProvider — snapshot/probe layer for the Pi coding agent.
++ *
++ * Health is probed with `pi --version`. Models, the user's default model, and
++ * the user's commands (extension slash commands, prompt templates, skills)
++ * are discovered through a short-lived ephemeral RPC session
++ * (`pi --mode rpc --no-session`), so everything the user configured in
++ * `~/.pi/agent` — custom providers, models.json entries, extensions, skills —
++ * shows up in T3 without any hardcoded catalog.
++ */
++import {
++  type ModelCapabilities,
++  type PiSettings,
++  type ServerProvider,
++  type ServerProviderModel,
++  type ServerProviderSkill,
++  type ServerProviderSlashCommand,
++} from "@t3tools/contracts";
++import { causeErrorTag } from "@t3tools/shared/observability";
++import { createModelCapabilities } from "@t3tools/shared/model";
++import { resolveSpawnCommand } from "@t3tools/shared/shell";
++import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as Exit from "effect/Exit";
++import * as Option from "effect/Option";
++import * as Result from "effect/Result";
++import { HttpClient } from "effect/unstable/http";
++import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
++
++import { makePiRpcConnection } from "../../orchestration-v2/Adapters/PiRpc.ts";
++import {
++  buildServerProvider,
++  isCommandMissingCause,
++  parseGenericCliVersion,
++  providerModelsFromSettings,
++  spawnAndCollect,
++  type ServerProviderDraft,
++} from "../providerSnapshot.ts";
++import {
++  enrichProviderSnapshotWithVersionAdvisory,
++  type ProviderMaintenanceCapabilities,
++} from "../providerMaintenance.ts";
++
++const PI_PRESENTATION = {
++  displayName: "Pi",
++  badgeLabel: "Early Access",
++  showInteractionModeToggle: false,
++  requiresNewThreadForModelChange: false,
++} as const;
++
++const VERSION_PROBE_TIMEOUT_MS = 4_000;
++const PI_RPC_DISCOVERY_TIMEOUT_MS = 15_000;
++
++const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
++  optionDescriptors: [],
++});
++
++/**
++ * Reasoning-capable Pi models expose Pi's thinking levels. "Inherit" leaves
++ * the user's settings.json `defaultThinkingLevel` untouched.
++ */
++const THINKING_CAPABILITIES: ModelCapabilities = createModelCapabilities({
++  optionDescriptors: [
++    {
++      id: "thinking",
++      label: "Thinking",
++      type: "select",
++      options: [
++        { id: "inherit", label: "Pi default", isDefault: true },
++        { id: "off", label: "Off" },
++        { id: "minimal", label: "Minimal" },
++        { id: "low", label: "Low" },
++        { id: "medium", label: "Medium" },
++        { id: "high", label: "High" },
++        { id: "xhigh", label: "Extra high" },
++        { id: "max", label: "Max" },
++      ],
++    },
++  ],
++});
++
++/** Deferring to the user's own settings.json default model. */
++const PI_DEFAULT_MODEL: ServerProviderModel = {
++  slug: "default",
++  name: "Pi default",
++  isCustom: false,
++  capabilities: EMPTY_CAPABILITIES,
++};
++
++interface PiDiscovery {
++  readonly models: ReadonlyArray<ServerProviderModel>;
++  readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
++  readonly skills: ReadonlyArray<ServerProviderSkill>;
++  readonly authenticated: boolean;
++}
++
++function piModelsFromSettings(
++  customModels: ReadonlyArray<string> | undefined,
++  discovered: ReadonlyArray<ServerProviderModel> = [],
++): ReadonlyArray<ServerProviderModel> {
++  return providerModelsFromSettings(
++    [PI_DEFAULT_MODEL, ...discovered],
++    customModels ?? [],
++    EMPTY_CAPABILITIES,
++  );
++}
++
++function recordField(input: unknown, key: string): unknown {
++  if (typeof input !== "object" || input === null) return undefined;
++  return (input as Record<string, unknown>)[key];
++}
++
++function recordString(input: unknown, key: string): string | undefined {
++  const value = recordField(input, key);
++  return typeof value === "string" ? value : undefined;
++}
++
++function parseDiscoveredModels(data: unknown): ReadonlyArray<ServerProviderModel> {
++  const models = recordField(data, "models");
++  if (!Array.isArray(models)) return [];
++  const seen = new Set<string>();
++  const parsed: Array<ServerProviderModel> = [];
++  for (const model of models) {
++    const provider = recordString(model, "provider");
++    const id = recordString(model, "id");
++    if (provider === undefined || id === undefined) continue;
++    const slug = `${provider}/${id}`;
++    if (seen.has(slug)) continue;
++    seen.add(slug);
++    parsed.push({
++      slug,
++      name: recordString(model, "name") ?? slug,
++      isCustom: false,
++      capabilities:
++        recordField(model, "reasoning") === true ? THINKING_CAPABILITIES : EMPTY_CAPABILITIES,
++    });
++  }
++  return parsed;
++}
++
++function parseDiscoveredCommands(data: unknown): {
++  readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
++  readonly skills: ReadonlyArray<ServerProviderSkill>;
++} {
++  const commands = recordField(data, "commands");
++  if (!Array.isArray(commands)) return { slashCommands: [], skills: [] };
++  const slashCommands: Array<ServerProviderSlashCommand> = [];
++  const skills: Array<ServerProviderSkill> = [];
++  for (const command of commands) {
++    const name = recordString(command, "name");
++    if (name === undefined || name.length === 0) continue;
++    const description = recordString(command, "description");
++    if (recordString(command, "source") === "skill") {
++      const path = recordString(command, "path");
++      if (path === undefined) continue;
++      skills.push({
++        name,
++        ...(description === undefined ? {} : { description }),
++        path,
++        ...(recordString(command, "location") === undefined
++          ? {}
++          : { scope: recordString(command, "location") }),
++        enabled: true,
++      });
++      continue;
++    }
++    slashCommands.push({
++      name,
++      ...(description === undefined ? {} : { description }),
++    });
++  }
++  return { slashCommands, skills };
++}
++
++const discoverPiViaRpc = (piSettings: PiSettings, environment: NodeJS.ProcessEnv) =>
++  Effect.gen(function* () {
++    const connection = yield* makePiRpcConnection({
++      command: piSettings.binaryPath || "pi",
++      args: ["--mode", "rpc", "--no-session", ...tokenizeCliArgs(piSettings.launchArgs)],
++      cwd: undefined,
++      env: environment,
++    });
++    const modelsData = yield* connection.request({ type: "get_available_models" });
++    const commandsData = yield* connection
++      .request({ type: "get_commands" })
++      .pipe(Effect.orElseSucceed(() => undefined));
++    const discoveredModels = parseDiscoveredModels(modelsData);
++    const { slashCommands, skills } = parseDiscoveredCommands(commandsData);
++    return {
++      models: discoveredModels,
++      slashCommands,
++      skills,
++      authenticated: discoveredModels.length > 0,
++    } satisfies PiDiscovery;
++  }).pipe(Effect.scoped);
++
++const runPiVersionCommand = (piSettings: PiSettings, environment: NodeJS.ProcessEnv) =>
++  Effect.gen(function* () {
++    const command = piSettings.binaryPath || "pi";
++    const spawnCommand = yield* resolveSpawnCommand(command, ["--version"], {
++      env: environment,
++    });
++    return yield* spawnAndCollect(
++      command,
++      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
++        env: environment,
++        shell: spawnCommand.shell,
++      }),
++    );
++  });
++
++export function buildInitialPiProviderSnapshot(
++  piSettings: PiSettings,
++): Effect.Effect<ServerProviderDraft> {
++  return Effect.gen(function* () {
++    const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
++    const models = piModelsFromSettings(piSettings.customModels);
++    if (!piSettings.enabled) {
++      return buildServerProvider({
++        presentation: PI_PRESENTATION,
++        enabled: false,
++        checkedAt,
++        models,
++        probe: {
++          installed: false,
++          version: null,
++          status: "warning",
++          auth: { status: "unknown" },
++          message: "Pi is disabled in T3 Code settings.",
++        },
++      });
++    }
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: true,
++      checkedAt,
++      models,
++      probe: {
++        installed: true,
++        version: null,
++        status: "warning",
++        auth: { status: "unknown" },
++        message: "Checking Pi CLI availability...",
++      },
++    });
++  });
++}
++
++export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function* (
++  piSettings: PiSettings,
++  environment: NodeJS.ProcessEnv = process.env,
++): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
++  const checkedAt = DateTime.formatIso(yield* DateTime.now);
++  const fallbackModels = piModelsFromSettings(piSettings.customModels);
++
++  if (!piSettings.enabled) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: false,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: false,
++        version: null,
++        status: "warning",
++        auth: { status: "unknown" },
++        message: "Pi is disabled in T3 Code settings.",
++      },
++    });
++  }
++
++  const versionResult = yield* runPiVersionCommand(piSettings, environment).pipe(
++    Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
++    Effect.result,
++  );
++
++  if (Result.isFailure(versionResult)) {
++    const error = versionResult.failure;
++    yield* Effect.logWarning("Pi CLI health check failed.", { errorTag: error._tag });
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: !isCommandMissingCause(error),
++        version: null,
++        status: "error",
++        auth: { status: "unknown" },
++        message: isCommandMissingCause(error)
++          ? "Pi CLI (`pi`) is not installed or not on PATH. Install with `npm install -g @earendil-works/pi-coding-agent`."
++          : "Failed to execute Pi CLI health check.",
++      },
++    });
++  }
++
++  if (Option.isNone(versionResult.success)) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version: null,
++        status: "error",
++        auth: { status: "unknown" },
++        message: "Pi CLI is installed but timed out while running `pi --version`.",
++      },
++    });
++  }
++
++  const versionOutput = versionResult.success.value;
++  const version = parseGenericCliVersion(`${versionOutput.stdout}\n${versionOutput.stderr}`);
++  if (versionOutput.code !== 0) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: "Pi CLI is installed but failed to run.",
++      },
++    });
++  }
++
++  const discoveryExit = yield* discoverPiViaRpc(piSettings, environment).pipe(
++    Effect.timeoutOption(PI_RPC_DISCOVERY_TIMEOUT_MS),
++    Effect.exit,
++  );
++  if (Exit.isFailure(discoveryExit)) {
++    yield* Effect.logWarning("Pi RPC discovery failed.", {
++      errorTag: causeErrorTag(discoveryExit.cause),
++    });
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: "Pi CLI is installed but RPC startup failed. Check server logs for details.",
++      },
++    });
++  }
++  if (Option.isNone(discoveryExit.value)) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: `Pi CLI is installed but RPC startup timed out after ${PI_RPC_DISCOVERY_TIMEOUT_MS}ms.`,
++      },
++    });
++  }
++
++  const discovery = discoveryExit.value.value;
++  const models = piModelsFromSettings(piSettings.customModels, discovery.models);
++  return buildServerProvider({
++    presentation: PI_PRESENTATION,
++    enabled: piSettings.enabled,
++    checkedAt,
++    models,
++    slashCommands: discovery.slashCommands,
++    skills: discovery.skills,
++    probe: {
++      installed: true,
++      version,
++      status: discovery.authenticated ? "ready" : "warning",
++      auth: { status: discovery.authenticated ? "authenticated" : "unauthenticated", type: "pi" },
++      ...(discovery.authenticated
++        ? {}
++        : {
++            message:
++              "Pi has no usable models. Run `pi` in a terminal and use /login, or configure an API key in ~/.pi/agent.",
++          }),
++    },
++  });
++});
++
++export const enrichPiSnapshot = (input: {
++  readonly snapshot: ServerProvider;
++  readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
++  readonly enableProviderUpdateChecks?: boolean;
++  readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
++  readonly httpClient: HttpClient.HttpClient;
++}): Effect.Effect<void> => {
++  const { snapshot, publishSnapshot } = input;
++  return enrichProviderSnapshotWithVersionAdvisory(snapshot, input.maintenanceCapabilities, {
++    enableProviderUpdateChecks: input.enableProviderUpdateChecks,
++  }).pipe(
++    Effect.provideService(HttpClient.HttpClient, input.httpClient),
++    Effect.flatMap((enrichedSnapshot) => publishSnapshot(enrichedSnapshot)),
++    Effect.catchCause((cause) =>
++      Effect.logWarning("Pi version advisory enrichment failed", {
++        errorTag: causeErrorTag(cause),
++      }),
++    ),
++    Effect.asVoid,
++  );
++};
+diff --git a/apps/server/src/provider/Layers/ProviderRegistry.test.ts b/apps/server/src/provider/Layers/ProviderRegistry.test.ts
+index 32f6448da..de3379736 100644
+--- a/apps/server/src/provider/Layers/ProviderRegistry.test.ts
++++ b/apps/server/src/provider/Layers/ProviderRegistry.test.ts
+@@ -1808,6 +1808,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
+                 "cursor",
+                 "grok",
+                 "opencode",
++                "pi",
+               ]);
+               assert.strictEqual(cursorProvider?.enabled, false);
+               assert.strictEqual(cursorProvider?.status, "disabled");
+diff --git a/apps/server/src/provider/builtInDrivers.ts b/apps/server/src/provider/builtInDrivers.ts
+index bbff99705..f4e6c4e0a 100644
+--- a/apps/server/src/provider/builtInDrivers.ts
++++ b/apps/server/src/provider/builtInDrivers.ts
+@@ -26,6 +26,7 @@ import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
+ import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
+ import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
+ import { OpenCodeDriver, type OpenCodeDriverEnv } from "./Drivers/OpenCodeDriver.ts";
++import { PiDriver, type PiDriverEnv } from "./Drivers/PiDriver.ts";
+ import type { AnyProviderDriver } from "./ProviderDriver.ts";
+ 
+ /**
+@@ -39,7 +40,8 @@ export type BuiltInDriversEnv =
+   | CodexDriverEnv
+   | CursorDriverEnv
+   | GrokDriverEnv
+-  | OpenCodeDriverEnv;
++  | OpenCodeDriverEnv
++  | PiDriverEnv;
+ 
+ /**
+  * Ordered list of built-in drivers. Order matters only for tie-breaking in
+@@ -52,5 +54,6 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
+   CursorDriver,
+   GrokDriver,
+   OpenCodeDriver,
++  PiDriver,
+   AcpRegistryDriver,
+ ];
+diff --git a/apps/server/src/textGeneration/PiTextGeneration.ts b/apps/server/src/textGeneration/PiTextGeneration.ts
+new file mode 100644
+index 000000000..7446cdb52
+--- /dev/null
++++ b/apps/server/src/textGeneration/PiTextGeneration.ts
+@@ -0,0 +1,224 @@
++/**
++ * PiTextGeneration — commit messages, PR content, branch names, and thread
++ * titles generated through an ephemeral `pi --mode rpc --no-session` process.
++ * No session file is written; the user's Pi configuration (default model,
++ * auth, custom providers) still applies.
++ */
++import * as Effect from "effect/Effect";
++import * as Option from "effect/Option";
++import * as Queue from "effect/Queue";
++import * as Schema from "effect/Schema";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import { TextGenerationError, type ModelSelection, type PiSettings } from "@t3tools/contracts";
++import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
++import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
++import { extractJsonObject } from "@t3tools/shared/schemaJson";
++
++import { makePiRpcConnection } from "../orchestration-v2/Adapters/PiRpc.ts";
++import * as TextGeneration from "./TextGeneration.ts";
++import {
++  buildBranchNamePrompt,
++  buildCommitMessagePrompt,
++  buildPrContentPrompt,
++  buildThreadTitlePrompt,
++} from "./TextGenerationPrompts.ts";
++import {
++  sanitizeCommitSubject,
++  sanitizePrTitle,
++  sanitizeThreadTitle,
++} from "./TextGenerationUtils.ts";
++
++const PI_TIMEOUT_MS = 180_000;
++
++const isTextGenerationError = Schema.is(TextGenerationError);
++
++export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* (
++  piSettings: PiSettings,
++  environment: NodeJS.ProcessEnv = process.env,
++) {
++  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++
++  const runPiJson = <S extends Schema.Top>({
++    operation,
++    cwd,
++    prompt,
++    outputSchemaJson,
++    modelSelection,
++  }: {
++    operation:
++      | "generateCommitMessage"
++      | "generatePrContent"
++      | "generateBranchName"
++      | "generateThreadTitle";
++    cwd: string;
++    prompt: string;
++    outputSchemaJson: S;
++    modelSelection: ModelSelection;
++  }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
++    Effect.gen(function* () {
++      const connection = yield* makePiRpcConnection({
++        command: piSettings.binaryPath || "pi",
++        args: ["--mode", "rpc", "--no-session", ...tokenizeCliArgs(piSettings.launchArgs)],
++        cwd,
++        env: environment,
++      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
++
++      if (modelSelection.model !== "default") {
++        const separator = modelSelection.model.indexOf("/");
++        if (separator > 0 && separator < modelSelection.model.length - 1) {
++          yield* connection.request({
++            type: "set_model",
++            provider: modelSelection.model.slice(0, separator),
++            modelId: modelSelection.model.slice(separator + 1),
++          });
++        }
++      }
++
++      yield* connection.request({ type: "prompt", message: prompt });
++      yield* Effect.gen(function* () {
++        while (true) {
++          const event = yield* Queue.take(connection.events);
++          if (event["type"] === "agent_settled") return;
++        }
++      });
++      const data = yield* connection.request({ type: "get_last_assistant_text" });
++      const text =
++        typeof data === "object" &&
++        data !== null &&
++        typeof (data as { text?: unknown }).text === "string"
++          ? (data as { text: string }).text.trim()
++          : "";
++      if (!text) {
++        return yield* new TextGenerationError({
++          operation,
++          detail: "Pi returned empty output.",
++        });
++      }
++      const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson));
++      return yield* decodeOutput(extractJsonObject(text)).pipe(
++        Effect.catchTags({
++          SchemaError: (cause) =>
++            Effect.fail(
++              new TextGenerationError({
++                operation,
++                detail: "Pi returned invalid structured output.",
++                cause,
++              }),
++            ),
++        }),
++      );
++    }).pipe(
++      Effect.timeoutOption(PI_TIMEOUT_MS),
++      Effect.flatMap(
++        Option.match({
++          onNone: () =>
++            Effect.fail(new TextGenerationError({ operation, detail: "Pi request timed out." })),
++          onSome: (value) => Effect.succeed(value),
++        }),
++      ),
++      Effect.mapError((cause) =>
++        isTextGenerationError(cause)
++          ? cause
++          : new TextGenerationError({
++              operation,
++              detail: "Pi text generation failed.",
++              cause,
++            }),
++      ),
++      Effect.scoped,
++    );
++
++  const generateCommitMessage: TextGeneration.TextGeneration["Service"]["generateCommitMessage"] =
++    Effect.fn("PiTextGeneration.generateCommitMessage")(function* (input) {
++      const { prompt, outputSchema } = buildCommitMessagePrompt({
++        branch: input.branch,
++        stagedSummary: input.stagedSummary,
++        stagedPatch: input.stagedPatch,
++        includeBranch: input.includeBranch === true,
++        policy: input.policy,
++      });
++      const generated = yield* runPiJson({
++        operation: "generateCommitMessage",
++        cwd: input.cwd,
++        prompt,
++        outputSchemaJson: outputSchema,
++        modelSelection: input.modelSelection,
++      });
++      return {
++        subject: sanitizeCommitSubject(generated.subject),
++        body: generated.body.trim(),
++        ...("branch" in generated && typeof generated.branch === "string"
++          ? { branch: sanitizeFeatureBranchName(generated.branch) }
++          : {}),
++      };
++    });
++
++  const generatePrContent: TextGeneration.TextGeneration["Service"]["generatePrContent"] =
++    Effect.fn("PiTextGeneration.generatePrContent")(function* (input) {
++      const { prompt, outputSchema } = buildPrContentPrompt({
++        baseBranch: input.baseBranch,
++        headBranch: input.headBranch,
++        commitSummary: input.commitSummary,
++        diffSummary: input.diffSummary,
++        diffPatch: input.diffPatch,
++        policy: input.policy,
++        changeRequestTemplate: input.changeRequestTemplate,
++      });
++      const generated = yield* runPiJson({
++        operation: "generatePrContent",
++        cwd: input.cwd,
++        prompt,
++        outputSchemaJson: outputSchema,
++        modelSelection: input.modelSelection,
++      });
++      return {
++        title: sanitizePrTitle(generated.title),
++        body: generated.body.trim(),
++      };
++    });
++
++  const generateBranchName: TextGeneration.TextGeneration["Service"]["generateBranchName"] =
++    Effect.fn("PiTextGeneration.generateBranchName")(function* (input) {
++      const { prompt, outputSchema } = buildBranchNamePrompt({
++        message: input.message,
++        attachments: input.attachments,
++      });
++      const generated = yield* runPiJson({
++        operation: "generateBranchName",
++        cwd: input.cwd,
++        prompt,
++        outputSchemaJson: outputSchema,
++        modelSelection: input.modelSelection,
++      });
++      return {
++        branch: sanitizeBranchFragment(generated.branch),
++      };
++    });
++
++  const generateThreadTitle: TextGeneration.TextGeneration["Service"]["generateThreadTitle"] =
++    Effect.fn("PiTextGeneration.generateThreadTitle")(function* (input) {
++      const { prompt, outputSchema } = buildThreadTitlePrompt({
++        message: input.message,
++        previousTitle: input.previousTitle,
++        attachments: input.attachments,
++      });
++      const generated = yield* runPiJson({
++        operation: "generateThreadTitle",
++        cwd: input.cwd,
++        prompt,
++        outputSchemaJson: outputSchema,
++        modelSelection: input.modelSelection,
++      });
++      return {
++        title: sanitizeThreadTitle(generated.title),
++      } satisfies TextGeneration.ThreadTitleGenerationResult;
++    });
++
++  return {
++    generateCommitMessage,
++    generatePrContent,
++    generateBranchName,
++    generateThreadTitle,
++  } satisfies TextGeneration.TextGeneration["Service"];
++});
+diff --git a/apps/server/src/textGeneration/TextGeneration.ts b/apps/server/src/textGeneration/TextGeneration.ts
+index 66b7ccd46..24af04dc6 100644
+--- a/apps/server/src/textGeneration/TextGeneration.ts
++++ b/apps/server/src/textGeneration/TextGeneration.ts
+@@ -8,7 +8,13 @@ import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstance
+ import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+ import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
+ 
+-export type TextGenerationProvider = "codex" | "claudeAgent" | "cursor" | "grok" | "opencode";
++export type TextGenerationProvider =
++  | "codex"
++  | "claudeAgent"
++  | "cursor"
++  | "grok"
++  | "pi"
++  | "opencode";
+ 
+ export interface CommitMessageGenerationInput {
+   cwd: string;
+diff --git a/apps/web/src/components/chat/providerIconUtils.ts b/apps/web/src/components/chat/providerIconUtils.ts
+index 842c616fe..7af540534 100644
+--- a/apps/web/src/components/chat/providerIconUtils.ts
++++ b/apps/web/src/components/chat/providerIconUtils.ts
+@@ -1,5 +1,5 @@
+ import { ProviderDriverKind } from "@t3tools/contracts";
+-import { ClaudeAI, CursorIcon, GrokIcon, Icon, OpenAI, OpenCodeIcon } from "../Icons";
++import { ClaudeAI, CursorIcon, GrokIcon, Icon, OpenAI, OpenCodeIcon, PiAgentIcon } from "../Icons";
+ import { PROVIDER_OPTIONS } from "../../session-logic";
+ 
+ export const PROVIDER_ICON_BY_PROVIDER: Partial<Record<ProviderDriverKind, Icon>> = {
+@@ -8,6 +8,7 @@ export const PROVIDER_ICON_BY_PROVIDER: Partial<Record<ProviderDriverKind, Icon>
+   [ProviderDriverKind.make("opencode")]: OpenCodeIcon,
+   [ProviderDriverKind.make("cursor")]: CursorIcon,
+   [ProviderDriverKind.make("grok")]: GrokIcon,
++  [ProviderDriverKind.make("pi")]: PiAgentIcon,
+ };
+ 
+ function isAvailableProviderOption(option: (typeof PROVIDER_OPTIONS)[number]): option is {
+diff --git a/apps/web/src/components/settings/AddProviderInstanceDialog.tsx b/apps/web/src/components/settings/AddProviderInstanceDialog.tsx
+index 260d895ff..25fda96b3 100644
+--- a/apps/web/src/components/settings/AddProviderInstanceDialog.tsx
++++ b/apps/web/src/components/settings/AddProviderInstanceDialog.tsx
+@@ -14,7 +14,7 @@ import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hook
+ import { cn } from "../../lib/utils";
+ import { normalizeProviderAccentColor } from "../../providerInstances";
+ import { Button } from "../ui/button";
+-import { Gemini, GithubCopilotIcon, PiAgentIcon, type Icon } from "../Icons";
++import { Gemini, GithubCopilotIcon, type Icon } from "../Icons";
+ import {
+   Dialog,
+   DialogDescription,
+@@ -88,11 +88,6 @@ const COMING_SOON_DRIVER_OPTIONS: readonly ComingSoonDriverOption[] = [
+     label: "Gemini",
+     icon: Gemini,
+   },
+-  {
+-    value: ProviderDriverKind.make("piAgent"),
+-    label: "Pi Agent",
+-    icon: PiAgentIcon,
+-  },
+ ];
+ 
+ /**
+diff --git a/apps/web/src/components/settings/ProviderModelsSection.tsx b/apps/web/src/components/settings/ProviderModelsSection.tsx
+index 9a42961d1..6fcbc5ebb 100644
+--- a/apps/web/src/components/settings/ProviderModelsSection.tsx
++++ b/apps/web/src/components/settings/ProviderModelsSection.tsx
+@@ -35,6 +35,7 @@ const CUSTOM_MODEL_PLACEHOLDER_BY_KIND: Partial<Record<ProviderDriverKind, strin
+   [ProviderDriverKind.make("claudeAgent")]: "claude-sonnet-5",
+   [ProviderDriverKind.make("cursor")]: "claude-sonnet-4-6",
+   [ProviderDriverKind.make("opencode")]: "openai/gpt-5",
++  [ProviderDriverKind.make("pi")]: "anthropic/claude-sonnet-5",
+ };
+ 
+ interface ProviderModelsSectionProps {
+diff --git a/apps/web/src/components/settings/providerDriverMeta.ts b/apps/web/src/components/settings/providerDriverMeta.ts
+index 45ae5a799..44a564fd7 100644
+--- a/apps/web/src/components/settings/providerDriverMeta.ts
++++ b/apps/web/src/components/settings/providerDriverMeta.ts
+@@ -5,6 +5,7 @@ import {
+   CursorSettings,
+   GrokSettings,
+   OpenCodeSettings,
++  PiSettings,
+   ProviderDriverKind,
+ } from "@t3tools/contracts";
+ import type * as Schema from "effect/Schema";
+@@ -16,6 +17,7 @@ import {
+   type Icon,
+   OpenAI,
+   OpenCodeIcon,
++  PiAgentIcon,
+ } from "../Icons";
+ 
+ type ProviderSettingsSchema = {
+@@ -96,6 +98,13 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] =
+     settingsSchema: AcpRegistrySettings,
+     hasDefaultInstance: false,
+   },
++  {
++    value: ProviderDriverKind.make("pi"),
++    label: "Pi",
++    icon: PiAgentIcon,
++    badgeLabel: "Early Access",
++    settingsSchema: PiSettings,
++  },
+   {
+     value: ProviderDriverKind.make("opencode"),
+     label: "OpenCode",
+diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
+index 8d60f6267..9ad131f0b 100644
+--- a/apps/web/src/lib/contextWindow.ts
++++ b/apps/web/src/lib/contextWindow.ts
+@@ -31,6 +31,8 @@ export function formatProviderDisplayName(provider: string | null | undefined):
+       return "Cursor";
+     case "opencode":
+       return "OpenCode";
++    case "pi":
++      return "Pi";
+     default: {
+       // Title-case unknown driver kinds so they read reasonably.
+       const trimmed = provider.replace(/Agent$/i, "").trim();
+diff --git a/apps/web/src/session-logic.ts b/apps/web/src/session-logic.ts
+index 6d874ab59..15cbbc42e 100644
+--- a/apps/web/src/session-logic.ts
++++ b/apps/web/src/session-logic.ts
+@@ -44,6 +44,12 @@ export const PROVIDER_OPTIONS: Array<{
+     pickerSidebarBadge: "new",
+   },
+   { value: ProviderDriverKind.make("grok"), label: "Grok", available: true },
++  {
++    value: ProviderDriverKind.make("pi"),
++    label: "Pi",
++    available: true,
++    pickerSidebarBadge: "new",
++  },
+ ];
+ 
+ export type WorkLogToolLifecycleStatus =
+diff --git a/docs/internals/providers.md b/docs/internals/providers.md
+index a309d70f0..a52a3e602 100644
+--- a/docs/internals/providers.md
++++ b/docs/internals/providers.md
+@@ -7,7 +7,7 @@ orchestration layer does not know which one is behind a thread.
+ 
+ ## Built-in drivers
+ 
+-[`builtInDrivers.ts`][drivers] exports `BUILT_IN_DRIVERS` with five entries:
++[`builtInDrivers.ts`][drivers] exports `BUILT_IN_DRIVERS` with these entries:
+ 
+ | Driver kind   | Driver source                           |
+ | ------------- | --------------------------------------- |
+@@ -16,6 +16,12 @@ orchestration layer does not know which one is behind a thread.
+ | `cursor`      | [`Drivers/CursorDriver.ts`][cursor]     |
+ | `grok`        | [`Drivers/GrokDriver.ts`][grok]         |
+ | `opencode`    | [`Drivers/OpenCodeDriver.ts`][opencode] |
++| `pi`          | [`Drivers/PiDriver.ts`][pi]             |
++
++The Pi driver speaks Pi's stdio JSONL RPC mode (`pi --mode rpc`) and deliberately spawns the user's
++own `pi` install with no `--no-*` flags, so extensions, skills, context files, custom models, and
++sessions behave exactly as they do in the Pi TUI. Extension UI dialogs surface as orchestration
++runtime requests.
+ 
+ Each driver declares its `driverKind`, a `configSchema`, and a `create` function that builds an
+ adapter in a child scope. Adapter implementations live beside them in
+@@ -81,6 +87,7 @@ when a request opens (approval) or user input is requested, via
+ [cursor]: ../../apps/server/src/provider/Drivers/CursorDriver.ts
+ [grok]: ../../apps/server/src/provider/Drivers/GrokDriver.ts
+ [opencode]: ../../apps/server/src/provider/Drivers/OpenCodeDriver.ts
++[pi]: ../../apps/server/src/provider/Drivers/PiDriver.ts
+ [adapter]: ../../apps/server/src/provider/Services/ProviderAdapter.ts
+ [instances]: ../../apps/server/src/provider/Services/ProviderInstanceRegistry.ts
+ [registry]: ../../apps/server/src/provider/Services/ProviderAdapterRegistry.ts
+diff --git a/packages/contracts/src/model.ts b/packages/contracts/src/model.ts
+index 1c8c16a06..635e75b0d 100644
+--- a/packages/contracts/src/model.ts
++++ b/packages/contracts/src/model.ts
+@@ -131,6 +131,7 @@ const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
+ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
+ const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
+ const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
++const PI_DRIVER_KIND = ProviderDriverKind.make("pi");
+ const ACP_REGISTRY_DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
+ const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
+ 
+@@ -154,6 +155,8 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
+   [CURSOR_DRIVER_KIND]: "auto",
+   [GROK_DRIVER_KIND]: "grok-build",
+   [ACP_REGISTRY_DRIVER_KIND]: "default",
++  // "default" defers to the user's own Pi settings.json model selection.
++  [PI_DRIVER_KIND]: "default",
+   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+ };
+ 
+@@ -224,5 +227,6 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
+   [CURSOR_DRIVER_KIND]: "Cursor",
+   [GROK_DRIVER_KIND]: "Grok",
+   [ACP_REGISTRY_DRIVER_KIND]: "ACP Registry",
++  [PI_DRIVER_KIND]: "Pi",
+   [OPENCODE_DRIVER_KIND]: "OpenCode",
+ };
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 2ae720410..81a22094d 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -445,6 +445,39 @@ export const GrokSettings = makeProviderSettingsSchema(
+ );
+ export type GrokSettings = typeof GrokSettings.Type;
+ 
++export const PiSettings = makeProviderSettingsSchema(
++  {
++    // Disabled by default while Pi support is Early Access.
++    enabled: Schema.Boolean.pipe(
++      Schema.withDecodingDefault(Effect.succeed(false)),
++      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
++    ),
++    binaryPath: makeBinaryPathSetting("pi").pipe(
++      Schema.annotateKey({
++        title: "Binary path",
++        description: "Path to the Pi coding agent binary.",
++        providerSettingsForm: { placeholder: "pi", clearWhenEmpty: "omit" },
++      }),
++    ),
++    launchArgs: TrimmedString.pipe(
++      Schema.withDecodingDefault(Effect.succeed("")),
++      Schema.annotateKey({
++        title: "Launch arguments",
++        description: "Additional CLI arguments passed to pi --mode rpc on session start.",
++        providerSettingsForm: { clearWhenEmpty: "omit" },
++      }),
++    ),
++    customModels: Schema.Array(Schema.String).pipe(
++      Schema.withDecodingDefault(Effect.succeed([])),
++      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
++    ),
++  },
++  {
++    order: ["binaryPath", "launchArgs"],
++  },
++);
++export type PiSettings = typeof PiSettings.Type;
++
+ export const AcpRegistryDistributionPreference = Schema.Literals(["auto", "binary", "npx", "uvx"]);
+ export type AcpRegistryDistributionPreference = typeof AcpRegistryDistributionPreference.Type;
+ 
+@@ -686,6 +719,7 @@ export const ServerSettings = Schema.Struct({
+     claudeAgent: ClaudeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
++    pi: PiSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
+@@ -780,6 +814,13 @@ const GrokSettingsPatch = Schema.Struct({
+   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+ });
+ 
++const PiSettingsPatch = Schema.Struct({
++  enabled: Schema.optionalKey(Schema.Boolean),
++  binaryPath: Schema.optionalKey(TrimmedString),
++  launchArgs: Schema.optionalKey(TrimmedString),
++  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
++});
++
+ const OpenCodeSettingsPatch = Schema.Struct({
+   enabled: Schema.optionalKey(Schema.Boolean),
+   binaryPath: Schema.optionalKey(TrimmedString),
+@@ -828,6 +869,7 @@ export const ServerSettingsPatch = Schema.Struct({
+       claudeAgent: Schema.optionalKey(ClaudeSettingsPatch),
+       cursor: Schema.optionalKey(CursorSettingsPatch),
+       grok: Schema.optionalKey(GrokSettingsPatch),
++      pi: Schema.optionalKey(PiSettingsPatch),
+       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
+     }),
+   ),
+-- 
+2.50.1 (Apple Git-155)
+

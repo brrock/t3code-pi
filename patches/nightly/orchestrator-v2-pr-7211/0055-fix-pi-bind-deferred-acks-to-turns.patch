@@ -1,0 +1,193 @@
+From 7441f732709f8f4d7f83f11c57d94205807a094a Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 12:02:36 +0200
+Subject: [PATCH] fix(pi): bind deferred acks to turns
+
+---
+ .../Adapters/PiAdapterV2.test.ts              | 36 ++++++++++++---
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 44 +++++++++++++------
+ 2 files changed, 60 insertions(+), 20 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 5157110c3..72e022d76 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -313,19 +313,20 @@ const startTurn = Effect.fnUntraced(function* (
+   model = "default",
+   attachments: ReadonlyArray<ChatAttachment> = [],
+   text = "Hello pi",
++  ordinal = 1,
+ ) {
+   const appThread = yield* makeAppThread(model);
+   yield* runtime.startTurn({
+     appThread,
+     threadId: THREAD_ID,
+-    runId: RunId.make("run:thread-pi-test:1"),
+-    runOrdinal: 1,
+-    providerTurnOrdinal: 1,
+-    attemptId: RunAttemptId.make("run-attempt:run:thread-pi-test:1:1"),
+-    rootNodeId: NodeId.make("node:run:thread-pi-test:1:root"),
++    runId: RunId.make(`run:thread-pi-test:${ordinal}`),
++    runOrdinal: ordinal,
++    providerTurnOrdinal: ordinal,
++    attemptId: RunAttemptId.make(`run-attempt:run:thread-pi-test:${ordinal}:1`),
++    rootNodeId: NodeId.make(`node:run:thread-pi-test:${ordinal}:root`),
+     providerThread,
+     message: {
+-      messageId: "message:thread-pi-test:1" as never,
++      messageId: `message:thread-pi-test:${ordinal}` as never,
+       text,
+       attachments,
+       createdBy: "user",
+@@ -885,6 +886,8 @@ describe("PiAdapterV2", () => {
+       );
+       const providerTurnId =
+         running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
++      yield* fake.emit({ type: "response", command: "prompt", success: true });
++      yield* fake.emit({ type: "agent_start" });
+ 
+       yield* runtime.steerTurn({
+         threadId: THREAD_ID,
+@@ -917,6 +920,27 @@ describe("PiAdapterV2", () => {
+       });
+       const command = yield* fake.takeRequest("prompt");
+       assert.equal(command["message"], "/my-command");
++
++      yield* fake.emit({ type: "agent_settled" });
++      const firstTerminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(firstTerminal.type === "turn.terminal" && firstTerminal.status === "completed");
++
++      yield* startTurn(runtime, providerThread, "default", [], "Second turn", 2);
++      yield* fake.takeRequest("prompt");
++      // The slash command's response belongs to the settled first turn. It
++      // must not consume or fail the second turn's prompt acknowledgement.
++      yield* fake.emit({
++        type: "response",
++        command: "prompt",
++        success: false,
++        error: "late command rejection",
++      });
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({ type: "agent_settled" });
++      const secondTerminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(
++        secondTerminal.type === "turn.terminal" && secondTerminal.status === "completed",
++      );
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ });
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index 7efbe9120..44743173e 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -298,8 +298,6 @@ interface ActivePiTurn {
+   sawAgentActivity: boolean;
+   /** Only slash-command prompts can complete without starting an agent run. */
+   readonly promptMayBeCommandOnly: boolean;
+-  /** Pi's id-less prompt responses are ordered, so retain why each prompt was sent. */
+-  readonly pendingPromptResponses: Array<"turn_start" | "steer">;
+   /** Pi reports context as unknown immediately after compaction; keep its estimate for the meter. */
+   latestCompactionAfterTokens: number | null;
+   failure: ReturnType<typeof makeProviderFailure> | null;
+@@ -448,6 +446,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       let baselineModel: { provider: string; modelId: string } | null = null;
+       let baselineThinking: string | null = null;
+       let autoCompactionEnabled: boolean | undefined;
++      // Prompt responses carry no id. Keep their session-wide send order and
++      // owner so a late ack from a settled turn cannot affect the next turn.
++      const pendingPromptResponses: Array<{
++        readonly providerTurnId: OrchestrationV2ProviderTurn["id"];
++        readonly kind: "turn_start" | "steer";
++      }> = [];
+       // Invalidates optional post-turn stats reads when rollback changes the
+       // active branch before an older read completes.
+       let contextUsageGeneration = 0;
+@@ -1430,8 +1434,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             // Correlated responses never reach the pump; an id-less response
+             // is the deferred ack of a fire-and-forget prompt/steer.
+             const command = recordString(event, "command");
+-            const promptKind =
+-              command === "prompt" ? turn?.pendingPromptResponses.shift() : undefined;
++            const pendingPrompt = command === "prompt" ? pendingPromptResponses.shift() : undefined;
++            const responseTurn =
++              pendingPrompt?.providerTurnId === turn?.providerTurn.id ? turn : null;
+             if (event["success"] === true) {
+               // Deferred success ack. Command-only prompts (pure extension
+               // slash commands) never start an agent run and never emit
+@@ -1439,12 +1444,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               // re-queued behind any events Pi emitted before answering
+               // get_state, which keeps the check stream-ordered.
+               if (
+-                promptKind === "turn_start" &&
+-                turn !== null &&
+-                turn.promptMayBeCommandOnly &&
+-                !turn.sawAgentActivity
++                pendingPrompt?.kind === "turn_start" &&
++                responseTurn !== null &&
++                responseTurn.promptMayBeCommandOnly &&
++                !responseTurn.sawAgentActivity
+               ) {
+-                const providerTurnId = turn.providerTurn.id;
++                const providerTurnId = responseTurn.providerTurn.id;
+                 yield* request({ type: "get_state" }).pipe(
+                   Effect.matchEffect({
+                     onSuccess: (data) =>
+@@ -1470,7 +1475,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               return;
+             }
+             if (event["success"] !== false) return;
+-            if (command === "steer" || promptKind === "steer") {
++            if (command === "steer" || pendingPrompt?.kind === "steer") {
+               // A rejected steer only means that one message was refused. The
+               // turn it was aimed at is still running on Pi, so terminalizing
+               // here would report a failure while output keeps streaming.
+@@ -1479,8 +1484,14 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               });
+               return;
+             }
+-            if (turn !== null && (command === "prompt" || command === "parse")) {
+-              turn.failure = makeProviderFailure({
++            const failedTurn =
++              command === "prompt" && pendingPrompt?.kind === "turn_start"
++                ? responseTurn
++                : command === "parse"
++                  ? turn
++                  : null;
++            if (failedTurn !== null) {
++              failedTurn.failure = makeProviderFailure({
+                 message: recordString(event, "error") ?? "Pi rejected the prompt.",
+                 class: "provider_error",
+               });
+@@ -1885,7 +1896,6 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               interrupted: false,
+               sawAgentActivity: false,
+               promptMayBeCommandOnly: payload.message.trimStart().startsWith("/"),
+-              pendingPromptResponses: ["turn_start"],
+               latestCompactionAfterTokens: null,
+               failure: null,
+             };
+@@ -1900,6 +1910,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+                 message: payload.message,
+                 ...(payload.images.length === 0 ? {} : { images: payload.images }),
+               });
++              pendingPromptResponses.push({ providerTurnId: providerTurn.id, kind: "turn_start" });
+               yield* emit({
+                 type: "provider_turn.updated",
+                 driver: PI_PROVIDER,
+@@ -1964,7 +1975,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+                   message: payload.message,
+                   ...(payload.images.length === 0 ? {} : { images: payload.images }),
+                 });
+-                if (type === "prompt") turn.pendingPromptResponses.push("steer");
++                if (type === "prompt") {
++                  pendingPromptResponses.push({
++                    providerTurnId: turn.providerTurn.id,
++                    kind: "steer",
++                  });
++                }
+               }),
+             );
+           }).pipe(
+-- 
+2.50.1 (Apple Git-155)
+

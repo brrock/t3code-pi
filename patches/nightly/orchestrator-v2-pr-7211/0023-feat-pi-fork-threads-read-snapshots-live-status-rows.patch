@@ -1,0 +1,876 @@
+From 3d867cff5fd76e5e352b024015a209fd2fbb9480 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 07:53:49 +0200
+Subject: [PATCH] feat(pi): fork threads, read snapshots, live status rows and
+ safer stops
+
+Closes the remaining coverage gaps against pi's RPC surface:
+
+- forkThread clones pi's session tree and switches the live process back
+  to the source, so T3-side thread forks map to native clones.
+- readThreadSnapshot reconstructs the conversation from get_entries,
+  giving handoff and preview surfaces a real transcript.
+- setStatus/setWidget extension calls project as keyed live work-log
+  rows that update in place and close on settle.
+- Session-start extension dialogs (e.g. project trust) are buffered and
+  attached to the next turn instead of being cancelled unseen.
+- Stop-with-restart aborts the turn and terminates the pi process, and
+  transport death during an interrupt reads as interrupted, not failed.
+- A recovered auto-compaction clears the stashed model error so the
+  turn completes instead of reporting the pre-compaction failure.
+- Opening a subagent's child thread while its task is still running is
+  refused with a clear message instead of corrupting the child session.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Adapters/PiAdapterV2.test.ts              | 265 +++++++++++++-
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 328 ++++++++++++++++--
+ .../src/orchestration-v2/Adapters/PiRpc.ts    |  11 +
+ 3 files changed, 579 insertions(+), 25 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index cca7daa0f..32fa1fd33 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -77,6 +77,8 @@ interface FakePi {
+   readonly queueEntries: (data: unknown) => void;
+   /** Make the next `switch_session` ack report an extension veto. */
+   readonly vetoNextSwitch: () => void;
++  /** Data returned by the next `get_state` acks, consumed in order. */
++  readonly queueState: (data: unknown) => void;
+   readonly lastSpawn: () => {
+     readonly args: ReadonlyArray<string>;
+     readonly env: NodeJS.ProcessEnv;
+@@ -91,6 +93,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   const stdout = yield* Queue.unbounded<Uint8Array>();
+   const requests = yield* Queue.unbounded<PiRpcRecord>();
+   const entriesQueue: Array<unknown> = [];
++  const stateQueue: Array<unknown> = [];
+   let vetoSwitch = false;
+   let stdinBuffer = "";
+ 
+@@ -111,7 +114,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+       case "get_state":
+         return {
+           ...base,
+-          data: {
++          data: stateQueue.shift() ?? {
+             model: null,
+             thinkingLevel: "medium",
+             isStreaming: false,
+@@ -194,6 +197,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+     vetoNextSwitch: () => {
+       vetoSwitch = true;
+     },
++    queueState: (data) => stateQueue.push(data),
+     lastSpawn: () => lastSpawn,
+   } satisfies FakePi;
+ });
+@@ -1015,6 +1019,265 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
++  it.effect("clears a stashed model error when compaction recovers the turn", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      // Overflow surfaces as a model error, then pi compacts and retries.
++      yield* fake.emit({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          content: [],
++          stopReason: "error",
++          errorMessage: "400 too long",
++        },
++      });
++      yield* fake.emit({
++        type: "compaction_end",
++        reason: "overflow",
++        result: { summary: "compacted", tokensBefore: 520000, estimatedTokensAfter: 3400 },
++        aborted: false,
++        willRetry: true,
++      });
++      yield* fake.emit({
++        type: "message_end",
++        message: {
++          role: "assistant",
++          content: [{ type: "text", text: "done" }],
++          stopReason: "stop",
++        },
++      });
++      yield* fake.emit({ type: "agent_settled" });
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("stops with restart by aborting and then terminating the process", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      const running = yield* takeEvent(
++        (event) =>
++          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
++      );
++      const providerTurnId =
++        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
++      yield* runtime.interruptTurn({
++        providerThread,
++        providerTurnId: providerTurnId!,
++        requestRuntimeRestart: true,
++      });
++      yield* fake.takeRequest("abort");
++      // The fake process cannot die; pi settling still closes the turn as
++      // interrupted rather than failed.
++      yield* fake.emit({ type: "agent_settled" });
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "interrupted");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.live("defers session-start dialogs to the next turn instead of cancelling", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      // Project-trust style prompt before any turn exists.
++      yield* fake.emit({
++        type: "extension_ui_request",
++        id: "ui-trust",
++        method: "confirm",
++        title: "Run project extensions?",
++        message: "This project has .pi/extensions.",
++      });
++      // Give the pump real time to buffer the dialog before the turn opens.
++      yield* Effect.sleep("60 millis");
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      const pending = yield* takeEvent(
++        (event) =>
++          event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending",
++      );
++      const requestId =
++        pending.type === "runtime_request.updated" ? pending.runtimeRequest.id : undefined;
++      yield* runtime.respondToRuntimeRequest({ requestId: requestId!, decision: "accept" });
++      const uiResponse = yield* fake.takeRequest("extension_ui_response");
++      assert.equal(uiResponse["id"], "ui-trust");
++      assert.equal(uiResponse["confirmed"], true);
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("projects setStatus as a keyed live row and closes it on settle", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      yield* fake.emit({
++        type: "extension_ui_request",
++        id: "ui-s1",
++        method: "setStatus",
++        statusKey: "tps",
++        statusText: "42 tok/s",
++      });
++      const row = yield* takeEvent(
++        (event) =>
++          event.type === "turn_item.updated" &&
++          event.turnItem.type === "dynamic_tool" &&
++          event.turnItem.toolName === "status",
++      );
++      assert.isTrue(
++        row.type === "turn_item.updated" &&
++          row.turnItem.type === "dynamic_tool" &&
++          row.turnItem.status === "running" &&
++          (row.turnItem.input as { status?: string }).status === "42 tok/s",
++      );
++      yield* fake.emit({ type: "agent_settled" });
++      const closed = yield* takeEvent(
++        (event) =>
++          event.type === "turn_item.updated" &&
++          event.turnItem.type === "dynamic_tool" &&
++          event.turnItem.toolName === "status" &&
++          event.turnItem.status === "completed",
++      );
++      assert.equal(closed.type, "turn_item.updated");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("refuses to open a subagent child session while its task is running", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "agent_start" });
++      const childFile = "/fake/.pi/agent/sessions/children/child-1.jsonl";
++      yield* fake.emit({
++        type: "tool_execution_update",
++        toolCallId: "call_child",
++        toolName: "subagent",
++        partialResult: {
++          content: [{ type: "text", text: "(running...)" }],
++          details: {
++            mode: "single",
++            results: [
++              {
++                agent: "worker",
++                task: "long task",
++                exitCode: 0,
++                stderr: "",
++                messages: [],
++                sessionFile: childFile,
++              },
++            ],
++          },
++        },
++      });
++      yield* takeEvent(
++        (event) => event.type === "subagent.updated" && event.subagent.status === "running",
++      );
++      const childThread: OrchestrationV2ProviderThread = {
++        ...providerThread,
++        nativeThreadRef: { driver: PI_PROVIDER, nativeId: childFile, strength: "strong" },
++      };
++      const error = yield* runtime.resumeThread({ providerThread: childThread }).pipe(Effect.flip);
++      assert.equal(error._tag, "ProviderAdapterResumeThreadError");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("forks a thread by cloning pi's session and switching back", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      const cloneFile = "/fake/.pi/agent/sessions/--workspace--/0002_clone.jsonl";
++      fake.queueState({ sessionFile: cloneFile, sessionId: "clone" });
++      const forked = yield* runtime.forkThread({
++        sourceProviderThread: providerThread,
++        targetThreadId: ThreadId.make("thread-pi-fork-target"),
++      });
++      assert.equal(forked.nativeThreadRef?.nativeId, cloneFile);
++      assert.isNull(forked.providerSessionId);
++      yield* fake.takeRequest("clone");
++      const switchBack = yield* fake.takeRequest("switch_session");
++      assert.equal(switchBack["sessionPath"], FAKE_SESSION_FILE);
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
++  it.effect("reads a thread snapshot from pi's session entries", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      fake.queueEntries({
++        entries: [
++          {
++            type: "message",
++            id: "e1",
++            message: { role: "user", content: "hello pi", timestamp: 1700000000000 },
++          },
++          {
++            type: "message",
++            id: "e2",
++            message: {
++              role: "assistant",
++              content: [{ type: "text", text: "hello back" }],
++              timestamp: 1700000001000,
++            },
++          },
++          { type: "message", id: "e3", message: { role: "toolResult", content: [] } },
++        ],
++        leafId: "e2",
++      });
++      const snapshot = yield* runtime.readThreadSnapshot({ providerThread });
++      assert.equal(snapshot.messages.length, 2);
++      assert.equal(snapshot.messages[0]!.role, "user");
++      assert.equal(snapshot.messages[0]!.text, "hello pi");
++      assert.equal(snapshot.messages[1]!.role, "assistant");
++      assert.equal(snapshot.messages[1]!.text, "hello back");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("cancels unanswered extension dialogs when the turn settles", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index 4227a0eb0..ee8f4ee9e 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -44,6 +44,7 @@ import {
+   type ProviderInstanceId,
+ } from "@t3tools/contracts";
+ import * as DateTime from "effect/DateTime";
++import * as Option from "effect/Option";
+ import * as Duration from "effect/Duration";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+@@ -104,6 +105,7 @@ import {
+ } from "./PiRpc.ts";
+ import {
+   buildPiRpcLaunch,
++  discoverPiUserExtensions,
+   materializePiT3McpExtension,
+   materializePiT3SubagentExtension,
+ } from "./piT3McpInjection.ts";
+@@ -134,9 +136,11 @@ export const PiProviderCapabilitiesV2 = {
+   },
+   threads: {
+     canCreateEmptyThread: true,
+-    canReadThreadSnapshot: false,
++    canReadThreadSnapshot: true,
+     canRollbackThread: true,
+-    canForkThread: false,
++    // Forks clone pi's active branch into a new session file. Fork-from-a-
++    // specific-turn stays off until clone-then-rewind lands.
++    canForkThread: true,
+     canForkFromTurn: false,
+     canForkFromSubagentThread: false,
+     exposesNativeThreadId: true,
+@@ -212,7 +216,7 @@ export const PiProviderCapabilitiesV2 = {
+     // CommandPolicy.ensureRollback requires the snapshot whenever provider
+     // rollback is enabled; rollbackThread returns the updated provider thread.
+     providerRollbackReturnsSnapshot: true,
+-    providerCanReadConversationSnapshot: false,
++    providerCanReadConversationSnapshot: true,
+   },
+   identity: {
+     nativeThreadIds: "strong",
+@@ -306,6 +310,12 @@ interface ActivePiTurn {
+    * the turn instead.
+    */
+   sawAgentActivity: boolean;
++  /**
++   * Open keyed status/widget items from extension `setStatus`/`setWidget`
++   * calls, by native item id. Updated in place as the extension re-keys
++   * them; whatever is still open is completed when the turn settles.
++   */
++  readonly liveStatus: Map<string, { title: string; input: unknown }>;
+   failure: ReturnType<typeof makeProviderFailure> | null;
+ }
+ 
+@@ -337,6 +347,13 @@ interface PiThreadState {
+ 
+ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2Shape {
+   const { idAllocator } = options;
++  /**
++   * Session files of subagent children whose task is still running, shared
++   * across this instance's sessions. A send into such a child would open a
++   * second pi process on a session file the child process is actively
++   * writing; refuse it with a readable error until the task finishes.
++   */
++  const liveChildSessions = new Set<string>();
+ 
+   const protocolError = (detail: string, payload?: unknown) =>
+     new ProviderAdapterProtocolError({
+@@ -377,12 +394,16 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       const subagentExtensionPath = yield* provideCacheFs(
+         materializePiT3SubagentExtension(options.serverConfig.providerStatusCacheDir),
+       );
++      const discoveredExtensionPaths = yield* provideCacheFs(
++        discoverPiUserExtensions({ environment: options.environment, cwd }),
++      );
+       const launch = buildPiRpcLaunch({
+         launchArgs: options.settings.launchArgs,
+         environment: options.environment,
+         mcpSession,
+         extensionPath,
+         subagentExtensionPath,
++        discoveredExtensionPaths,
+       });
+       const hasT3Mcp = launch.hasT3Mcp;
+       const connection: PiRpcConnection = yield* makePiRpcConnection({
+@@ -427,6 +448,15 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       let appliedThinking: string | null = null;
+       /** Last thread title synced into pi's session name (`/resume` listing). */
+       let appliedSessionName: string | null = null;
++      /**
++       * Extension dialogs raised while no turn was active (project trust and
++       * login prompts at session start). Cancelling them would mean
++       * trust-gated extensions silently never load, so they are buffered and
++       * attached to the next turn. Flushing happens only inside the event
++       * pump, triggered by an order-preserving `t3.flush_dialogs` record, so
++       * dialog bookkeeping stays single-threaded. Cancelled on session close.
++       */
++      const outOfTurnDialogs: Array<PiRpcRecord> = [];
+       /**
+        * Leaf entry id of the pi session tree as of the last turn boundary.
+        * Turn-start user entries are located relative to it, giving each
+@@ -808,6 +838,10 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           const outputText = piSubagentOutput(result);
+           const title = agent;
+           const sessionFile = recordString(result, "sessionFile");
++          if (sessionFile !== undefined) {
++            if (finished) liveChildSessions.delete(sessionFile);
++            else liveChildSessions.add(sessionFile);
++          }
+           let child = turn.childSubagents.get(nativeTaskId);
+           if (sessionFile !== undefined && child === undefined) {
+             const childThreadId = idAllocator.derive.threadFromProviderThread({
+@@ -1060,6 +1094,40 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         }
+       });
+ 
++      /** One keyed status/widget row, updated in place while running. */
++      const emitLiveStatusItem = Effect.fnUntraced(function* (
++        turn: ActivePiTurn,
++        nativeItemId: string,
++        title: string,
++        input: unknown,
++        done: boolean,
++      ) {
++        const emittedAt = yield* DateTime.now;
++        const startedAt = turn.toolStartedAt.get(nativeItemId) ?? emittedAt;
++        turn.toolStartedAt.set(nativeItemId, startedAt);
++        yield* emitItemNode(
++          turn,
++          nativeItemId,
++          "system",
++          done ? "completed" : "running",
++          startedAt,
++          done ? emittedAt : null,
++        );
++        yield* emit({
++          type: "turn_item.updated",
++          driver: PI_PROVIDER,
++          turnItem: {
++            ...baseItemFields(turn, nativeItemId, startedAt, emittedAt),
++            status: done ? "completed" : "running",
++            title,
++            completedAt: done ? emittedAt : null,
++            type: "dynamic_tool",
++            toolName: nativeItemId.startsWith("status:") ? "status" : "widget",
++            input,
++          },
++        });
++      });
++
+       // ── extension UI prompts ──────────────────────────────
+ 
+       const cancelPrompt = (pending: PendingPiPrompt, resolvedAt: DateTime.Utc) =>
+@@ -1138,14 +1206,47 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+           });
+           return;
+         }
++        if (method === "setStatus" || method === "setWidget") {
++          // Keyed live progress from extensions (e.g. a tps tracker). Each
++          // key becomes one work-log item updated in place: running while
++          // the extension keeps it set, completed when cleared or on settle.
++          const state = threadState;
++          const turn = state?.activeTurn ?? null;
++          if (turn === null) return;
++          const key =
++            method === "setStatus"
++              ? recordString(event, "statusKey")
++              : recordString(event, "widgetKey");
++          if (key === undefined) return;
++          const nativeItemId = `${method === "setStatus" ? "status" : "widget"}:${key}`;
++          const statusText = recordString(event, "statusText");
++          const widgetLines = Array.isArray(event["widgetLines"])
++            ? event["widgetLines"].filter((line): line is string => typeof line === "string")
++            : undefined;
++          const cleared =
++            method === "setStatus" ? statusText === undefined : widgetLines === undefined;
++          const payload =
++            method === "setStatus"
++              ? { title: key, input: { status: statusText ?? "" } }
++              : { title: key, input: { lines: widgetLines ?? [] } };
++          if (cleared) {
++            const open = turn.liveStatus.get(nativeItemId);
++            if (open === undefined) return;
++            turn.liveStatus.delete(nativeItemId);
++            yield* emitLiveStatusItem(turn, nativeItemId, open.title, open.input, true);
++            return;
++          }
++          turn.liveStatus.set(nativeItemId, payload);
++          yield* emitLiveStatusItem(turn, nativeItemId, payload.title, payload.input, false);
++          return;
++        }
+         if (
+           method !== "select" &&
+           method !== "confirm" &&
+           method !== "input" &&
+           method !== "editor"
+         ) {
+-          // setStatus / setWidget / setTitle / set_editor_text: no Pi panel
+-          // yet, so these fire-and-forget surfaces are dropped.
++          // setTitle / set_editor_text have no matching T3 surface yet.
+           yield* Effect.logDebug("Ignoring pi extension UI update.", { method });
+           return;
+         }
+@@ -1153,10 +1254,8 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         const state = threadState;
+         const turn = state?.activeTurn ?? null;
+         if (state === null || turn === null) {
+-          // No turn to attach UI to; cancel so the extension is not stuck.
+-          yield* connection
+-            .send({ type: "extension_ui_response", id: nativeRequestId, cancelled: true })
+-            .pipe(Effect.ignore);
++          outOfTurnDialogs.push(event);
++          yield* Effect.logDebug("Buffered out-of-turn pi extension dialog.", { method });
+           return;
+         }
+         const createdAt = yield* DateTime.now;
+@@ -1298,6 +1397,14 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         const completedAt = yield* DateTime.now;
+         yield* completeOpenStreamItems(turn);
+         yield* cancelPendingPrompts(completedAt);
++        // Close any status/widget rows the extension left open.
++        yield* Effect.forEach(
++          Array.from(turn.liveStatus.entries()),
++          ([nativeItemId, open]) =>
++            emitLiveStatusItem(turn, nativeItemId, open.title, open.input, true),
++          { discard: true },
++        );
++        turn.liveStatus.clear();
+         const treeRefs = yield* captureTurnTreeRefs();
+         const failure = turn.interrupted ? null : turn.failure;
+         yield* emit({
+@@ -1457,6 +1564,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               });
+               return;
+             }
++            // An overflow can surface as a model error (`message_end` with
++            // stopReason error) before pi compacts and retries the turn. A
++            // successful compaction means the turn is recovering, so the
++            // stashed failure must not terminalize it, mirroring how
++            // auto_retry_end success already clears it.
++            turn.failure = null;
+             const nativeItemId = `compaction:${turn.nextItemOrdinal}`;
+             yield* emit({
+               type: "turn_item.updated",
+@@ -1570,6 +1683,16 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             }
+             return;
+           }
++          case "t3.flush_dialogs": {
++            // Synthetic record queued by startTurn: attach buffered
++            // session-start dialogs to the now-active turn, in order, from
++            // inside the pump so bookkeeping stays single-threaded. The
++            // handler re-buffers any dialog whose turn vanished mid-drain.
++            for (const dialog of outOfTurnDialogs.splice(0)) {
++              yield* handleExtensionUiRequest(dialog);
++            }
++            return;
++          }
+           case "t3.settle_probe": {
+             // Synthetic idle probe queued after a command-only prompt ack.
+             // Any agent activity Pi emitted before answering get_state has
+@@ -1606,16 +1729,24 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         Effect.catchCause((cause) =>
+           Effect.gen(function* () {
+             // Transport death: fail any live turn, then surface the error.
++            // A death caused by Stop-with-restart is an interrupt, not a
++            // failure; finalizeTurn already prefers `interrupted`.
+             const state = threadState;
++            const interrupted = state?.activeTurn?.interrupted === true;
+             if (state?.activeTurn != null) {
+-              state.activeTurn.failure = makeProviderFailure({
+-                cause,
+-                message: "Pi process exited unexpectedly.",
+-                class: "transport_error",
+-              });
++              state.activeTurn.failure = interrupted
++                ? null
++                : makeProviderFailure({
++                    cause,
++                    message: "Pi process exited unexpectedly.",
++                    class: "transport_error",
++                  });
+               yield* finalizeTurn(state);
+             }
+-            yield* updateProviderSession("error", "Pi process exited unexpectedly.");
++            yield* updateProviderSession(
++              "error",
++              interrupted ? "Pi process was stopped." : "Pi process exited unexpectedly.",
++            );
+             yield* Queue.fail(
+               events,
+               new ProviderAdapterEventStreamError({
+@@ -1636,6 +1767,11 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+       ) {
+         const existing = threadInput.existingProviderThread;
+         if (existing?.nativeThreadRef?.nativeId != null) {
++          if (liveChildSessions.has(existing.nativeThreadRef.nativeId)) {
++            return yield* protocolError(
++              "This subagent is still running. Wait for it to finish before sending messages to its thread.",
++            );
++          }
+           const switchData = yield* request({
+             type: "switch_session",
+             sessionPath: existing.nativeThreadRef.nativeId,
+@@ -1810,6 +1946,23 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+         return { message, images };
+       });
+ 
++      // Buffered dialogs must not strand their extensions when the session
++      // closes before another turn ever starts.
++      yield* Effect.addFinalizer(() =>
++        Effect.forEach(
++          outOfTurnDialogs,
++          (dialog) => {
++            const dialogId = recordString(dialog, "id");
++            return dialogId === undefined
++              ? Effect.void
++              : connection
++                  .send({ type: "extension_ui_response", id: dialogId, cancelled: true })
++                  .pipe(Effect.ignore);
++          },
++          { discard: true },
++        ).pipe(Effect.ignore),
++      );
++
+       const runtime: ProviderAdapterV2SessionRuntime = {
+         instanceId: options.instanceId,
+         driver: PI_PROVIDER,
+@@ -1911,6 +2064,7 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               childSubagents: new Map(),
+               interrupted: false,
+               sawAgentActivity: false,
++              liveStatus: new Map(),
+               failure: null,
+             };
+             yield* emit({
+@@ -1925,6 +2079,12 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               lastRunOrdinal: turnInput.runOrdinal,
+             });
+             yield* updateProviderSession("running", null);
++            // Attach any dialogs that arrived before this turn existed
++            // (project trust, session-start login prompts). The flush runs
++            // inside the event pump, behind everything pi already emitted.
++            if (outOfTurnDialogs.length > 0) {
++              yield* Queue.offer(connection.events, { type: "t3.flush_dialogs" });
++            }
+             // Fire-and-forget: pi acks `prompt` only after slash-command
+             // expansion completes, and extension commands may block on user
+             // dialogs indefinitely, so turn start must never await the ack.
+@@ -2007,6 +2167,16 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               return yield* protocolError(`Pi turn ${interruptInput.providerTurnId} is not active`);
+             }
+             turn.interrupted = true;
++            if (interruptInput.requestRuntimeRestart === true) {
++              // User Stop with restart: the process may be wedged, so give
++              // abort one short chance and then kill the process group. The
++              // transport failure finalizes the turn as interrupted and the
++              // session manager respawns a fresh process on the next turn,
++              // resuming the same session file.
++              yield* request({ type: "abort" }, 2_000).pipe(Effect.ignore);
++              yield* connection.terminate;
++              return;
++            }
+             yield* request({ type: "abort" }).pipe(
+               Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
+             );
+@@ -2077,11 +2247,66 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             ),
+           ),
+         readThreadSnapshot: (snapshotInput) =>
+-          Effect.fail(
+-            new ProviderAdapterReadThreadSnapshotError({
+-              driver: PI_PROVIDER,
+-              providerThreadId: snapshotInput.providerThread.id,
+-            }),
++          Effect.gen(function* () {
++            const state = threadState;
++            const boundNativeId = state?.providerThread.nativeThreadRef?.nativeId;
++            const wantedNativeId = snapshotInput.providerThread.nativeThreadRef?.nativeId;
++            if (state === null || wantedNativeId == null || boundNativeId !== wantedNativeId) {
++              return yield* protocolError(
++                "Pi snapshot requested for a thread this session does not host",
++              );
++            }
++            const entriesData = yield* request({ type: "get_entries" });
++            const entries = recordField(entriesData, "entries");
++            const threadId = state.providerThread.appThreadId ?? input.threadId;
++            const messages = (Array.isArray(entries) ? entries : []).flatMap((entry) => {
++              if (recordField(entry, "type") !== "message") return [];
++              const entryId = recordString(entry, "id");
++              const message = recordField(entry, "message");
++              const role = recordString(message, "role");
++              if (entryId === undefined || (role !== "user" && role !== "assistant")) return [];
++              const text = contentText(recordField(message, "content"));
++              if (text.length === 0) return [];
++              const timestamp = recordNumber(message, "timestamp");
++              const at = Option.getOrElse(
++                DateTime.make(timestamp ?? Number.NaN),
++                () => state.providerThread.createdAt,
++              );
++              return [
++                {
++                  id: idAllocator.derive.messageFromProviderItem({
++                    driver: PI_PROVIDER,
++                    nativeItemId: entryId,
++                  }),
++                  threadId,
++                  runId: null,
++                  nodeId: null,
++                  role: role as "user" | "assistant",
++                  text,
++                  attachments: [],
++                  streaming: false,
++                  createdBy: role === "user" ? ("user" as const) : ("agent" as const),
++                  creationSource: "provider" as const,
++                  createdAt: at,
++                  updatedAt: at,
++                },
++              ];
++            });
++            return {
++              providerThread: state.providerThread,
++              providerTurns: [],
++              messages,
++              runtimeRequests: [],
++            };
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterReadThreadSnapshotError({
++                  driver: PI_PROVIDER,
++                  providerThreadId: snapshotInput.providerThread.id,
++                  cause,
++                }),
++            ),
+           ),
+         rollbackThread: (rollbackInput) =>
+           Effect.gen(function* () {
+@@ -2131,11 +2356,66 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             ),
+           ),
+         forkThread: (forkInput) =>
+-          Effect.fail(
+-            new ProviderAdapterForkThreadError({
++          Effect.gen(function* () {
++            const state = threadState;
++            if (state === null || state.activeTurn !== null) {
++              return yield* protocolError(
++                "Pi can only fork an idle thread; wait for the current run to finish.",
++              );
++            }
++            if (forkInput.providerTurnId !== undefined) {
++              return yield* protocolError("Pi cannot fork from a specific earlier turn yet");
++            }
++            const sourceNativeId = forkInput.sourceProviderThread.nativeThreadRef?.nativeId;
++            if (sourceNativeId == null) {
++              return yield* protocolError("Pi fork source has no native session file");
++            }
++            // `clone` duplicates the active branch into a new session file
++            // and moves this process onto it; capture the clone's identity,
++            // then switch back so this runtime keeps serving the source.
++            const cloneData = yield* request({ type: "clone" });
++            if (recordField(cloneData, "cancelled") === true) {
++              return yield* protocolError("A Pi extension cancelled the session clone");
++            }
++            const cloneState = yield* request({ type: "get_state" });
++            const cloneNativeId =
++              recordString(cloneState, "sessionFile") ?? recordString(cloneState, "sessionId");
++            if (cloneNativeId === undefined || cloneNativeId === sourceNativeId) {
++              return yield* protocolError("Pi clone did not produce a new session", cloneState);
++            }
++            yield* request({ type: "switch_session", sessionPath: sourceNativeId });
++            const createdAt = yield* DateTime.now;
++            return {
++              id: idAllocator.derive.providerThread({
++                driver: PI_PROVIDER,
++                nativeThreadId: cloneNativeId,
++              }),
+               driver: PI_PROVIDER,
+-              providerThreadId: forkInput.sourceProviderThread.id,
+-            }),
++              providerInstanceId: options.instanceId,
++              // Null so the fork's first send opens its own pi process.
++              providerSessionId: null,
++              appThreadId: forkInput.targetThreadId,
++              ownerNodeId: forkInput.ownerNodeId ?? null,
++              nativeThreadRef: providerRef(cloneNativeId),
++              nativeConversationHeadRef: null,
++              status: "idle",
++              firstRunOrdinal: null,
++              lastRunOrdinal: null,
++              handoffIds: [],
++              forkedFrom: { providerThreadId: forkInput.sourceProviderThread.id },
++              pendingBackgroundTasks: [],
++              createdAt,
++              updatedAt: createdAt,
++            } satisfies OrchestrationV2ProviderThread;
++          }).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderAdapterForkThreadError({
++                  driver: PI_PROVIDER,
++                  providerThreadId: forkInput.sourceProviderThread.id,
++                  cause,
++                }),
++            ),
+           ),
+       };
+       return runtime;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+index f92e80895..19eb576d6 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+@@ -74,6 +74,13 @@ export interface PiRpcConnection {
+   readonly events: Queue.Queue<PiRpcRecord, PiRpcError>;
+   /** Resolves when the process has exited, with its exit code. */
+   readonly exited: Effect.Effect<number, PiRpcError>;
++  /**
++   * Kill the pi process group immediately (SIGTERM, grace, SIGKILL). Used by
++   * Stop-with-restart when the process may be wedged and `abort` cannot be
++   * trusted to land. The transport fails and the session manager respawns a
++   * fresh process on the next turn.
++   */
++  readonly terminate: Effect.Effect<void>;
+ }
+ 
+ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+@@ -375,5 +382,9 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+     request,
+     events,
+     exited: Deferred.await(exitDeferred),
++    terminate: terminatePiProcess(killProcessGroup, hasExited).pipe(
++      Effect.ignore,
++      Effect.uninterruptible,
++    ),
+   } satisfies PiRpcConnection;
+ });
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,54 @@
+From 79514a3bb7bd0b477a0aa79da465e137ca4ad3fb Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 17:08:28 +0200
+Subject: [PATCH] fix(providers): declare the Pi rollback snapshot capability
+
+CommandPolicy.ensureRollback rejects every rollback command unless
+providerRollbackReturnsSnapshot accompanies the rollback capabilities, so
+checkpoint reverts on Pi threads failed with 'rollback must return a
+providerInstanceId thread snapshot'. rollbackThread already returns the
+updated provider thread; declare it.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/Adapters/PiAdapterV2.test.ts     | 8 ++++++++
+ apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts  | 4 +++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 463e7cfaf..7153fbb52 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -266,6 +266,14 @@ const startTurn = Effect.fnUntraced(function* (
+ });
+ 
+ describe("PiAdapterV2", () => {
++  it("keeps the rollback capability triple consistent with CommandPolicy", () => {
++    // ensureRollback rejects rollback commands unless all three hold, so a
++    // partially-enabled combination is user-visibly broken, not conservative.
++    assert.isTrue(PiProviderCapabilitiesV2.threads.canRollbackThread);
++    assert.isTrue(PiProviderCapabilitiesV2.checkpointing.providerCanRollbackConversation);
++    assert.isTrue(PiProviderCapabilitiesV2.checkpointing.providerRollbackReturnsSnapshot);
++  });
++
+   it("declares Pi-honest capabilities", () => {
+     assert.isTrue(PiProviderCapabilitiesV2.turns.supportsActiveSteering);
+     assert.isFalse(PiProviderCapabilitiesV2.turns.supportsSteeringByInterruptRestart);
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index 99548c943..b30779782 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -194,7 +194,9 @@ export const PiProviderCapabilitiesV2 = {
+     appCanCheckpointFilesystem: true,
+     supportsNestedCheckpointScopes: false,
+     providerCanRollbackConversation: true,
+-    providerRollbackReturnsSnapshot: false,
++    // CommandPolicy.ensureRollback requires the snapshot whenever provider
++    // rollback is enabled; rollbackThread returns the updated provider thread.
++    providerRollbackReturnsSnapshot: true,
+     providerCanReadConversationSnapshot: false,
+   },
+   identity: {
+-- 
+2.50.1 (Apple Git-155)
+

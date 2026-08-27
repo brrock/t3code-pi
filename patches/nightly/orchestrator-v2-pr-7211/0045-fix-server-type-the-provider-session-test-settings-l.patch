@@ -1,0 +1,34 @@
+From b6cfb8d1925cbb47f0231bbc15b4d503f9de6d3f Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 13:48:54 +0200
+Subject: [PATCH] fix(server): type the provider session test settings layer
+
+ServerSettings.layerTest carries the settings-normalization error
+channel, but the makeTestLayer slot requires error never, failing
+typecheck. The error cannot occur for a literal override, so orDie it.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/ProviderSessionManager.test.ts     | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+index b8240aea3..9fa95e404 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+@@ -834,7 +834,11 @@ it.effect(
+             state,
+             idleTimeoutMs: 1_000,
+             mcpConfigs,
+-            serverSettingsLayer: ServerSettings.layerTest({ enableAgentBrowserAccess: false }),
++            // orDie: the test layer's settings-normalization error cannot
++            // occur for a literal override and the slot requires error never.
++            serverSettingsLayer: ServerSettings.layerTest({
++              enableAgentBrowserAccess: false,
++            }).pipe(Layer.orDie),
+           }),
+         ),
+       );
+-- 
+2.50.1 (Apple Git-155)
+

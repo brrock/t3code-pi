@@ -1,0 +1,336 @@
+From e2095354d54c20d4e90be744fd22ed9c8fd91da7 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 15:19:52 +0200
+Subject: [PATCH] fix(providers): never gate Pi turn start on the prompt ack
+
+Pi acks the prompt command only after slash-command expansion completes,
+and extension commands can block on user dialogs indefinitely. Awaiting
+the ack with a 15s timeout failed the turn mid-dialog and cancelled the
+prompt the user was answering. Send prompt and steer fire-and-forget;
+rejections come back as id-less response records and fail the turn from
+the event pump. Found by exercising /commands against a real pi install.
+
+Also carries concurrent review fixes staged in the shared worktree by
+the review-babysitting agent: theme-aware Pi icons on web and mobile,
+bounded RPC error summaries, and transport/request hardening in PiRpc.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ apps/mobile/src/components/ProviderIcon.tsx   |  2 +-
+ .../Adapters/PiAdapterV2.test.ts              | 57 ++++++++++++++++++-
+ .../orchestration-v2/Adapters/PiAdapterV2.ts  | 56 ++++++++++++------
+ .../src/orchestration-v2/Adapters/PiRpc.ts    | 41 ++++++++++---
+ apps/web/src/components/Icons.tsx             |  2 +-
+ 5 files changed, 129 insertions(+), 29 deletions(-)
+
+diff --git a/apps/mobile/src/components/ProviderIcon.tsx b/apps/mobile/src/components/ProviderIcon.tsx
+index e71c54660..73c8b8a9e 100644
+--- a/apps/mobile/src/components/ProviderIcon.tsx
++++ b/apps/mobile/src/components/ProviderIcon.tsx
+@@ -53,7 +53,7 @@ export function ProviderIcon(props: ProviderIconProps) {
+   if (props.provider === "pi") {
+     const foreground = isDarkMode ? "#F5F5F5" : "#0F0F0F";
+     return (
+-      <Svg width={size} height={size} viewBox="0 0 800 800" fill="none">
++      <Svg width={size} height={size} viewBox="165.29 165.29 469.43 469.43" fill="none">
+         <Path
+           fill={foreground}
+           fillRule="evenodd"
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+index 964fdd22e..aa3dfdb85 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.test.ts
+@@ -7,6 +7,7 @@ import {
+   RunAttemptId,
+   RunId,
+   ThreadId,
++  type ChatAttachment,
+   type ModelSelection,
+   type OrchestrationV2AppThread,
+   type OrchestrationV2ProviderThread,
+@@ -220,6 +221,7 @@ const startTurn = Effect.fnUntraced(function* (
+   runtime: ProviderAdapterV2SessionRuntime,
+   providerThread: OrchestrationV2ProviderThread,
+   model = "default",
++  attachments: ReadonlyArray<ChatAttachment> = [],
+ ) {
+   const appThread = yield* makeAppThread(model);
+   yield* runtime.startTurn({
+@@ -234,7 +236,7 @@ const startTurn = Effect.fnUntraced(function* (
+     message: {
+       messageId: "message:thread-pi-test:1" as never,
+       text: "Hello pi",
+-      attachments: [],
++      attachments,
+       createdBy: "user",
+       creationSource: "web",
+     },
+@@ -271,6 +273,33 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
++  it.effect("keeps the thread usable when an attachment cannot be read", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++
++      yield* startTurn(runtime, providerThread, "default", [
++        {
++          type: "image",
++          id: "missingpiattachment",
++          name: "missing.png",
++          mimeType: "image/png",
++          sizeBytes: 1,
++        },
++      ]).pipe(Effect.flip);
++
++      // The failed turn was never installed, so the next one still starts.
++      yield* startTurn(runtime, providerThread);
++      const prompt = yield* fake.takeRequest("prompt");
++      assert.equal(prompt["message"], "Hello pi");
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("streams assistant text and settles a completed turn on agent_settled", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+@@ -283,6 +312,9 @@ describe("PiAdapterV2", () => {
+       yield* startTurn(runtime, providerThread);
+       const prompt = yield* fake.takeRequest("prompt");
+       assert.equal(prompt["message"], "Hello pi");
++      // Fire-and-forget: extension slash commands can hold the ack open on a
++      // user dialog, so the prompt must carry no correlation id to await.
++      assert.equal(prompt["id"], undefined);
+ 
+       yield* fake.emit({ type: "agent_start" });
+       yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
+@@ -325,6 +357,29 @@ describe("PiAdapterV2", () => {
+     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+   );
+ 
++  it.effect("fails the turn when pi rejects a fire-and-forget prompt", () =>
++    Effect.gen(function* () {
++      const fake = yield* makeFakePi;
++      const { runtime, takeEvent } = yield* openRuntime(fake);
++      const providerThread = yield* runtime.ensureThread({
++        threadId: THREAD_ID,
++        modelSelection: modelSelection("default"),
++        runtimePolicy,
++      });
++      yield* startTurn(runtime, providerThread);
++      yield* fake.takeRequest("prompt");
++      yield* fake.emit({ type: "response", command: "prompt", success: false, error: "boom" });
++
++      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
++      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "failed");
++      assert.isTrue(
++        terminal.type === "turn.terminal" &&
++          terminal.status === "failed" &&
++          terminal.failure.message === "boom",
++      );
++    }).pipe(Effect.scoped, Effect.provide(testLayer)),
++  );
++
+   it.effect("keeps the turn open across agent_end and fails it on final retry failure", () =>
+     Effect.gen(function* () {
+       const fake = yield* makeFakePi;
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+index fdd2cf5fb..ca106d6ea 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiAdapterV2.ts
+@@ -1027,6 +1027,24 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             if (state !== null) yield* finalizeTurn(state);
+             return;
+           }
++          case "response": {
++            // Correlated responses never reach the pump; an id-less response
++            // is the deferred ack of a fire-and-forget prompt/steer. A
++            // rejection here means the turn never started on the Pi side.
++            const command = recordString(event, "command");
++            if (
++              turn !== null &&
++              event["success"] === false &&
++              (command === "prompt" || command === "steer" || command === "parse")
++            ) {
++              turn.failure = makeProviderFailure({
++                message: recordString(event, "error") ?? "Pi rejected the prompt.",
++                class: "provider_error",
++              });
++              if (state !== null) yield* finalizeTurn(state);
++            }
++            return;
++          }
+           default:
+             return;
+         }
+@@ -1075,15 +1093,25 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+             type: "switch_session",
+             sessionPath: existing.nativeThreadRef.nativeId,
+           });
++          // The applied-selection cache describes the session we just left.
++          // Clearing it stops the next `applySelection` from treating this
++          // session as already configured and skipping set_model.
++          appliedModel = null;
++          appliedThinking = null;
+         }
+         const stateData = yield* request({ type: "get_state" });
+-        if (baselineModel === null && baselineThinking === null) {
++        // Each baseline is captured independently, and only while nothing has
++        // been applied yet, so a `get_state` that omits one field still lets
++        // the other be picked up later without recording our own selection.
++        if (baselineModel === null && appliedModel === null) {
+           const stateModel = recordField(stateData, "model");
+           const provider = recordString(stateModel, "provider");
+           const modelId = recordString(stateModel, "id");
+           if (provider !== undefined && modelId !== undefined) {
+             baselineModel = { provider, modelId };
+           }
++        }
++        if (baselineThinking === null && appliedThinking === null) {
+           baselineThinking = recordString(stateData, "thinkingLevel") ?? null;
+         }
+         const nativeId =
+@@ -1307,24 +1335,16 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               lastRunOrdinal: turnInput.runOrdinal,
+             });
+             yield* updateProviderSession("running", null);
+-            yield* request({
++            // Fire-and-forget: pi acks `prompt` only after slash-command
++            // expansion completes, and extension commands may block on user
++            // dialogs indefinitely, so turn start must never await the ack.
++            // Rejections come back as an id-less response record and are
++            // handled by the event pump.
++            yield* connection.send({
+               type: "prompt",
+               message: payload.message,
+               ...(payload.images.length === 0 ? {} : { images: payload.images }),
+-            }).pipe(
+-              Effect.tapError(() =>
+-                Effect.gen(function* () {
+-                  const current = threadState;
+-                  if (current?.activeTurn?.providerTurn.id === providerTurn.id) {
+-                    current.activeTurn.failure = makeProviderFailure({
+-                      message: "Pi rejected the prompt.",
+-                      class: "provider_error",
+-                    });
+-                    yield* finalizeTurn(current);
+-                  }
+-                }),
+-              ),
+-            );
++            });
+           }).pipe(
+             Effect.mapError(
+               (cause) =>
+@@ -1347,7 +1367,9 @@ export function makePiAdapterV2(options: PiAdapterV2Options): ProviderAdapterV2S
+               steerInput.message.text,
+               steerInput.message.attachments,
+             );
+-            yield* request({
++            // Same fire-and-forget contract as `prompt`: a steer that expands
++            // a slash command must not block on the ack.
++            yield* connection.send({
+               type: "steer",
+               message: payload.message,
+               ...(payload.images.length === 0 ? {} : { images: payload.images }),
+diff --git a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+index 0373e77f7..e04f21665 100644
+--- a/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
++++ b/apps/server/src/orchestration-v2/Adapters/PiRpc.ts
+@@ -93,6 +93,21 @@ const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
+ const decodeJsonLine = Schema.decodeSync(UnknownFromJsonString);
+ const encodeJsonLine = Schema.encodeSync(UnknownFromJsonString);
+ 
++const PI_ERROR_DETAIL_MAX_CHARS = 200;
++
++/**
++ * Bounded, human-readable summary of a failed response's `error` payload.
++ * The untruncated value stays on the error's `cause`, so `message` never
++ * carries unbounded remote text while logs keep something diagnostic.
++ */
++function summarizePiError(error: unknown): string {
++  const text = typeof error === "string" ? error : JSON.stringify(error);
++  if (text === undefined) return "unknown error";
++  return text.length > PI_ERROR_DETAIL_MAX_CHARS
++    ? `${text.slice(0, PI_ERROR_DETAIL_MAX_CHARS)}…`
++    : text;
++}
++
+ function parsePiRecord(line: string): PiRpcRecord | undefined {
+   try {
+     const parsed: unknown = decodeJsonLine(line);
+@@ -146,6 +161,17 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+     }
+   };
+ 
++  // Registered before any further setup: an interrupt or failure between the
++  // spawn and the rest of this constructor would otherwise leak a detached
++  // pi process with no finalizer to reap it.
++  yield* Scope.addFinalizer(
++    scope,
++    terminatePiProcess(Number(child.pid), killProcessGroup).pipe(
++      Effect.ignore,
++      Effect.uninterruptible,
++    ),
++  );
++
+   const pendingRequests = new Map<string, PendingPiRequest>();
+   const events = yield* Queue.unbounded<PiRpcRecord, PiRpcError>();
+   const outgoing = yield* Queue.unbounded<Uint8Array>();
+@@ -185,6 +211,7 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+               pending.deferred,
+               new PiRpcError({
+                 operation: String(record["command"] ?? "request"),
++                detail: summarizePiError(record["error"]),
+                 ...(record["error"] === undefined ? {} : { cause: record["error"] }),
+               }),
+             );
+@@ -251,14 +278,6 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+     Effect.forkIn(scope),
+   );
+ 
+-  yield* Scope.addFinalizer(
+-    scope,
+-    terminatePiProcess(Number(child.pid), killProcessGroup).pipe(
+-      Effect.ignore,
+-      Effect.uninterruptible,
+-    ),
+-  );
+-
+   const send = (record: PiRpcRecord): Effect.Effect<void, PiRpcError> =>
+     Effect.gen(function* () {
+       const down = yield* Deferred.isDone(transportDown);
+@@ -279,7 +298,11 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
+       yield* send({ ...record, id }).pipe(
+         Effect.tapError(() => Effect.sync(() => pendingRequests.delete(id))),
+       );
+-      return yield* Deferred.await(deferred).pipe(
++      // Raced against the transport: a death that lands after this request was
++      // registered (or between `send`'s check and its enqueue) would otherwise
++      // leave the caller waiting out the full timeout for a reply that is
++      // never coming.
++      return yield* Effect.raceFirst(Deferred.await(deferred), Deferred.await(transportDown)).pipe(
+         Effect.timeoutOrElse({
+           duration: Duration.millis(timeoutMs),
+           orElse: () =>
+diff --git a/apps/web/src/components/Icons.tsx b/apps/web/src/components/Icons.tsx
+index 8b5a44501..b1642036b 100644
+--- a/apps/web/src/components/Icons.tsx
++++ b/apps/web/src/components/Icons.tsx
+@@ -688,7 +688,7 @@ export const ACPRegistryIcon: Icon = ({ className, ...props }) => (
+ export const PiAgentIcon: Icon = ({ className, ...props }) => (
+   <svg
+     {...props}
+-    viewBox="0 0 800 800"
++    viewBox="165.29 165.29 469.43 469.43"
+     fill="none"
+     className={cn("fill-[#0F0F0F] dark:fill-[#F5F5F5]", className)}
+   >
+-- 
+2.50.1 (Apple Git-155)
+

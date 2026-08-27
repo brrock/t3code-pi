@@ -1,0 +1,153 @@
+From 34a326096f2a0a248f1b9f6996f8a894c892fb23 Mon Sep 17 00:00:00 2001
+From: Wout Stiens <71498452+StiensWout@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 21:01:19 +0200
+Subject: [PATCH] fix(server): translate policy capability rejections into
+ readable errors
+
+Capability rejections surfaced their internal diagnostic string, so a
+checkpoint revert on a provider without rollback support showed 'pi
+cannot satisfy rollback_snapshot for command <uuid>: rollback must
+return a providerInstanceId thread snapshot'. userFacingDispatchErrorMessage
+now renders known policy rejections as provider-named prose ('Pi did not
+report its rewound conversation state, so the checkpoint was not
+restored.') and keeps the diagnostic form for logs and unknown codes.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../orchestration-v2/UserFacingErrors.test.ts | 47 +++++++++++++++++
+ .../src/orchestration-v2/UserFacingErrors.ts  | 51 +++++++++++++++++++
+ 2 files changed, 98 insertions(+)
+
+diff --git a/apps/server/src/orchestration-v2/UserFacingErrors.test.ts b/apps/server/src/orchestration-v2/UserFacingErrors.test.ts
+index 63e3a77a5..6346a2b0e 100644
+--- a/apps/server/src/orchestration-v2/UserFacingErrors.test.ts
++++ b/apps/server/src/orchestration-v2/UserFacingErrors.test.ts
+@@ -21,6 +21,53 @@ describe("userFacingDispatchErrorMessage", () => {
+     );
+   });
+ 
++  it("translates policy capability rejections into provider-named prose", () => {
++    assert.equal(
++      userFacingDispatchErrorMessage({
++        message: "Failed to dispatch orchestration command checkpoint.rollback (command-1).",
++        cause: {
++          _tag: "CommandPolicyCapabilityUnsupportedError",
++          commandId: "command-1",
++          threadId: "thread-1",
++          providerInstanceId: "pi",
++          capability: "rollback_snapshot",
++          detail: "rollback must return a provider thread snapshot",
++          message:
++            "pi cannot satisfy rollback_snapshot for command command-1: rollback must return a provider thread snapshot",
++        },
++      }),
++      "Pi did not report its rewound conversation state, so the checkpoint was not restored.",
++    );
++    assert.equal(
++      userFacingDispatchErrorMessage({
++        message: "Failed to dispatch orchestration command checkpoint.rollback (command-2).",
++        cause: {
++          _tag: "CommandPolicyCapabilityUnsupportedError",
++          commandId: "command-2",
++          threadId: "thread-1",
++          providerInstanceId: "grok",
++          capability: "rollback",
++          detail: "provider conversation rollback is unavailable",
++        },
++      }),
++      "Grok cannot rewind its conversation, so this checkpoint cannot be restored on this thread.",
++    );
++  });
++
++  it("falls back to the raw message for unknown capability codes", () => {
++    assert.equal(
++      userFacingDispatchErrorMessage({
++        cause: {
++          _tag: "CommandPolicyCapabilityUnsupportedError",
++          providerInstanceId: "pi",
++          capability: "some_future_capability",
++          message: "pi cannot satisfy some_future_capability for command command-3: details",
++        },
++      }),
++      "pi cannot satisfy some_future_capability for command command-3: details",
++    );
++  });
++
+   it("uses explicit detail fields as user-facing messages", () => {
+     assert.equal(
+       userFacingDispatchErrorMessage({
+diff --git a/apps/server/src/orchestration-v2/UserFacingErrors.ts b/apps/server/src/orchestration-v2/UserFacingErrors.ts
+index 3765312da..535dd05ba 100644
+--- a/apps/server/src/orchestration-v2/UserFacingErrors.ts
++++ b/apps/server/src/orchestration-v2/UserFacingErrors.ts
+@@ -1,9 +1,56 @@
++import { PROVIDER_DISPLAY_NAMES, type ProviderDriverKind } from "@t3tools/contracts";
++
+ const GENERIC_ERROR_PREFIXES = [
+   "Failed to dispatch orchestration V2 command",
+   "Failed to dispatch orchestration command ",
+   "Provider adapter failed while dispatching orchestration command ",
+ ];
+ 
++/**
++ * User-facing prose for capability rejections. The internal error messages
++ * keep command ids and capability codes for logs; the toast should say what
++ * did not happen and why in the provider's own name.
++ */
++const CAPABILITY_REJECTION_MESSAGES: Record<string, (provider: string) => string> = {
++  queued_messages: (p) => `${p} cannot queue messages behind an active run.`,
++  active_steering: (p) =>
++    `${p} cannot redirect an active run. Stop it first, then send the message.`,
++  interrupt_restart_steering: (p) =>
++    `${p} cannot redirect an active run. Stop it first, then send the message.`,
++  interrupt: (p) => `${p} cannot stop a run once it has started.`,
++  native_fork: (p) => `${p} cannot fork this thread natively.`,
++  fork_from_turn: (p) => `${p} cannot fork from an earlier point in this thread.`,
++  rollback: (p) =>
++    `${p} cannot rewind its conversation, so this checkpoint cannot be restored on this thread.`,
++  rollback_snapshot: (p) =>
++    `${p} did not report its rewound conversation state, so the checkpoint was not restored.`,
++  context_handoff: (p) => `${p} cannot receive the context handoff needed for this switch.`,
++  strong_terminal_status: (p) =>
++    `${p} cannot confirm when its runs finish reliably enough for this.`,
++};
++
++function providerDisplayName(instanceId: string): string {
++  const known = PROVIDER_DISPLAY_NAMES[instanceId as ProviderDriverKind];
++  if (known !== undefined) return known;
++  const trimmed = instanceId.replace(/Agent$/i, "").trim();
++  if (trimmed.length === 0) return instanceId;
++  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
++}
++
++/** Friendly translation for command-policy rejections; undefined otherwise. */
++function policyRejectionMessage(value: unknown): string | undefined {
++  if (!isRecord(value) || typeof value.providerInstanceId !== "string") return undefined;
++  const provider = providerDisplayName(value.providerInstanceId);
++  if (value._tag === "CommandPolicyCapabilityUnsupportedError") {
++    const capability = typeof value.capability === "string" ? value.capability : "";
++    return CAPABILITY_REJECTION_MESSAGES[capability]?.(provider);
++  }
++  if (value._tag === "CommandPolicyUnsupportedError") {
++    return `${provider} cannot deliver a message that way right now.`;
++  }
++  return undefined;
++}
++
+ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null;
+ }
+@@ -16,6 +63,10 @@ function messageFrom(value: unknown): string | undefined {
+   if (typeof value === "string") {
+     return textValue(value);
+   }
++  const friendly = policyRejectionMessage(value);
++  if (friendly !== undefined) {
++    return friendly;
++  }
+   if (value instanceof Error) {
+     return textValue(value.message);
+   }
+-- 
+2.50.1 (Apple Git-155)
+
