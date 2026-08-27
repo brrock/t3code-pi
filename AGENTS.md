@@ -18,11 +18,9 @@ The maintenance agent commits patch directories and docs/config changes itself. 
 
 When a nightly contains the required base, the tool checks out that exact release target, carries the previous successful patch series forward, applies it with `git am`, and regenerates it. Fix conflicts in that temporary clone, rerun the tool, and commit the resulting version directory. Do not mark a conflict as applied.
 
-## Current Pi capability boundary
+## Pi maintenance
 
-The direct base supports Pi RPC sessions, prompts, streamed text/reasoning, native tool lifecycle rows, stop/abort, provider/model discovery, and provider-labelled model names such as `[anthropic] Claude Sonnet`.
-
-It does **not** yet bridge PR #7211's Orchestrator-v2-only behaviors: T3 MCP injection (including agent browser access), extension UI approval/input forwarding, attachments, Pi session-tree rollback/forking, Pi text generation, or native subagent projection into T3 child threads. Do not describe those as supported or release a patch that claims parity until they have explicit current-orchestrator implementations and tests.
+The direct base supports Pi RPC sessions, prompts, streamed text/reasoning, native tool lifecycle rows, stop/abort, provider/model discovery, and provider-labelled model names such as `[anthropic] Claude Sonnet`. Continue porting PR #7211 behavior at the provider boundary as the current-tree adapter evolves, retaining focused tests for each behavior.
 
 ## Releases and updater assets
 
