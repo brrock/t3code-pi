@@ -60,6 +60,22 @@ await replace(
   `"productName": "${config.desktopProductName}"`,
 );
 
+// Unsigned macOS downloads can retain the quarantine extended attribute after
+// Squirrel installs them. This is deliberately best-effort: it runs only once
+// the replacement has launched, never touches files outside this app bundle,
+// and does not make an initially Gatekeeper-blocked application executable.
+const desktopMainPath = join(source, "apps/desktop/src/main.ts");
+let desktopMain = await readFile(desktopMainPath, "utf8");
+const desktopMainMarker = 'import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";';
+if (!desktopMain.includes(desktopMainMarker)) {
+  throw new Error("Desktop main implementation changed; update prepare-release-source.mjs");
+}
+desktopMain = desktopMain.replace(
+  desktopMainMarker,
+  `import { execFile } from "node:child_process";\nimport * as NodePath from "node:path";\n\nif (process.platform === "darwin" && process.execPath.includes(".app/Contents/MacOS/")) {\n  const appBundlePath = NodePath.resolve(process.execPath, "..", "..", "..");\n  execFile("/usr/bin/xattr", ["-dr", "com.apple.quarantine", appBundlePath], () => {});\n}\n\n${desktopMainMarker}`,
+);
+await writeFile(desktopMainPath, desktopMain);
+
 // Persist the identity used by release debugging without placing it in the app bundle.
 await writeFile(join(source, ".t3code-pi-release.json"), `${JSON.stringify({ ...config, source: dirname(source) }, null, 2)}\n`);
 console.log(`Prepared ${source} for ${config.npmPackage} and ${config.githubRepository}.`);
