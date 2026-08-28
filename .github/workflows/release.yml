@@ -68,10 +68,13 @@ jobs:
           ((${#patches[@]})) || { echo "No patch series for this release" >&2; exit 1; }
           git -C source am "${patches[@]/#/$GITHUB_WORKSPACE/}"
           node tools/prepare-release-source.mjs source
+          # Preserve dotfiles needed by downstream build jobs, without packaging clone metadata.
+          rm -rf source/.git
       - uses: actions/upload-artifact@v7
         with:
           name: prepared-source
           path: source
+          include-hidden-files: true
           retention-days: 1
 
   publish_npm:
@@ -149,6 +152,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y imagemagick
       - name: Install build dependencies
         working-directory: source
+        shell: bash
         run: |
           set -euo pipefail
           cp .env.example .env
