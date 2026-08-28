@@ -94,9 +94,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          vp install --filter=@brrock/t3-pi... --filter=@t3tools/web... --filter=@t3tools/scripts...
           node scripts/update-release-package-versions.ts "${VERSION#v}"
-          vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
-          vp run --filter t3 build
+          vp run --filter @brrock/t3-pi build
       - name: Publish fork CLI
         working-directory: source
         env:
@@ -145,7 +145,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y imagemagick
       - name: Install build dependencies
         working-directory: source
-        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+        run: vp install --filter=@t3tools/desktop... --filter=@brrock/t3-pi... --filter=@t3tools/scripts...
       # This fork intentionally publishes unsigned builds. Users may need to
       # bypass OS trust prompts on first install; GitHub updater metadata still
       # provides in-app version discovery and downloads.

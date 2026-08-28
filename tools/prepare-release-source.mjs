@@ -60,6 +60,12 @@ await replace(
   `"productName": "${config.desktopProductName}"`,
 );
 
+await replace(
+  join(source, "apps/desktop/vite.config.ts"),
+  "t3#build",
+  `${config.npmPackage}#build`,
+);
+
 // Unsigned macOS downloads can retain the quarantine extended attribute after
 // Squirrel installs them. This is deliberately best-effort: it runs only once
 // the replacement has launched, never touches files outside this app bundle,
