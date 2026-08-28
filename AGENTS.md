@@ -16,7 +16,9 @@ On the **first run**, preserve and use the configured `patches/base/<base>` seri
 
 The maintenance agent commits patch directories and docs/config changes itself. There is intentionally no scheduled GitHub maintenance workflow. Do not commit `clones/` or `.state/`.
 
-When a nightly contains the required base, the tool checks out that exact release target, carries the previous successful patch series forward, applies it with `git am`, and regenerates it. Fix conflicts in that temporary clone, rerun the tool, and commit the resulting version directory. Do not mark a conflict as applied.
+When a release contains the required base, the tool checks out that exact release target, carries the previous successful patch series forward, applies it with `git am`, and regenerates it. On an apply failure it writes `patches/<channel>/<tag>/manifest.json` with `status: "conflict"`, preserves the ordered attempted patch files, prints the underlying `git am` error, and exits nonzero.
+
+An agent must treat that as a repair loop, not as a terminal maintenance result: read the conflict manifest and stderr; check out that exact upstream target in a disposable clone; apply the preserved series, resolve the conflict in source, run focused tests, and regenerate the ordered patch files with `git format-patch`. Then rerun `node tools/maintain-upstream.mjs --channel=<channel>` so it verifies and records the repaired series as `applied`. Commit and push only that successful result. Never publish, mark applied, or silently skip a deferred/conflicted release. If the conflict cannot be resolved safely, stop and report the manifest, attempted resolution, and blocker.
 
 ## Pi maintenance
 
