@@ -67,7 +67,9 @@ export async function copyPatchSeries(source, destination) {
 }
 
 export function releaseTarget(release) {
-  return release.target_commitish || release.tag_name;
+  // GitHub Releases may retain a branch name (for example, "main") in
+  // target_commitish. The release tag is the immutable artifact boundary.
+  return release.tag_name;
 }
 
 export function manifest({ channel, release, source, status, reason, patches, requiredCommit }) {

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   channelReleases, copyPatchSeries, latestSuccessfulSource, loadJson, manifest,
-  missingReleases, record, recordedChannel, safeReleaseName, saveJson
+  missingReleases, record, recordedChannel, releaseTarget, safeReleaseName, saveJson
 } from "./maintenance-lib.mjs";
 
 const releases = [
@@ -30,6 +30,10 @@ test("channels GitHub Releases by prerelease status and published order", () => 
   assert.deepEqual(channelReleases(releases, false).map((release) => release.tag_name), ["v0.0.1"]);
   assert.deepEqual(channelReleases(releases, true).map((release) => release.tag_name), ["v0.0.2-nightly.1", "v0.0.2-nightly.2"]);
   assert.deepEqual(missingReleases(channelReleases(releases, true), { releases: { "v0.0.2-nightly.1": {} } }).map((release) => release.tag_name), ["v0.0.2-nightly.2"]);
+});
+
+test("uses the immutable release tag rather than a moving target branch", () => {
+  assert.equal(releaseTarget({ tag_name: "v0.0.0-alpha.3", target_commitish: "main" }), "v0.0.0-alpha.3");
 });
 
 test("refuses release tags that could escape a patch directory", () => {
@@ -72,6 +76,6 @@ test("uses the latest successful series, persists state, and describes a release
   await saveJson(join(root, "state.json"), state);
   assert.deepEqual(await loadJson(join(root, "state.json")), state);
   assert.deepEqual(manifest({ channel: "nightly", release: releases[0], source: "patches/nightly/old", status: "applied", patches: ["0001.patch"], requiredCommit: "abc" }), {
-    schemaVersion: 1, channel: "nightly", upstream: "pingdotgg/t3code", tag: "v0.0.2-nightly.2", targetCommitish: "c2", publishedAt: "2026-01-03T00:00:00Z", source: "patches/nightly/old", requiredCommit: "abc", status: "applied", reason: null, patches: ["0001.patch"]
+    schemaVersion: 1, channel: "nightly", upstream: "pingdotgg/t3code", tag: "v0.0.2-nightly.2", targetCommitish: "v0.0.2-nightly.2", publishedAt: "2026-01-03T00:00:00Z", source: "patches/nightly/old", requiredCommit: "abc", status: "applied", reason: null, patches: ["0001.patch"]
   });
 });
