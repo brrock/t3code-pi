@@ -12,6 +12,7 @@
   "patches": [
     "0001-feat-providers-add-Pi-coding-agent.patch",
     "0002-feat-providers-complete-Pi-runtime-integration.patch",
-    "0003-fix-web-simplify-Pi-composer-model-labels.patch"
+    "0003-fix-web-simplify-Pi-composer-model-labels.patch",
+    "0004-fix-desktop-keep-Pi-nightly-rebuilds-on-nightly-feed.patch"
   ]
 }

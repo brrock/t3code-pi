@@ -170,6 +170,16 @@ jobs:
           node scripts/update-release-package-versions.ts "${VERSION#v}"
           args=(--platform "${{ matrix.platform }}" --target "${{ matrix.target }}" --arch "${{ matrix.arch }}" --build-version "${VERSION#v}" --verbose)
           vp run dist:desktop:artifact "${args[@]}"
+          # electron-builder derives its update-feed filename from the final
+          # prerelease suffix. Immutable fork rebuilds end in `-pi.N`, which
+          # would otherwise produce latest*.yml even though they belong to the
+          # nightly feed consumed by nightly desktop builds.
+          if [[ "${{ inputs.channel }}" == nightly ]]; then
+            for metadata in release/latest*.yml; do
+              [[ -e "$metadata" ]] || continue
+              mv "$metadata" "${metadata/latest/nightly}"
+            done
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
