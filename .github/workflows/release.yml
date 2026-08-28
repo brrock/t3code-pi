@@ -177,7 +177,7 @@ jobs:
           pattern: desktop-*
           merge-multiple: true
           path: assets
-      - name: Publish signed updater release
+      - name: Publish desktop updater release
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ inputs.channel }}
@@ -187,4 +187,8 @@ jobs:
           set -euo pipefail
           prerelease=()
           [[ "$CHANNEL" == nightly ]] && prerelease=(--prerelease)
-          gh release create "$TAG" assets/* "${prerelease[@]}" --title "T3 Code Pi $TAG" --notes "Pi fork of $UPSTREAM_REPOSITORY $UPSTREAM_TAG. npm and desktop updater release."
+          notes_file="$RUNNER_TEMP/upstream-release-notes.md"
+          gh api "repos/$UPSTREAM_REPOSITORY/releases/tags/$UPSTREAM_TAG" --jq .body > "$notes_file"
+          printf '\n\n---\n\n_Pi fork release of [%s@%s](https://github.com/%s/releases/tag/%s). Includes the Pi provider integration, npm package `@brrock/t3-pi`, and desktop updater assets._\n' \
+            "$UPSTREAM_REPOSITORY" "$UPSTREAM_TAG" "$UPSTREAM_REPOSITORY" "$UPSTREAM_TAG" >> "$notes_file"
+          gh release create "$TAG" assets/* "${prerelease[@]}" --title "T3 Code Pi $TAG" --notes-file "$notes_file"

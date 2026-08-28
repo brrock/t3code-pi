@@ -47,7 +47,7 @@ The workflow:
 3. applies the fork release identity (`@brrock/t3-pi`, `brrock/t3code-pi`, and the fork desktop app ID);
 4. publishes npm with GitHub OIDC trusted publishing and provenance;
 5. builds desktop updater assets for macOS, Windows, and Linux;
-6. creates the GitHub Release.
+6. forwards the upstream T3 Code release notes, adds a Pi-fork footer, and creates the GitHub Release.
 
 Configure npm trusted publishing for `@brrock/t3-pi` to trust this repository and `.github/workflows/release.yml`. No long-lived `NPM_TOKEN` is used.
 
