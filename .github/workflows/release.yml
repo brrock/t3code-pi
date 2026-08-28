@@ -13,7 +13,7 @@ on:
         required: true
         type: string
       version:
-        description: Exact semver version to publish to npm and desktop updaters
+        description: Exact upstream semver version (must equal upstream_tag without its leading v)
         required: true
         type: string
 
@@ -45,6 +45,8 @@ jobs:
           set -euo pipefail
           node tools/verify-release.mjs "$CHANNEL" "$UPSTREAM_TAG"
           node -e 'if (!/^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(process.argv[1])) process.exit(1)' "$VERSION" || { echo "version must be semver" >&2; exit 1; }
+          expected_version="${UPSTREAM_TAG#v}"
+          [[ "${VERSION#v}" == "$expected_version" ]] || { echo "version must exactly match upstream_tag: expected $expected_version" >&2; exit 1; }
       - id: version
         env:
           CHANNEL: ${{ inputs.channel }}

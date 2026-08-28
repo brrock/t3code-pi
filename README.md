@@ -31,7 +31,7 @@ After a verified `applied` result, the agent commits and pushes the patch direct
 
 ## Publishing a release
 
-Publishing is manual-only (`workflow_dispatch`), so an authorized agent or maintainer explicitly chooses the upstream release and version:
+Publishing is manual-only (`workflow_dispatch`), so an authorized agent or maintainer explicitly chooses the upstream release. The supplied version must exactly equal `upstream_tag` without its leading `v`:
 
 ```sh
 gh workflow run release.yml \

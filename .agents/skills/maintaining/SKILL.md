@@ -29,7 +29,7 @@ Run from this repository root. This is patch-maintenance and release infrastruct
 
 ## Publish
 
-Publishing is manual-only. After an **applied** manifest is committed and pushed, dispatch the release workflow with the exact channel, upstream tag, and semver version:
+Publishing is manual-only. After an **applied** manifest is committed and pushed, dispatch the release workflow with the exact channel, upstream tag, and matching semver version (`upstream_tag` without leading `v`):
 
 ```sh
 gh workflow run release.yml \
