@@ -4,13 +4,14 @@ import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   applyAndExport, channelReleases, checkoutRelease, copyPatchSeries, ensureClone, hasCommit,
-  latestSuccessfulSource, loadJson, manifest, missingReleases, patchDirectory, patchFiles, record,
+  latestSuccessfulSource, loadJson, maintenanceCandidates, manifest, patchDirectory, patchFiles, record,
   recordedChannel, relative, releaseTarget, saveJson, statePath, writeManifest
 } from "./maintenance-lib.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const args = new Set(process.argv.slice(2));
 const dryRun = args.has("--dry-run");
+const latestOnly = args.has("--latest-only");
 const requestedChannel = [...args].find((arg) => arg.startsWith("--channel="))?.slice(10) ?? "all";
 if (!["all", "stable", "nightly"].includes(requestedChannel)) throw new Error("--channel must be stable, nightly, or all");
 const config = await loadJson(join(root, "maintenance.config.json"));
@@ -35,7 +36,7 @@ for (const [channel, channelConfig] of Object.entries(config.channels)) {
   state.channels[channel] ??= { releases: {} };
   Object.assign(state.channels[channel].releases, recorded.releases);
   let known = state.channels[channel];
-  for (const release of missingReleases(channelReleases(releases, channelConfig.preRelease), known)) {
+  for (const release of maintenanceCandidates(channelReleases(releases, channelConfig.preRelease), known, latestOnly)) {
     const destination = patchDirectory(root, channel, release.tag_name);
     const previousConflict = await loadJson(join(destination, "manifest.json"), null);
     const source = previousConflict?.status === "conflict"

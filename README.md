@@ -19,11 +19,11 @@ Desktop-managed servers update with the desktop app. Linux background-service se
 Patch maintenance is deliberately agent-driven, not a blind scheduled job.
 
 ```sh
-npm run maintain -- --channel=stable
-npm run maintain -- --channel=nightly
+npm run maintain -- --latest-only --channel=stable
+npm run maintain -- --latest-only --channel=nightly
 ```
 
-The tool finds upstream GitHub Releases, checks out each exact upstream target, applies the most recent Pi patch series, and regenerates the series for that release.
+The tool selects the newest upstream GitHub Release for each requested channel, checks out its immutable release tag, applies the most recent Pi patch series when the required base is present, and regenerates only that release’s series. It does not backfill older releases unless explicitly requested.
 
 If an upstream change causes a conflict, maintenance exits nonzero, retains the attempted patch files, and writes a conflict manifest under `patches/<channel>/<upstream-tag>/manifest.json`. The agent is instructed to inspect that error, repair the patch in a disposable upstream clone, run focused tests, regenerate the series, and rerun maintenance. It must never publish a deferred or conflicted manifest.
 

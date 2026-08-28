@@ -12,7 +12,7 @@ This repository stores the Pi adaptation of `pingdotgg/t3code`; it is not a T3 C
 
 ## Agent maintenance contract
 
-On the **first run**, preserve and use the configured `patches/base/<base>` series as the source for the first compatible nightly; do not create a release folder by copying an old V2 series. Run `node tools/maintain-upstream.mjs --dry-run` first, then run it without `--dry-run` only from a clean maintenance checkout. It uses `gh api` to enumerate **GitHub Releases**: non-prereleases for stable and prereleases for nightly. It handles missed releases in published order. Committed manifests are the durable completion history; ignored `.state/releases.json` is only a local checkpoint.
+On every run, inspect and process only the latest upstream stable and nightly release. Run `node tools/maintain-upstream.mjs --latest-only --dry-run` first, then run it without `--dry-run` only from a clean maintenance checkout. It uses `gh api` to enumerate **GitHub Releases**: non-prereleases for stable and prereleases for nightly. Do not backfill older release directories unless the user explicitly asks. Committed manifests are the durable completion history; ignored `.state/releases.json` is only a local checkpoint.
 
 The maintenance agent commits patch directories and docs/config changes itself. There is intentionally no scheduled GitHub maintenance workflow. Do not commit `clones/` or `.state/`.
 

@@ -11,15 +11,15 @@ Run from this repository root. This is patch-maintenance and release infrastruct
 
 1. Verify `gh auth status` can read `pingdotgg/t3code`, can push `brrock/t3code-pi`, and that the checkout is clean.
 2. Read `maintenance.config.json` plus the referenced `patches/base/<base>/manifest.json`. The committed direct Pi base is the only first-compatible-release seed; never revive the removed Orchestrator-v2 series.
-3. Inspect missed upstream releases before modifying state:
+3. Inspect the current latest upstream release in each channel before modifying state:
    ```sh
-   node tools/maintain-upstream.mjs --dry-run
+   node tools/maintain-upstream.mjs --latest-only --dry-run
    ```
-4. Process releases in published order:
+4. Process only those latest releases:
    ```sh
-   node tools/maintain-upstream.mjs
+   node tools/maintain-upstream.mjs --latest-only
    ```
-   Stable means non-draft, non-prerelease upstream GitHub Releases; nightly means non-draft prereleases. Committed manifests are the durable checkpoint, not `.state/releases.json`.
+   Stable means the newest non-draft, non-prerelease upstream GitHub Release; nightly means the newest non-draft prerelease. Do not backfill older releases unless the user explicitly requests it. Committed manifests are the durable checkpoint, not `.state/releases.json`.
 5. Inspect every resulting `patches/<channel>/<tag>/manifest.json`.
    - **applied:** inspect regenerated patches and run focused tests in the matching disposable `clones/<channel>` checkout.
    - **deferred:** commit only when the recorded base commit is genuinely absent from that upstream target. Do not publish it.

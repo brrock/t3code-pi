@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  channelReleases, copyPatchSeries, latestSuccessfulSource, loadJson, manifest,
+  channelReleases, copyPatchSeries, latestSuccessfulSource, loadJson, maintenanceCandidates, manifest,
   missingReleases, record, recordedChannel, releaseTarget, safeReleaseName, saveJson
 } from "./maintenance-lib.mjs";
 
@@ -34,6 +34,12 @@ test("channels GitHub Releases by prerelease status and published order", () => 
 
 test("uses the immutable release tag rather than a moving target branch", () => {
   assert.equal(releaseTarget({ tag_name: "v0.0.0-alpha.3", target_commitish: "main" }), "v0.0.0-alpha.3");
+});
+
+test("limits maintenance to the newest missing release when requested", () => {
+  const channel = channelReleases(releases, true);
+  assert.deepEqual(maintenanceCandidates(channel, { releases: {} }, true).map((release) => release.tag_name), ["v0.0.2-nightly.2"]);
+  assert.deepEqual(maintenanceCandidates(channel, { releases: {} }, false).map((release) => release.tag_name), ["v0.0.2-nightly.1", "v0.0.2-nightly.2"]);
 });
 
 test("refuses release tags that could escape a patch directory", () => {

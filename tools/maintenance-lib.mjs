@@ -20,6 +20,11 @@ export function missingReleases(releases, channelState) {
   return releases.filter((release) => !done.has(release.tag_name));
 }
 
+export function maintenanceCandidates(releases, channelState, latestOnly = false) {
+  const missing = missingReleases(releases, channelState);
+  return latestOnly ? missing.slice(-1) : missing;
+}
+
 export function run(command, args, cwd) {
   const result = spawnSync(command, args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed:\n${result.stderr || result.stdout}`);
