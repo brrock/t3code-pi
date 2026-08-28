@@ -62,6 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$UPSTREAM_TAG" "https://github.com/$UPSTREAM_REPOSITORY.git" source
+          git -C source config user.name "Brrock Agent"
+          git -C source config user.email "benjy@benjyross.xyz"
           mapfile -t patches < <(find "patches/$CHANNEL/$UPSTREAM_TAG" -maxdepth 1 -name '*.patch' -print | sort)
           ((${#patches[@]})) || { echo "No patch series for this release" >&2; exit 1; }
           git -C source am "${patches[@]/#/$GITHUB_WORKSPACE/}"
