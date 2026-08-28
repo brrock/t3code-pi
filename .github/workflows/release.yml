@@ -94,6 +94,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          cp .env.example .env
           vp install --filter=@brrock/t3-pi... --filter=@t3tools/web... --filter=@t3tools/scripts...
           node scripts/update-release-package-versions.ts "${VERSION#v}"
           vp run --filter @brrock/t3-pi build
@@ -103,8 +104,11 @@ jobs:
           NPM_TAG: ${{ needs.prepare.outputs.npm_tag }}
           VERSION: ${{ inputs.version }}
         run: |
-          # npm trusted publishing exchanges this job's GitHub OIDC token for
-          # a short-lived publish credential; no long-lived NPM_TOKEN exists.
+          # A retried release must not attempt to republish an immutable npm version.
+          if npm view "@brrock/t3-pi@${VERSION#v}" version >/dev/null 2>&1; then
+            echo "@brrock/t3-pi@${VERSION#v} is already published; skipping publish."
+            exit 0
+          fi
           node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --app-version "${VERSION#v}" --provenance --verbose
 
   desktop:
@@ -145,7 +149,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y imagemagick
       - name: Install build dependencies
         working-directory: source
-        run: vp install --filter=@t3tools/desktop... --filter=@brrock/t3-pi... --filter=@t3tools/scripts...
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          vp install --filter=@t3tools/desktop... --filter=@brrock/t3-pi... --filter=@t3tools/scripts...
       # This fork intentionally publishes unsigned builds. Users may need to
       # bypass OS trust prompts on first install; GitHub updater metadata still
       # provides in-app version discovery and downloads.
@@ -195,4 +202,4 @@ jobs:
           gh api "repos/$UPSTREAM_REPOSITORY/releases/tags/$UPSTREAM_TAG" --jq .body > "$notes_file"
           printf '\n\n---\n\n_Pi fork release of [%s@%s](https://github.com/%s/releases/tag/%s). Includes the Pi provider integration, npm package `@brrock/t3-pi`, and desktop updater assets._\n' \
             "$UPSTREAM_REPOSITORY" "$UPSTREAM_TAG" "$UPSTREAM_REPOSITORY" "$UPSTREAM_TAG" >> "$notes_file"
-          gh release create "$TAG" assets/* "${prerelease[@]}" --title "T3 Code Pi $TAG" --notes-file "$notes_file"
+          gh release create "$TAG" assets/* "${prerelease[@]}" --repo "$GITHUB_REPOSITORY" --title "T3 Code Pi $TAG" --notes-file "$notes_file"
