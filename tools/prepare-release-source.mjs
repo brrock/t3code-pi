@@ -64,6 +64,11 @@ await replace(
   '"productName": "T3 Code (Alpha)"',
   `"productName": "${desktopProductName}"`,
 );
+await replace(
+  join(source, "apps/web/index.html"),
+  "<title>T3 Code (Alpha)</title>",
+  `<title>${desktopProductName}</title>`,
+);
 
 await replace(
   join(source, "apps/desktop/vite.config.ts"),
