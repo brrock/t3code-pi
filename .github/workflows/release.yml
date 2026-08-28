@@ -123,10 +123,6 @@ jobs:
             platform: mac
             target: dmg
             arch: arm64
-          - runner: macos-15-intel
-            platform: mac
-            target: dmg
-            arch: x64
           - runner: ubuntu-24.04
             platform: linux
             target: AppImage
