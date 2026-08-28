@@ -21,8 +21,9 @@ export function missingReleases(releases, channelState) {
 }
 
 export function maintenanceCandidates(releases, channelState, latestOnly = false) {
-  const missing = missingReleases(releases, channelState);
-  return latestOnly ? missing.slice(-1) : missing;
+  // Latest-only maintenance intentionally revisits the newest immutable release
+  // even when it has a deferred/conflict manifest, so a user can retry it.
+  return latestOnly ? releases.slice(-1) : missingReleases(releases, channelState);
 }
 
 export function run(command, args, cwd) {

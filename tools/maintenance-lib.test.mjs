@@ -36,9 +36,13 @@ test("uses the immutable release tag rather than a moving target branch", () => 
   assert.equal(releaseTarget({ tag_name: "v0.0.0-alpha.3", target_commitish: "main" }), "v0.0.0-alpha.3");
 });
 
-test("limits maintenance to the newest missing release when requested", () => {
+test("selects the latest upstream release even when its manifest already exists", () => {
   const channel = channelReleases(releases, true);
   assert.deepEqual(maintenanceCandidates(channel, { releases: {} }, true).map((release) => release.tag_name), ["v0.0.2-nightly.2"]);
+  assert.deepEqual(
+    maintenanceCandidates(channel, { releases: { "v0.0.2-nightly.2": { status: "deferred" } } }, true).map((release) => release.tag_name),
+    ["v0.0.2-nightly.2"],
+  );
   assert.deepEqual(maintenanceCandidates(channel, { releases: {} }, false).map((release) => release.tag_name), ["v0.0.2-nightly.1", "v0.0.2-nightly.2"]);
 });
 
