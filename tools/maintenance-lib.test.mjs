@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   channelReleases, copyPatchSeries, latestSuccessfulSource, loadJson, maintenanceCandidates, manifest,
-  missingReleases, record, recordedChannel, releaseTarget, safeReleaseName, saveJson
+  missingReleases, record, recordedChannel, releaseTarget, releaseVersionMatches, safeReleaseName, saveJson
 } from "./maintenance-lib.mjs";
 
 const releases = [
@@ -34,6 +34,13 @@ test("channels GitHub Releases by prerelease status and published order", () => 
 
 test("uses the immutable release tag rather than a moving target branch", () => {
   assert.equal(releaseTarget({ tag_name: "v0.0.0-alpha.3", target_commitish: "main" }), "v0.0.0-alpha.3");
+});
+
+test("allows a numeric Pi rebuild revision for an exact upstream version", () => {
+  assert.equal(releaseVersionMatches("v0.0.36-nightly.20260828.1208", "0.0.36-nightly.20260828.1208"), true);
+  assert.equal(releaseVersionMatches("v0.0.36-nightly.20260828.1208", "0.0.36-nightly.20260828.1208-pi.1"), true);
+  assert.equal(releaseVersionMatches("v0.0.36-nightly.20260828.1208", "0.0.36-nightly.20260828.1208-pi.one"), false);
+  assert.equal(releaseVersionMatches("v0.0.36-nightly.20260828.1208", "0.0.36-nightly.20260828.1209-pi.1"), false);
 });
 
 test("selects the latest upstream release even when its manifest already exists", () => {

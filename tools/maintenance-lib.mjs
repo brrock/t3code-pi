@@ -78,6 +78,12 @@ export function releaseTarget(release) {
   return release.tag_name;
 }
 
+export function releaseVersionMatches(upstreamTag, version) {
+  const upstreamVersion = upstreamTag.replace(/^v/, "");
+  const candidate = version.replace(/^v/, "");
+  return candidate === upstreamVersion || new RegExp(`^${upstreamVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-pi\\.[0-9]+$`).test(candidate);
+}
+
 export function manifest({ channel, release, source, status, reason, patches, requiredCommit }) {
   return {
     schemaVersion: 1, channel, upstream: "pingdotgg/t3code", tag: release.tag_name,
