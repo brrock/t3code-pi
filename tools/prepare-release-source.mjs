@@ -7,8 +7,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
-const [sourceArgument] = process.argv.slice(2);
-if (!sourceArgument) throw new Error("Usage: node tools/prepare-release-source.mjs <patched-source-directory>");
+const [sourceArgument, channel] = process.argv.slice(2);
+if (!sourceArgument || !["stable", "nightly"].includes(channel)) {
+  throw new Error("Usage: node tools/prepare-release-source.mjs <patched-source-directory> <stable|nightly>");
+}
 const root = resolve(import.meta.dirname, "..");
 const source = resolve(sourceArgument);
 const config = JSON.parse(await readFile(join(root, "release.config.json"), "utf8"));
@@ -54,10 +56,13 @@ await replace(
   'const DESKTOP_APP_ID = "com.t3tools.t3code";',
   `const DESKTOP_APP_ID = "${config.desktopAppId}";`,
 );
+const desktopProductName = channel === "nightly"
+  ? `${config.desktopProductName} Nightly`
+  : config.desktopProductName;
 await replace(
   join(source, "apps/desktop/package.json"),
   '"productName": "T3 Code (Alpha)"',
-  `"productName": "${config.desktopProductName}"`,
+  `"productName": "${desktopProductName}"`,
 );
 
 await replace(
