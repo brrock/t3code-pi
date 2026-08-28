@@ -1,0 +1,103 @@
+From 5aa09aa330700d2abb0e5b22fe81e4e7643116f8 Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 16:21:50 +0100
+Subject: [PATCH] fix(web): simplify Pi composer model labels
+
+---
+ .../src/components/chat/ProviderModelPicker.tsx   | 15 ++++++---------
+ .../src/components/chat/providerIconUtils.test.ts | 13 ++++++++++++-
+ apps/web/src/components/chat/providerIconUtils.ts | 12 ++++++++++++
+ 3 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
+index 5566160bc..167649da7 100644
+--- a/apps/web/src/components/chat/ProviderModelPicker.tsx
++++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
+@@ -11,11 +11,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { cn } from "~/lib/utils";
+ import { ModelPickerContent } from "./ModelPickerContent";
+ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+-import {
+-  ModelEsque,
+-  getTriggerDisplayModelLabel,
+-  getTriggerDisplayModelName,
+-} from "./providerIconUtils";
++import { getComposerModelPresentation, type ModelEsque } from "./providerIconUtils";
+ import { shouldShowInstanceBadge, type ProviderInstanceEntry } from "../../providerInstances";
+ import { ComposerControl, ComposerControlChevron } from "./ComposerControl";
+ 
+@@ -65,8 +61,9 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+   const selectedModel =
+     selectedInstanceOptions.find((option) => option.slug === props.model) ??
+     selectedInstanceOptions[0];
+-  const triggerTitle = selectedModel ? getTriggerDisplayModelName(selectedModel) : props.model;
+-  const triggerLabel = selectedModel ? getTriggerDisplayModelLabel(selectedModel) : props.model;
++  const triggerPresentation = selectedModel
++    ? getComposerModelPresentation(selectedModel)
++    : { label: props.model, tooltip: props.model };
+   const showInstanceBadge =
+     activeEntry !== null && shouldShowInstanceBadge(activeEntry, props.instanceEntries);
+ 
+@@ -175,9 +172,9 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+           ) : null}
+           <Tooltip>
+             <TooltipTrigger render={<span className="min-w-0 flex-1 overflow-hidden truncate" />}>
+-              {triggerTitle}
++              {triggerPresentation.label}
+             </TooltipTrigger>
+-            <TooltipPopup side="top">{triggerLabel}</TooltipPopup>
++            <TooltipPopup side="top">{triggerPresentation.tooltip}</TooltipPopup>
+           </Tooltip>
+         </span>
+         <span aria-hidden="true" className="flex items-center">
+diff --git a/apps/web/src/components/chat/providerIconUtils.test.ts b/apps/web/src/components/chat/providerIconUtils.test.ts
+index f62a06e07..a2371ee10 100644
+--- a/apps/web/src/components/chat/providerIconUtils.test.ts
++++ b/apps/web/src/components/chat/providerIconUtils.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { getDisplayModelName, getTriggerDisplayModelLabel } from "./providerIconUtils";
++import {
++  getComposerModelPresentation,
++  getDisplayModelName,
++  getTriggerDisplayModelLabel,
++} from "./providerIconUtils";
+ 
+ describe("Pi provider model labels", () => {
+   const model = {
+@@ -15,4 +19,11 @@ describe("Pi provider model labels", () => {
+   it("omits the provider name in composer triggers", () => {
+     expect(getTriggerDisplayModelLabel(model)).toBe("GPT-5.5");
+   });
++
++  it("keeps the Pi sub-provider out of composer chrome but available on hover", () => {
++    expect(getComposerModelPresentation(model)).toEqual({
++      label: "GPT-5.5",
++      tooltip: "[Codex] GPT-5.5",
++    });
++  });
+ });
+diff --git a/apps/web/src/components/chat/providerIconUtils.ts b/apps/web/src/components/chat/providerIconUtils.ts
+index 209a5e1f0..2f9650315 100644
+--- a/apps/web/src/components/chat/providerIconUtils.ts
++++ b/apps/web/src/components/chat/providerIconUtils.ts
+@@ -64,3 +64,15 @@ export function getTriggerDisplayModelLabel(model: ModelEsque): string {
+   const qualified = /^\[([^\]]+)\]\s+(.+)$/u.exec(displayName);
+   return qualified?.[2] ?? displayName;
+ }
++
++export function getComposerModelPresentation(model: ModelEsque): {
++  readonly label: string;
++  readonly tooltip: string;
++} {
++  return {
++    label: getTriggerDisplayModelLabel(model),
++    // Pi uses a provider-qualified picker name to disambiguate identical model
++    // slugs. Keep that detail available without making composer chrome noisy.
++    tooltip: getTriggerDisplayModelName(model),
++  };
++}
+-- 
+2.47.3
+
