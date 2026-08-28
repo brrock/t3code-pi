@@ -24,6 +24,8 @@ An agent must treat that as a repair loop, not as a terminal maintenance result:
 
 The direct base supports Pi RPC sessions, prompts, streamed text/reasoning, native tool lifecycle rows, stop/abort, provider/model discovery, and provider-labelled model names such as `[anthropic] Claude Sonnet`. Continue porting PR #7211 behavior at the provider boundary as the current-tree adapter evolves, retaining focused tests for each behavior.
 
+On **every** stable or nightly maintenance run, inspect the exact upstream release diff and current provider implementations (especially Codex, Claude, Cursor, Grok, and OpenCode) for user-visible provider capabilities Pi does not yet support: new tools, permissions/input flows, attachments, session controls, model/thinking controls, MCP/browser support, subagents, text generation, lifecycle/status projection, and Settings/command-palette/keybinding entry points. Decide whether each applicable capability can be mapped through Pi RPC/extensions. Port the small, defensible ones with focused tests; record an explicit blocker when Pi cannot express it. Do not silently carry patches forward while leaving newly added provider behavior unreviewed.
+
 ## Releases and updater assets
 
 After the agent has committed and pushed a verified applied patch directory, dispatch `.github/workflows/release.yml` with its channel, upstream tag, and an exact semver version. It builds the patched source, applies the fork identity from `release.config.json`, publishes the `@brrock/t3-pi` npm CLI under `latest` or `nightly`, builds unsigned Electron installers/updater manifests, then creates the matching GitHub release.
