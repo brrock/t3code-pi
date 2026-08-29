@@ -1,0 +1,47 @@
+From a000eb7b469eefd90d295f7e7648c4e77339bb0d Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 17:06:00 +0100
+Subject: [PATCH] fix(desktop): keep Pi nightly rebuilds on nightly feed
+
+---
+ apps/desktop/src/updates/updateChannels.test.ts | 13 +++++++++++++
+ apps/desktop/src/updates/updateChannels.ts      |  4 +++-
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/updates/updateChannels.test.ts
+
+diff --git a/apps/desktop/src/updates/updateChannels.test.ts b/apps/desktop/src/updates/updateChannels.test.ts
+new file mode 100644
+index 000000000..b0ce483a1
+--- /dev/null
++++ b/apps/desktop/src/updates/updateChannels.test.ts
+@@ -0,0 +1,13 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { resolveDefaultDesktopUpdateChannel } from "./updateChannels.ts";
++
++describe("desktop update channels", () => {
++  it("keeps immutable nightly Pi rebuilds on the nightly channel", () => {
++    expect(resolveDefaultDesktopUpdateChannel("0.0.36-nightly.20260828.1210-pi.1")).toBe("nightly");
++  });
++
++  it("uses latest for a stable version", () => {
++    expect(resolveDefaultDesktopUpdateChannel("0.0.36")).toBe("latest");
++  });
++});
+diff --git a/apps/desktop/src/updates/updateChannels.ts b/apps/desktop/src/updates/updateChannels.ts
+index 731910e44..18d596e89 100644
+--- a/apps/desktop/src/updates/updateChannels.ts
++++ b/apps/desktop/src/updates/updateChannels.ts
+@@ -1,6 +1,8 @@
+ import type { DesktopUpdateChannel } from "@t3tools/contracts";
+ 
+-const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
++// Fork rebuilds preserve the upstream nightly identity with an immutable
++// `-pi.N` suffix. They must continue using the nightly updater feed.
++const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+(?:-pi\.\d+)?$/;
+ 
+ export function isNightlyDesktopVersion(version: string): boolean {
+   return NIGHTLY_VERSION_PATTERN.test(version);
+-- 
+2.47.3
+
