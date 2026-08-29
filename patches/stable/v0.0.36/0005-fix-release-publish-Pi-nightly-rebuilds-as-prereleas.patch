@@ -1,0 +1,41 @@
+From fb4a8fc316201ac5354ad0fa4aa360f7dcc24712 Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 17:26:29 +0100
+Subject: [PATCH 5/5] fix(release): publish Pi nightly rebuilds as prereleases
+
+---
+ scripts/build-desktop-artifact.test.ts | 4 ++++
+ scripts/build-desktop-artifact.ts      | 2 +-
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/build-desktop-artifact.test.ts b/scripts/build-desktop-artifact.test.ts
+index c12c73bfc..312427ba5 100644
+--- a/scripts/build-desktop-artifact.test.ts
++++ b/scripts/build-desktop-artifact.test.ts
+@@ -249,6 +249,10 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
+     assert.equal(resolveDesktopUpdateChannel("0.0.17"), "latest");
+   });
+ 
++  it("keeps immutable Pi rebuilds on the nightly updater channel", () => {
++    assert.equal(resolveDesktopUpdateChannel("0.0.17-nightly.20260413.42-pi.2"), "nightly");
++  });
++
+   it("switches desktop packaging product names to nightly for nightly builds", () => {
+     assert.equal(resolveDesktopProductName("0.0.17"), "T3 Code (Alpha)");
+     assert.equal(resolveDesktopProductName("0.0.17-nightly.20260413.42"), "T3 Code (Nightly)");
+diff --git a/scripts/build-desktop-artifact.ts b/scripts/build-desktop-artifact.ts
+index 8709be2a2..76672a611 100644
+--- a/scripts/build-desktop-artifact.ts
++++ b/scripts/build-desktop-artifact.ts
+@@ -2072,7 +2072,7 @@ export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig"
+ });
+ 
+ export function resolveDesktopUpdateChannel(version: string): "latest" | "nightly" {
+-  return /-nightly\.\d{8}\.\d+$/.test(version) ? "nightly" : "latest";
++  return /-nightly\.\d{8}\.\d+(?:-pi\.\d+)?$/.test(version) ? "nightly" : "latest";
+ }
+ 
+ function isDesktopPreviewVersion(version: string): boolean {
+-- 
+2.47.3
+

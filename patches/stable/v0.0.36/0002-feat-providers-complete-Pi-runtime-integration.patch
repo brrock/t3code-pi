@@ -1,7 +1,7 @@
 From 0efad6043cd0c4939e5f6d28c08a7f896f8b7fb6 Mon Sep 17 00:00:00 2001
 From: Benjy <123623302+brrock@users.noreply.github.com>
 Date: Thu, 27 Aug 2026 19:37:45 +0100
-Subject: [PATCH] feat(providers): complete Pi runtime integration
+Subject: [PATCH 2/5] feat(providers): complete Pi runtime integration
 
 ---
  apps/mobile/src/components/ProviderIcon.tsx   |  16 +-

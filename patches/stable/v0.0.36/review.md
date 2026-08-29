@@ -1,7 +1,7 @@
 # Pi review — `v0.0.36`
 
 - **Immutable target:** `v0.0.36` (`8fc7f22941969d7a2c06929dc29aa86ae1b02f33`)
-- **Manifest:** `applied`; the two direct Pi runtime patches apply cleanly.
+- **Manifest:** `applied`; the five-patch series retains the direct Pi provider port plus the Composer and desktop-updater compatibility fixes carried from nightly.
 - **Provider changes reviewed:** the exact range `v0.0.35..v0.0.36` adds OpenCode child-agent approval/stop/model-catalog handling, Codex sub-agent model visibility and account-plan recognition, Grok skills/plan/usage/turn-reliability work, provider-settings editor changes, and generalized attachments (including PDF/ZIP and other files up to 50 MB).
 - **Mapped by Pi:** Pi already projects prompt/input requests, tool lifecycle, stop/abort, provider/model discovery, provider-qualified model labels, MCP browser/automation lifecycle, streamed text/reasoning, and text generation through the Pi RPC adapter. The regenerated series retains focused Pi adapter, RPC-injection, thinking-capability, and provider tests for those mappings.
 - **Ported compatibility repair:** upstream changed the composer picker to retain unavailable-model state. The Pi composer-label patch was rebased so it keeps that upstream state while continuing to render a concise model-only label with the provider-qualified Pi name on hover. The focused `providerIconUtils` expectation remains in the series.

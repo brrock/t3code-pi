@@ -1,7 +1,7 @@
 From d07c9ee21f09b6400a6f88f44770940952f03b31 Mon Sep 17 00:00:00 2001
 From: Benjy <123623302+brrock@users.noreply.github.com>
 Date: Thu, 27 Aug 2026 15:04:04 +0100
-Subject: [PATCH] feat(providers): add Pi coding agent
+Subject: [PATCH 1/5] feat(providers): add Pi coding agent
 
 ---
  apps/server/src/provider/Drivers/PiDriver.ts  | 194 ++++++++
