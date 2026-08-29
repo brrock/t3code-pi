@@ -51,6 +51,22 @@ runtime = runtime
   .replaceAll('`t3@${input.version}`', `\`${config.npmPackage}@\${input.version}\``);
 await writeFile(runtimePath, runtime);
 
+// service-launcher.mjs is bundled separately and kept at a stable path by the
+// service installer. Its own runtime lookup must use the same fork package as
+// pinnedRuntime.ts; otherwise the service installs @brrock/t3-pi but the
+// launcher looks for node_modules/t3 and crash-loops at boot.
+const serviceLauncherPath = join(source, "apps/server/src/serviceLauncher.ts");
+let serviceLauncher = await readFile(serviceLauncherPath, "utf8");
+const launcherRuntimeMarker = '"node_modules", "t3", "dist", "bin.mjs"';
+if (!serviceLauncher.includes(launcherRuntimeMarker)) {
+  throw new Error("Service launcher runtime implementation changed; update prepare-release-source.mjs");
+}
+serviceLauncher = serviceLauncher.replaceAll(
+  launcherRuntimeMarker,
+  `"node_modules", ${packagePathSegments}, "dist", "bin.mjs"`,
+);
+await writeFile(serviceLauncherPath, serviceLauncher);
+
 await replace(
   join(source, "scripts/build-desktop-artifact.ts"),
   'const DESKTOP_APP_ID = "com.t3tools.t3code";',
