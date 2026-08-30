@@ -127,6 +127,10 @@ jobs:
             platform: linux
             target: AppImage
             arch: x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            target: AppImage
+            arch: arm64
           - runner: windows-2025
             platform: win
             target: nsis
