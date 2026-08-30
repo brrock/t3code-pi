@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "channel": "nightly",
+  "upstream": "pingdotgg/t3code",
+  "tag": "v0.0.37-nightly.20260829.1224",
+  "targetCommitish": "v0.0.37-nightly.20260829.1224",
+  "publishedAt": "2026-08-29T21:50:27Z",
+  "source": "patches/nightly/v0.0.37-nightly.20260829.1219",
+  "requiredCommit": "a6797b3b97dca6b6941574ff062d069c45c89b9a",
+  "status": "applied",
+  "reason": null,
+  "patches": [
+    "0001-feat-providers-add-Pi-coding-agent.patch",
+    "0002-feat-providers-complete-Pi-runtime-integration.patch",
+    "0003-fix-web-simplify-Pi-composer-model-labels.patch",
+    "0004-fix-desktop-keep-Pi-nightly-rebuilds-on-nightly-feed.patch",
+    "0005-fix-release-publish-Pi-nightly-rebuilds-as-prereleas.patch"
+  ]
+}
