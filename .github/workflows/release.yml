@@ -52,7 +52,10 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           version="${VERSION#v}"
-          echo "release_tag=pi-v$version" >> "$GITHUB_OUTPUT"
+          # electron-updater parses GitHub's Atom release tags as semver.  A
+          # `pi-v…` prefix is not valid semver and makes prerelease discovery
+          # report “No published versions on GitHub”.
+          echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
           echo "npm_tag=$([[ "$CHANNEL" == nightly ]] && echo nightly || echo latest)" >> "$GITHUB_OUTPUT"
       - name: Create patched, fork-branded source tree
         env:
