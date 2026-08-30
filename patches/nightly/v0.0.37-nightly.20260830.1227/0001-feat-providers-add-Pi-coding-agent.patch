@@ -1,0 +1,1916 @@
+From 09220d8a7c0a7d68d688140fbfe0af9071935f7d Mon Sep 17 00:00:00 2001
+From: Benjy <123623302+brrock@users.noreply.github.com>
+Date: Thu, 27 Aug 2026 15:04:04 +0100
+Subject: [PATCH 1/6] feat(providers): add Pi coding agent
+
+---
+ apps/server/src/provider/Drivers/PiDriver.ts  | 194 ++++++++
+ apps/server/src/provider/Layers/PiAdapter.ts  | 366 ++++++++++++++
+ .../src/provider/Layers/PiProvider.test.ts    |  80 ++++
+ apps/server/src/provider/Layers/PiProvider.ts | 450 ++++++++++++++++++
+ .../Layers/piThinkingCapabilities.test.ts     |  30 ++
+ .../provider/Layers/piThinkingCapabilities.ts | 115 +++++
+ apps/server/src/provider/PiCommands.ts        |  71 +++
+ apps/server/src/provider/PiRpc.ts             | 396 +++++++++++++++
+ apps/server/src/provider/builtInDrivers.ts    |   5 +-
+ .../components/settings/providerDriverMeta.ts |  18 +-
+ packages/contracts/src/settings.ts            |  40 ++
+ 11 files changed, 1763 insertions(+), 2 deletions(-)
+ create mode 100644 apps/server/src/provider/Drivers/PiDriver.ts
+ create mode 100644 apps/server/src/provider/Layers/PiAdapter.ts
+ create mode 100644 apps/server/src/provider/Layers/PiProvider.test.ts
+ create mode 100644 apps/server/src/provider/Layers/PiProvider.ts
+ create mode 100644 apps/server/src/provider/Layers/piThinkingCapabilities.test.ts
+ create mode 100644 apps/server/src/provider/Layers/piThinkingCapabilities.ts
+ create mode 100644 apps/server/src/provider/PiCommands.ts
+ create mode 100644 apps/server/src/provider/PiRpc.ts
+
+diff --git a/apps/server/src/provider/Drivers/PiDriver.ts b/apps/server/src/provider/Drivers/PiDriver.ts
+new file mode 100644
+index 000000000..f69a940e4
+--- /dev/null
++++ b/apps/server/src/provider/Drivers/PiDriver.ts
+@@ -0,0 +1,194 @@
++import {
++  PiSettings,
++  ProviderDriverKind,
++  TextGenerationError,
++  type ServerProvider,
++} from "@t3tools/contracts";
++import * as Crypto from "effect/Crypto";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import { HttpClient } from "effect/unstable/http";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
++import { ServerConfig } from "../../config.ts";
++import { ServerSettingsService } from "../../serverSettings.ts";
++import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
++import { ProviderDriverError } from "../Errors.ts";
++import { makePiAdapter } from "../Layers/PiAdapter.ts";
++import {
++  buildInitialPiProviderSnapshot,
++  checkPiProviderStatus,
++  enrichPiSnapshot,
++} from "../Layers/PiProvider.ts";
++import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
++import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
++import {
++  defaultProviderContinuationIdentity,
++  type ProviderDriver,
++  type ProviderInstance,
++} from "../ProviderDriver.ts";
++import type { ServerProviderDraft } from "../providerSnapshot.ts";
++import {
++  makePackageManagedProviderMaintenanceResolver,
++  resolveProviderMaintenanceCapabilitiesEffect,
++} from "../providerMaintenance.ts";
++import {
++  haveProviderSnapshotSettingsChanged,
++  makeProviderSnapshotSettingsSource,
++  type ProviderSnapshotSettings,
++} from "../providerUpdateSettings.ts";
++
++const DRIVER_KIND = ProviderDriverKind.make("pi");
++const decodePiSettings = Schema.decodeSync(PiSettings);
++const UPDATE = makePackageManagedProviderMaintenanceResolver({
++  provider: DRIVER_KIND,
++  npmPackageName: "@earendil-works/pi-coding-agent",
++  homebrewFormula: null,
++  nativeUpdate: null,
++});
++
++export type PiDriverEnv =
++  | BackgroundPolicy.BackgroundPolicy
++  | ChildProcessSpawner.ChildProcessSpawner
++  | Crypto.Crypto
++  | FileSystem.FileSystem
++  | HttpClient.HttpClient
++  | Path.Path
++  | ServerConfig
++  | ServerSettingsService;
++
++const stamp =
++  (input: {
++    readonly instanceId: ProviderInstance["instanceId"];
++    readonly displayName: string | undefined;
++    readonly accentColor: string | undefined;
++    readonly continuationGroupKey: string;
++  }) =>
++  (snapshot: ServerProviderDraft): ServerProvider => ({
++    ...snapshot,
++    instanceId: input.instanceId,
++    driver: DRIVER_KIND,
++    ...(input.displayName ? { displayName: input.displayName } : {}),
++    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
++    continuation: { groupKey: input.continuationGroupKey },
++  });
++
++const unsupportedTextGeneration: TextGeneration.TextGeneration["Service"] = {
++  generateCommitMessage: () =>
++    Effect.fail(
++      new TextGenerationError({
++        operation: "generateCommitMessage",
++        detail: "Pi text generation is not available yet.",
++      }),
++    ),
++  generatePrContent: () =>
++    Effect.fail(
++      new TextGenerationError({
++        operation: "generatePrContent",
++        detail: "Pi text generation is not available yet.",
++      }),
++    ),
++  generateBranchName: () =>
++    Effect.fail(
++      new TextGenerationError({
++        operation: "generateBranchName",
++        detail: "Pi text generation is not available yet.",
++      }),
++    ),
++  generateThreadTitle: () =>
++    Effect.fail(
++      new TextGenerationError({
++        operation: "generateThreadTitle",
++        detail: "Pi text generation is not available yet.",
++      }),
++    ),
++};
++
++export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
++  driverKind: DRIVER_KIND,
++  metadata: { displayName: "Pi", supportsMultipleInstances: true },
++  configSchema: PiSettings,
++  defaultConfig: () => decodePiSettings({}),
++  create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
++    Effect.gen(function* () {
++      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++      const httpClient = yield* HttpClient.HttpClient;
++      const { cwd } = yield* ServerConfig;
++      const settings = yield* ServerSettingsService;
++      const processEnv = mergeProviderInstanceEnvironment(environment);
++      const continuationIdentity = defaultProviderContinuationIdentity({
++        driverKind: DRIVER_KIND,
++        instanceId,
++      });
++      const effectiveConfig = { ...config, enabled } satisfies PiSettings;
++      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
++        binaryPath: effectiveConfig.binaryPath,
++        env: processEnv,
++      });
++      const adapter = yield* makePiAdapter(effectiveConfig, {
++        instanceId,
++        environment: processEnv,
++      });
++      const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, settings);
++      const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<PiSettings>>({
++        maintenanceCapabilities,
++        getSettings: snapshotSettings.getSettings,
++        streamSettings: snapshotSettings.streamSettings,
++        haveSettingsChanged: haveProviderSnapshotSettingsChanged,
++        initialSnapshot: (source) =>
++          buildInitialPiProviderSnapshot(source.provider).pipe(
++            Effect.map(
++              stamp({
++                instanceId,
++                displayName,
++                accentColor,
++                continuationGroupKey: continuationIdentity.continuationKey,
++              }),
++            ),
++          ),
++        checkProvider: checkPiProviderStatus(effectiveConfig, processEnv, cwd).pipe(
++          Effect.map(
++            stamp({
++              instanceId,
++              displayName,
++              accentColor,
++              continuationGroupKey: continuationIdentity.continuationKey,
++            }),
++          ),
++          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
++        ),
++        enrichSnapshot: ({ settings: source, snapshot: current, publishSnapshot }) =>
++          enrichPiSnapshot({
++            snapshot: current,
++            maintenanceCapabilities,
++            enableProviderUpdateChecks: source.enableProviderUpdateChecks,
++            publishSnapshot,
++            httpClient,
++          }),
++      }).pipe(
++        Effect.mapError(
++          (cause) =>
++            new ProviderDriverError({
++              driver: DRIVER_KIND,
++              instanceId,
++              detail: `Failed to build Pi snapshot: ${String(cause)}`,
++              cause,
++            }),
++        ),
++      );
++      return {
++        instanceId,
++        driverKind: DRIVER_KIND,
++        continuationIdentity,
++        displayName,
++        accentColor,
++        enabled,
++        snapshot,
++        adapter,
++        textGeneration: unsupportedTextGeneration,
++      } satisfies ProviderInstance;
++    }),
++};
+diff --git a/apps/server/src/provider/Layers/PiAdapter.ts b/apps/server/src/provider/Layers/PiAdapter.ts
+new file mode 100644
+index 000000000..3aaa5f38b
+--- /dev/null
++++ b/apps/server/src/provider/Layers/PiAdapter.ts
+@@ -0,0 +1,366 @@
++import {
++  EventId,
++  type PiSettings,
++  ProviderDriverKind,
++  type ProviderInstanceId,
++  type ProviderRuntimeEvent,
++  type ProviderSendTurnInput,
++  type ProviderSession,
++  type ProviderSessionStartInput,
++  ThreadId,
++  TurnId,
++} from "@t3tools/contracts";
++import * as Crypto from "effect/Crypto";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as Exit from "effect/Exit";
++import * as Queue from "effect/Queue";
++import * as Scope from "effect/Scope";
++import * as Stream from "effect/Stream";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import {
++  makePiRpcConnection,
++  piRecordField,
++  piRecordString,
++  type PiRpcConnection,
++} from "../PiRpc.ts";
++import {
++  ProviderAdapterRequestError,
++  ProviderAdapterSessionClosedError,
++  ProviderAdapterSessionNotFoundError,
++  ProviderAdapterValidationError,
++  type ProviderAdapterError,
++} from "../Errors.ts";
++import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
++
++const PROVIDER = ProviderDriverKind.make("pi");
++
++interface PiSessionContext {
++  readonly scope: Scope.Closeable;
++  readonly connection: PiRpcConnection;
++  session: ProviderSession;
++  activeTurnId: TurnId | undefined;
++  assistantItemId: string | undefined;
++}
++
++function piLaunchArgs(settings: PiSettings): ReadonlyArray<string> {
++  // Pi owns its session through this long-lived RPC process. Configuration
++  // flags are intentionally passed through; transport/session flags are not.
++  const extras =
++    settings.launchArgs.trim().length === 0 ? [] : settings.launchArgs.trim().split(/\s+/);
++  if (extras.some((arg) => arg === "--mode" || arg === "--no-session" || arg === "--session")) {
++    throw new Error("Pi launch arguments cannot override T3's RPC session mode.");
++  }
++  return ["--mode", "rpc", ...extras];
++}
++
++export interface PiAdapterOptions {
++  readonly instanceId: ProviderInstanceId;
++  readonly environment: NodeJS.ProcessEnv;
++}
++
++/**
++ * Direct current-orchestrator Pi adapter. It deliberately speaks Pi's public
++ * JSONL RPC protocol instead of importing an in-process Pi SDK, so users keep
++ * their own Pi installation and credentials. Extension dialogs, T3 MCP/browser
++ * injection, and native subagent projection require explicit bridge support.
++ */
++export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
++  settings: PiSettings,
++  options: PiAdapterOptions,
++) {
++  const crypto = yield* Crypto.Crypto;
++  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++  const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
++  const sessions = new Map<ThreadId, PiSessionContext>();
++  const now = () => DateTime.now.pipe(Effect.map(DateTime.formatIso));
++  const eventBase = (threadId: ThreadId, turnId?: TurnId) =>
++    Effect.all({
++      eventId: crypto.randomUUIDv4.pipe(Effect.map(EventId.make)),
++      createdAt: now(),
++    }).pipe(
++      Effect.map(({ eventId, createdAt }) => ({
++        eventId,
++        provider: PROVIDER,
++        providerInstanceId: options.instanceId,
++        threadId,
++        createdAt,
++        ...(turnId === undefined ? {} : { turnId }),
++      })),
++      Effect.mapError(
++        (cause) =>
++          new ProviderAdapterRequestError({
++            provider: PROVIDER,
++            method: "event",
++            detail: String(cause),
++            cause,
++          }),
++      ),
++    );
++  const emit = (event: ProviderRuntimeEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
++
++  const close = (context: PiSessionContext) =>
++    Scope.close(context.scope, Exit.void).pipe(Effect.ignore);
++
++  const requireContext = (
++    threadId: ThreadId,
++  ): Effect.Effect<PiSessionContext, ProviderAdapterSessionNotFoundError> => {
++    const context = sessions.get(threadId);
++    return context === undefined
++      ? Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }))
++      : Effect.succeed(context);
++  };
++
++  const startPump = (context: PiSessionContext) =>
++    Effect.gen(function* () {
++      while (true) {
++        const native = yield* Queue.take(context.connection.events);
++        const turnId = context.activeTurnId;
++        const type = native.type;
++        if (type === "message_update" && turnId !== undefined) {
++          const delta = piRecordField(native, "assistantMessageEvent");
++          const deltaType = piRecordString(delta, "type");
++          const text = piRecordString(delta, "content") ?? piRecordString(delta, "thinking");
++          if (
++            text !== undefined &&
++            (deltaType === "text_delta" || deltaType === "thinking_delta")
++          ) {
++            const itemId = context.assistantItemId ?? `pi-assistant-${turnId}`;
++            if (context.assistantItemId === undefined) {
++              context.assistantItemId = itemId;
++              yield* emit({
++                ...(yield* eventBase(context.session.threadId, turnId)),
++                type: "item.started",
++                itemId: itemId as never,
++                payload: {
++                  itemType: deltaType === "thinking_delta" ? "reasoning" : "assistant_message",
++                },
++              });
++            }
++            yield* emit({
++              ...(yield* eventBase(context.session.threadId, turnId)),
++              type: "content.delta",
++              itemId: itemId as never,
++              payload: {
++                streamKind: deltaType === "thinking_delta" ? "reasoning_text" : "assistant_text",
++                delta: text,
++              },
++            });
++          }
++        } else if (type === "tool_execution_start" && turnId !== undefined) {
++          const itemId = piRecordString(native, "toolCallId");
++          if (itemId !== undefined)
++            yield* emit({
++              ...(yield* eventBase(context.session.threadId, turnId)),
++              type: "item.started",
++              itemId: itemId as never,
++              payload: {
++                itemType: "dynamic_tool_call",
++                title: piRecordString(native, "toolName") ?? "tool",
++                data: native,
++              },
++            });
++        } else if (type === "tool_execution_end" && turnId !== undefined) {
++          const itemId = piRecordString(native, "toolCallId");
++          if (itemId !== undefined)
++            yield* emit({
++              ...(yield* eventBase(context.session.threadId, turnId)),
++              type: "item.completed",
++              itemId: itemId as never,
++              payload: {
++                itemType: "dynamic_tool_call",
++                status: native.isError === true ? "failed" : "completed",
++                title: piRecordString(native, "toolName") ?? "tool",
++                data: native,
++              },
++            });
++        } else if (type === "agent_settled" && turnId !== undefined) {
++          const itemId = context.assistantItemId;
++          context.activeTurnId = undefined;
++          context.assistantItemId = undefined;
++          if (itemId !== undefined)
++            yield* emit({
++              ...(yield* eventBase(context.session.threadId, turnId)),
++              type: "item.completed",
++              itemId: itemId as never,
++              payload: { itemType: "assistant_message", status: "completed" },
++            });
++          yield* emit({
++            ...(yield* eventBase(context.session.threadId, turnId)),
++            type: "turn.completed",
++            payload: { state: "completed" },
++          });
++        }
++      }
++    }).pipe(
++      Effect.catch(() => Effect.void),
++      Effect.forkIn(context.scope),
++    );
++
++  const startSession: ProviderAdapterShape<ProviderAdapterError>["startSession"] = Effect.fn(
++    "PiAdapter.startSession",
++  )(function* (input: ProviderSessionStartInput) {
++    const old = sessions.get(input.threadId);
++    if (old) yield* close(old);
++    const scope = yield* Scope.make();
++    const started = yield* Effect.exit(
++      makePiRpcConnection({
++        command: settings.binaryPath || "pi",
++        args: piLaunchArgs(settings),
++        cwd: input.cwd,
++        env: options.environment,
++      }).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
++        Effect.provideService(Scope.Scope, scope),
++        Effect.mapError(
++          (cause) =>
++            new ProviderAdapterSessionClosedError({
++              provider: PROVIDER,
++              threadId: input.threadId,
++              cause,
++            }),
++        ),
++      ),
++    );
++    if (Exit.isFailure(started)) {
++      yield* Scope.close(scope, Exit.void).pipe(Effect.ignore);
++      return yield* new ProviderAdapterSessionClosedError({
++        provider: PROVIDER,
++        threadId: input.threadId,
++        cause: started.cause,
++      });
++    }
++    const createdAt = yield* now();
++    const session: ProviderSession = {
++      provider: PROVIDER,
++      providerInstanceId: options.instanceId,
++      status: "ready",
++      runtimeMode: input.runtimeMode,
++      ...(input.cwd ? { cwd: input.cwd } : {}),
++      ...(input.modelSelection ? { model: input.modelSelection.model } : {}),
++      threadId: input.threadId,
++      createdAt,
++      updatedAt: createdAt,
++    };
++    const context: PiSessionContext = {
++      scope,
++      connection: started.value,
++      session,
++      activeTurnId: undefined,
++      assistantItemId: undefined,
++    };
++    sessions.set(input.threadId, context);
++    yield* startPump(context);
++    yield* emit({
++      ...(yield* eventBase(input.threadId)),
++      type: "session.started",
++      payload: { message: "Pi RPC session started" },
++    });
++    yield* emit({ ...(yield* eventBase(input.threadId)), type: "thread.started", payload: {} });
++    return session;
++  });
++
++  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = Effect.fn(
++    "PiAdapter.sendTurn",
++  )(function* (input: ProviderSendTurnInput) {
++    const context = yield* requireContext(input.threadId);
++    const text = input.input?.trim();
++    if (!text)
++      return yield* new ProviderAdapterValidationError({
++        provider: PROVIDER,
++        operation: "sendTurn",
++        issue: "Pi needs prompt text.",
++      });
++    if (input.attachments?.length)
++      return yield* new ProviderAdapterValidationError({
++        provider: PROVIDER,
++        operation: "sendTurn",
++        issue: "Pi attachments are not supported by this adapter yet.",
++      });
++    const turnId =
++      context.activeTurnId ??
++      TurnId.make(
++        `pi-turn-${yield* crypto.randomUUIDv4.pipe(Effect.mapError((cause) => new ProviderAdapterRequestError({ provider: PROVIDER, method: "crypto/randomUUIDv4", detail: String(cause), cause })))}`,
++      );
++    context.activeTurnId = turnId;
++    yield* context.connection.send({ type: "prompt", message: text }).pipe(
++      Effect.mapError(
++        (cause) =>
++          new ProviderAdapterRequestError({
++            provider: PROVIDER,
++            method: "prompt",
++            detail: cause.message,
++            cause,
++          }),
++      ),
++    );
++    yield* emit({
++      ...(yield* eventBase(input.threadId, turnId)),
++      type: "turn.started",
++      payload: input.modelSelection ? { model: input.modelSelection.model } : {},
++    });
++    return { threadId: input.threadId, turnId };
++  });
++
++  return {
++    provider: PROVIDER,
++    capabilities: { sessionModelSwitch: "unsupported" },
++    startSession,
++    sendTurn,
++    interruptTurn: (threadId) =>
++      requireContext(threadId).pipe(
++        Effect.flatMap((context) => context.connection.send({ type: "abort" })),
++        Effect.mapError((cause) =>
++          cause._tag === "ProviderAdapterSessionNotFoundError"
++            ? cause
++            : new ProviderAdapterRequestError({
++                provider: PROVIDER,
++                method: "abort",
++                detail: cause.message,
++                cause,
++              }),
++        ),
++        Effect.asVoid,
++      ),
++    respondToRequest: (threadId) =>
++      Effect.fail(
++        new ProviderAdapterValidationError({
++          provider: PROVIDER,
++          operation: "respondToRequest",
++          issue: `Pi extension prompts are not yet supported for ${threadId}.`,
++        }),
++      ),
++    respondToUserInput: (threadId) =>
++      Effect.fail(
++        new ProviderAdapterValidationError({
++          provider: PROVIDER,
++          operation: "respondToUserInput",
++          issue: `Pi extension prompts are not yet supported for ${threadId}.`,
++        }),
++      ),
++    stopSession: (threadId) =>
++      requireContext(threadId).pipe(
++        Effect.tap(close),
++        Effect.tap(() => Effect.sync(() => sessions.delete(threadId))),
++        Effect.asVoid,
++      ),
++    listSessions: () => Effect.sync(() => [...sessions.values()].map((context) => context.session)),
++    hasSession: (threadId) => Effect.sync(() => sessions.has(threadId)),
++    readThread: (threadId) =>
++      requireContext(threadId).pipe(Effect.map(() => ({ threadId, turns: [] }))),
++    rollbackThread: (threadId) =>
++      Effect.fail(
++        new ProviderAdapterValidationError({
++          provider: PROVIDER,
++          operation: "rollbackThread",
++          issue: `Pi rollback is not yet supported for ${threadId}.`,
++        }),
++      ),
++    stopAll: () =>
++      Effect.forEach([...sessions.values()], (context) => close(context), { discard: true }).pipe(
++        Effect.tap(() => Effect.sync(() => sessions.clear())),
++      ),
++    streamEvents: Stream.fromQueue(events),
++  } satisfies ProviderAdapterShape<ProviderAdapterError>;
++});
+diff --git a/apps/server/src/provider/Layers/PiProvider.test.ts b/apps/server/src/provider/Layers/PiProvider.test.ts
+new file mode 100644
+index 000000000..4f7a6f6ad
+--- /dev/null
++++ b/apps/server/src/provider/Layers/PiProvider.test.ts
+@@ -0,0 +1,80 @@
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, describe, it } from "@effect/vitest";
++import * as Effect from "effect/Effect";
++import * as Sink from "effect/Sink";
++import * as Stream from "effect/Stream";
++import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
++
++import { checkPiProviderStatus, MINIMUM_PI_VERSION } from "./PiProvider.ts";
++
++const encoder = new TextEncoder();
++
++function processHandle(input: {
++  readonly stdout?: string;
++  readonly stderr?: string;
++  readonly exitCode?: number;
++}) {
++  const bytes = (value: string | undefined) =>
++    value === undefined || value.length === 0
++      ? Stream.empty
++      : Stream.succeed(encoder.encode(value));
++  return ChildProcessSpawner.makeHandle({
++    pid: ChildProcessSpawner.ProcessId(900_000_001),
++    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(input.exitCode ?? 0)),
++    isRunning: Effect.succeed(false),
++    kill: () => Effect.void,
++    unref: Effect.succeed(Effect.void),
++    stdin: Sink.drain,
++    stdout: bytes(input.stdout),
++    stderr: bytes(input.stderr),
++    all: Stream.empty,
++    getInputFd: () => Sink.drain,
++    getOutputFd: () => Stream.empty,
++  });
++}
++
++function piProbeSpawner(version: string) {
++  return ChildProcessSpawner.make((command) => {
++    const args = ChildProcess.isStandardCommand(command) ? command.args : [];
++    return Effect.succeed(
++      args.includes("--version")
++        ? processHandle({ stdout: `pi ${version}\n` })
++        : processHandle({ stderr: "RPC startup failed", exitCode: 1 }),
++    );
++  });
++}
++
++const settings = {
++  enabled: true,
++  binaryPath: "pi",
++  launchArgs: "",
++  customModels: [],
++} as const;
++
++describe("PiProvider", () => {
++  it.effect("requires the first published Pi version with entries and settlement hooks", () =>
++    Effect.gen(function* () {
++      const snapshot = yield* checkPiProviderStatus(settings).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, piProbeSpawner("0.80.3")),
++      );
++      assert.equal(snapshot.status, "error");
++      assert.equal(snapshot.version, "0.80.3");
++      assert.include(snapshot.message ?? "", `Pi ${MINIMUM_PI_VERSION} or newer`);
++    }).pipe(Effect.provide(NodeServices.layer)),
++  );
++
++  it.effect("keeps compatible Pi selectable when optional discovery fails", () =>
++    Effect.gen(function* () {
++      const snapshot = yield* checkPiProviderStatus(settings).pipe(
++        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, piProbeSpawner("0.84.3")),
++      );
++      assert.equal(snapshot.status, "ready");
++      assert.equal(snapshot.auth.status, "unknown");
++      assert.deepEqual(
++        snapshot.models.map((model) => model.slug),
++        ["default"],
++      );
++      assert.include(snapshot.message ?? "", "could not refresh its models and commands");
++    }).pipe(Effect.provide(NodeServices.layer)),
++  );
++});
+diff --git a/apps/server/src/provider/Layers/PiProvider.ts b/apps/server/src/provider/Layers/PiProvider.ts
+new file mode 100644
+index 000000000..c88a71fb1
+--- /dev/null
++++ b/apps/server/src/provider/Layers/PiProvider.ts
+@@ -0,0 +1,450 @@
++/**
++ * PiProvider — snapshot/probe layer for the Pi coding agent.
++ *
++ * Health is probed with `pi --version`. Models, the user's default model, and
++ * the user's commands (extension slash commands, prompt templates, skills)
++ * are discovered through a short-lived ephemeral RPC session
++ * (`pi --mode rpc --no-session`), so everything the user configured in
++ * `~/.pi/agent` — custom providers, models.json entries, extensions, skills —
++ * shows up in T3 without any hardcoded catalog.
++ */
++import { type PiSettings, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
++import { causeErrorTag } from "@t3tools/shared/observability";
++import { resolveSpawnCommand } from "@t3tools/shared/shell";
++import { compareSemverVersions } from "@t3tools/shared/semver";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as Exit from "effect/Exit";
++import * as Option from "effect/Option";
++import * as Result from "effect/Result";
++import { HttpClient } from "effect/unstable/http";
++import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
++
++import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
++import {
++  makePiRpcConnection,
++  piRecordField as recordField,
++  piRecordString as recordString,
++} from "../PiRpc.ts";
++import {
++  buildServerProvider,
++  isCommandMissingCause,
++  parseGenericCliVersion,
++  providerModelsFromSettings,
++  spawnAndCollect,
++  type ServerProviderDraft,
++} from "../providerSnapshot.ts";
++import {
++  enrichProviderSnapshotWithVersionAdvisory,
++  type ProviderMaintenanceCapabilities,
++} from "../providerMaintenance.ts";
++import {
++  EMPTY_PI_MODEL_CAPABILITIES,
++  thinkingCapabilitiesForPiModel,
++} from "./piThinkingCapabilities.ts";
++import { parsePiDiscoveredCommands, type PiDiscoveredCommands } from "../PiCommands.ts";
++
++const PI_PRESENTATION = {
++  displayName: "Pi",
++  badgeLabel: "Early Access",
++  showInteractionModeToggle: false,
++  supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
++  requiresNewThreadForModelChange: false,
++} as const;
++
++const VERSION_PROBE_TIMEOUT_MS = 4_000;
++const PI_RPC_DISCOVERY_TIMEOUT_MS = 15_000;
++/**
++ * get_entries arrived in 0.80.3 and agent_settled landed in source at 0.80.4.
++ * Version 0.80.5 was the first published package containing both hooks. T3
++ * needs them for rollback boundaries and reliable turn terminalization.
++ */
++export const MINIMUM_PI_VERSION = "0.80.5";
++
++/** Deferring to the user's own settings.json default model. */
++const RESERVED_PI_ARGS = new Set([
++  "--mode",
++  "--no-session",
++  "--session",
++  "--resume",
++  "--continue",
++  "--version",
++  "--help",
++]);
++
++/** T3 owns Pi's transport and session cursor, so user options cannot replace them. */
++function resolvePiLaunchArgs(
++  launchArgs: string,
++):
++  | { readonly ok: true; readonly args: ReadonlyArray<string> }
++  | { readonly ok: false; readonly message: string } {
++  const args = tokenizeCliArgs(launchArgs);
++  for (const arg of args) {
++    if (arg === "--" || !arg.startsWith("-")) {
++      return { ok: false, message: "Pi launch arguments cannot include positional prompts." };
++    }
++    if (
++      [...RESERVED_PI_ARGS].some((reserved) => arg === reserved || arg.startsWith(`${reserved}=`))
++    ) {
++      return { ok: false, message: `Pi launch argument '${arg}' is controlled by T3 Code.` };
++    }
++  }
++  return { ok: true, args };
++}
++
++const PI_DEFAULT_MODEL: ServerProviderModel = {
++  slug: "default",
++  name: "[Pi] default",
++  isCustom: false,
++  capabilities: EMPTY_PI_MODEL_CAPABILITIES,
++};
++
++interface PiDiscovery extends PiDiscoveredCommands {
++  readonly models: ReadonlyArray<ServerProviderModel>;
++  readonly authenticated: boolean;
++}
++
++function piModelsFromSettings(
++  customModels: ReadonlyArray<string> | undefined,
++  discovered: ReadonlyArray<ServerProviderModel> = [],
++): ReadonlyArray<ServerProviderModel> {
++  return providerModelsFromSettings(
++    [PI_DEFAULT_MODEL, ...discovered],
++    customModels ?? [],
++    EMPTY_PI_MODEL_CAPABILITIES,
++  );
++}
++
++function parseDiscoveredModels(
++  data: unknown,
++  defaultThinkingLevel: unknown,
++): ReadonlyArray<ServerProviderModel> {
++  const models = recordField(data, "models");
++  if (!Array.isArray(models)) return [];
++  const seen = new Set<string>();
++  const parsed: Array<ServerProviderModel> = [];
++  for (const model of models) {
++    const provider = recordString(model, "provider");
++    const id = recordString(model, "id");
++    if (provider === undefined || id === undefined) continue;
++    const slug = `${provider}/${id}`;
++    if (seen.has(slug)) continue;
++    seen.add(slug);
++    parsed.push({
++      slug,
++      // Pi can expose OpenAI, Anthropic, local, and user-defined providers in
++      // one picker. Keep its provider visible even when model names collide.
++      name: `[${provider}] ${recordString(model, "name") ?? id}`,
++      isCustom: false,
++      capabilities: thinkingCapabilitiesForPiModel(model, defaultThinkingLevel),
++    });
++  }
++  return parsed;
++}
++
++const discoverPiViaRpc = (
++  piSettings: PiSettings,
++  environment: NodeJS.ProcessEnv,
++  launchArgs: ReadonlyArray<string>,
++  cwd?: string,
++) =>
++  Effect.gen(function* () {
++    const launch = {
++      args: ["--mode", "rpc", "--no-session", ...launchArgs],
++      env: environment,
++    };
++    const connection = yield* makePiRpcConnection({
++      command: piSettings.binaryPath || "pi",
++      args: launch.args,
++      cwd,
++      env: launch.env,
++    });
++    const stateData = yield* connection.request({ type: "get_state" });
++    const modelsData = yield* connection.request({ type: "get_available_models" });
++    const commandsData = yield* connection
++      .request({ type: "get_commands" })
++      .pipe(Effect.orElseSucceed(() => undefined));
++    const discoveredModels = parseDiscoveredModels(
++      modelsData,
++      recordString(stateData, "thinkingLevel"),
++    );
++    const { slashCommands, skills } = parsePiDiscoveredCommands(commandsData);
++    return {
++      models: discoveredModels,
++      slashCommands,
++      skills,
++      authenticated: discoveredModels.length > 0,
++    } satisfies PiDiscovery;
++  }).pipe(Effect.scoped);
++
++const runPiVersionCommand = (piSettings: PiSettings, environment: NodeJS.ProcessEnv) =>
++  Effect.gen(function* () {
++    const command = piSettings.binaryPath || "pi";
++    const spawnCommand = yield* resolveSpawnCommand(command, ["--version"], {
++      env: environment,
++    });
++    return yield* spawnAndCollect(
++      command,
++      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
++        env: environment,
++        shell: spawnCommand.shell,
++      }),
++    );
++  });
++
++export function buildInitialPiProviderSnapshot(
++  piSettings: PiSettings,
++): Effect.Effect<ServerProviderDraft> {
++  return Effect.gen(function* () {
++    const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
++    const models = piModelsFromSettings(piSettings.customModels);
++    if (!piSettings.enabled) {
++      return buildServerProvider({
++        presentation: PI_PRESENTATION,
++        enabled: false,
++        checkedAt,
++        models,
++        probe: {
++          installed: false,
++          version: null,
++          status: "warning",
++          auth: { status: "unknown" },
++          message: "Pi is disabled in T3 Code settings.",
++        },
++      });
++    }
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: true,
++      checkedAt,
++      models,
++      probe: {
++        installed: true,
++        version: null,
++        status: "warning",
++        auth: { status: "unknown" },
++        message: "Checking Pi CLI availability...",
++      },
++    });
++  });
++}
++
++export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function* (
++  piSettings: PiSettings,
++  environment: NodeJS.ProcessEnv = process.env,
++  cwd?: string,
++): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
++  const checkedAt = DateTime.formatIso(yield* DateTime.now);
++  const fallbackModels = piModelsFromSettings(piSettings.customModels);
++
++  if (!piSettings.enabled) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: false,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: false,
++        version: null,
++        status: "warning",
++        auth: { status: "unknown" },
++        message: "Pi is disabled in T3 Code settings.",
++      },
++    });
++  }
++
++  const versionResult = yield* runPiVersionCommand(piSettings, environment).pipe(
++    Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
++    Effect.result,
++  );
++
++  if (Result.isFailure(versionResult)) {
++    const error = versionResult.failure;
++    yield* Effect.logWarning("Pi CLI health check failed.", { errorTag: error._tag });
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: !isCommandMissingCause(error),
++        version: null,
++        status: "error",
++        auth: { status: "unknown" },
++        message: isCommandMissingCause(error)
++          ? "Pi CLI (`pi`) is not installed or not on PATH. Install with `npm install -g @earendil-works/pi-coding-agent`."
++          : "Failed to execute Pi CLI health check.",
++      },
++    });
++  }
++
++  if (Option.isNone(versionResult.success)) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version: null,
++        status: "error",
++        auth: { status: "unknown" },
++        message: "Pi CLI is installed but timed out while running `pi --version`.",
++      },
++    });
++  }
++
++  const versionOutput = versionResult.success.value;
++  const version = parseGenericCliVersion(`${versionOutput.stdout}\n${versionOutput.stderr}`);
++  if (versionOutput.code !== 0) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: "Pi CLI is installed but failed to run.",
++      },
++    });
++  }
++
++  if (version === null) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version: null,
++        status: "error",
++        auth: { status: "unknown" },
++        message: `T3 Code could not determine the Pi version. Pi ${MINIMUM_PI_VERSION} or newer is required.`,
++      },
++    });
++  }
++
++  if (compareSemverVersions(version, MINIMUM_PI_VERSION) < 0) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: `Pi ${version} is unsupported. Update to Pi ${MINIMUM_PI_VERSION} or newer.`,
++      },
++    });
++  }
++
++  const resolvedLaunchArgs = resolvePiLaunchArgs(piSettings.launchArgs);
++  if (!resolvedLaunchArgs.ok) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "error",
++        auth: { status: "unknown" },
++        message: resolvedLaunchArgs.message,
++      },
++    });
++  }
++
++  const discoveryExit = yield* discoverPiViaRpc(
++    piSettings,
++    environment,
++    resolvedLaunchArgs.args,
++    cwd,
++  ).pipe(Effect.timeoutOption(PI_RPC_DISCOVERY_TIMEOUT_MS), Effect.exit);
++  if (Exit.isFailure(discoveryExit)) {
++    yield* Effect.logWarning("Pi RPC discovery failed.", {
++      errorTag: causeErrorTag(discoveryExit.cause),
++    });
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "ready",
++        auth: { status: "unknown" },
++        message:
++          "Pi is available, but T3 Code could not refresh its models and commands. The live session will retry startup.",
++      },
++    });
++  }
++  if (Option.isNone(discoveryExit.value)) {
++    return buildServerProvider({
++      presentation: PI_PRESENTATION,
++      enabled: piSettings.enabled,
++      checkedAt,
++      models: fallbackModels,
++      probe: {
++        installed: true,
++        version,
++        status: "ready",
++        auth: { status: "unknown" },
++        message:
++          "Pi is available, but model and command discovery needs interactive input. The live session will handle it.",
++      },
++    });
++  }
++
++  const discovery = discoveryExit.value.value;
++  const models = piModelsFromSettings(piSettings.customModels, discovery.models);
++  return buildServerProvider({
++    presentation: PI_PRESENTATION,
++    enabled: piSettings.enabled,
++    checkedAt,
++    models,
++    slashCommands: discovery.slashCommands,
++    skills: discovery.skills,
++    probe: {
++      installed: true,
++      version,
++      status: discovery.authenticated ? "ready" : "warning",
++      auth: { status: discovery.authenticated ? "authenticated" : "unauthenticated", type: "pi" },
++      ...(discovery.authenticated
++        ? {}
++        : {
++            message:
++              "Pi has no usable models. Run `pi` in a terminal and use /login, or configure an API key in ~/.pi/agent.",
++          }),
++    },
++  });
++});
++
++export const enrichPiSnapshot = (input: {
++  readonly snapshot: ServerProvider;
++  readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
++  readonly enableProviderUpdateChecks?: boolean;
++  readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
++  readonly httpClient: HttpClient.HttpClient;
++}): Effect.Effect<void> => {
++  const { snapshot, publishSnapshot } = input;
++  return enrichProviderSnapshotWithVersionAdvisory(snapshot, input.maintenanceCapabilities, {
++    enableProviderUpdateChecks: input.enableProviderUpdateChecks,
++  }).pipe(
++    Effect.provideService(HttpClient.HttpClient, input.httpClient),
++    Effect.flatMap((enrichedSnapshot) => publishSnapshot(enrichedSnapshot)),
++    Effect.catchCause((cause) =>
++      Effect.logWarning("Pi version advisory enrichment failed", {
++        errorTag: causeErrorTag(cause),
++      }),
++    ),
++    Effect.asVoid,
++  );
++};
+diff --git a/apps/server/src/provider/Layers/piThinkingCapabilities.test.ts b/apps/server/src/provider/Layers/piThinkingCapabilities.test.ts
+new file mode 100644
+index 000000000..78eb2e941
+--- /dev/null
++++ b/apps/server/src/provider/Layers/piThinkingCapabilities.test.ts
+@@ -0,0 +1,30 @@
++import { assert, describe, it } from "@effect/vitest";
++
++import { thinkingCapabilitiesForPiModel } from "./piThinkingCapabilities.ts";
++
++describe("thinkingCapabilitiesForPiModel", () => {
++  it("shows Pi's resolved default as the default choice while keeping it inherited", () => {
++    const capabilities = thinkingCapabilitiesForPiModel(
++      {
++        reasoning: true,
++        thinkingLevelMap: { off: null, xhigh: "extra_high", max: null },
++      },
++      "xhigh",
++    );
++    const descriptors = capabilities.optionDescriptors ?? [];
++    const thinking = descriptors[0];
++    assert.equal(thinking?.id, "thinking");
++    assert.equal(thinking?.type, "select");
++    if (thinking?.type !== "select") return;
++    assert.deepEqual(
++      thinking.options.map((option) => [option.id, option.label, option.isDefault === true]),
++      [
++        ["minimal", "Minimal", false],
++        ["low", "Low", false],
++        ["medium", "Medium", false],
++        ["high", "High", false],
++        ["inherit", "Extra High", true],
++      ],
++    );
++  });
++});
+diff --git a/apps/server/src/provider/Layers/piThinkingCapabilities.ts b/apps/server/src/provider/Layers/piThinkingCapabilities.ts
+new file mode 100644
+index 000000000..186bcb587
+--- /dev/null
++++ b/apps/server/src/provider/Layers/piThinkingCapabilities.ts
+@@ -0,0 +1,115 @@
++import { type ModelCapabilities, type ProviderOptionChoice } from "@t3tools/contracts";
++import { createModelCapabilities } from "@t3tools/shared/model";
++import * as Predicate from "effect/Predicate";
++
++/**
++ * Pi's full thinking ladder. Extra High (`xhigh`) and Max are opt-in per
++ * model via `thinkingLevelMap`; advertising them globally makes
++ * `set_thinking_level` fail on models that lack them.
++ */
++export const PI_THINKING_LEVELS = [
++  "off",
++  "minimal",
++  "low",
++  "medium",
++  "high",
++  "xhigh",
++  "max",
++] as const;
++
++export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
++
++const PI_THINKING_LEVEL_LABELS: Record<PiThinkingLevel, string> = {
++  off: "Off",
++  minimal: "Minimal",
++  low: "Low",
++  medium: "Medium",
++  high: "High",
++  xhigh: "Extra High",
++  max: "Max",
++};
++
++export const EMPTY_PI_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
++  optionDescriptors: [],
++});
++
++export function thinkingCapabilitiesForPiModel(
++  model: unknown,
++  defaultThinkingLevel: unknown,
++): ModelCapabilities {
++  const levels = supportedPiThinkingLevelsFromModel(model);
++  if (levels.length === 0) return EMPTY_PI_MODEL_CAPABILITIES;
++  const defaultLevel = clampPiThinkingLevel(defaultThinkingLevel, levels);
++  return createModelCapabilities({
++    optionDescriptors: [
++      {
++        id: "thinking",
++        label: "Thinking",
++        type: "select",
++        options: levels.map(
++          (level): ProviderOptionChoice =>
++            level === defaultLevel
++              ? {
++                  // Keep Pi's default as an inherited value internally so T3
++                  // does not turn the displayed default into an override.
++                  id: "inherit",
++                  label: PI_THINKING_LEVEL_LABELS[level],
++                  isDefault: true,
++                }
++              : {
++                  id: level,
++                  label: PI_THINKING_LEVEL_LABELS[level],
++                },
++        ),
++      },
++    ],
++  });
++}
++
++/** Mirrors `@earendil-works/pi-ai` `clampThinkingLevel`. */
++function clampPiThinkingLevel(
++  input: unknown,
++  availableLevels: ReadonlyArray<PiThinkingLevel>,
++): PiThinkingLevel | undefined {
++  if (typeof input !== "string") return undefined;
++  const requestedIndex = PI_THINKING_LEVELS.findIndex((level) => level === input);
++  if (requestedIndex === -1) return undefined;
++  const exact = availableLevels.find((level) => level === input);
++  if (exact !== undefined) return exact;
++  for (let index = requestedIndex + 1; index < PI_THINKING_LEVELS.length; index += 1) {
++    const higher = availableLevels.find((level) => level === PI_THINKING_LEVELS[index]);
++    if (higher !== undefined) return higher;
++  }
++  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
++    const lower = availableLevels.find((level) => level === PI_THINKING_LEVELS[index]);
++    if (lower !== undefined) return lower;
++  }
++  return availableLevels[0];
++}
++
++/**
++ * Mirror of `@earendil-works/pi-ai` `getSupportedThinkingLevels`.
++ *
++ * A reasoning model always exposes off through high unless a map entry is
++ * `null`. Extra High and Max appear only when the map has a non-null entry.
++ */
++function supportedPiThinkingLevelsFromModel(model: unknown): ReadonlyArray<PiThinkingLevel> {
++  if (recordField(model, "reasoning") !== true) return [];
++  const thinkingLevelMap = thinkingLevelMapFromModel(model);
++  return PI_THINKING_LEVELS.filter((level) => {
++    const mapped = thinkingLevelMap?.[level];
++    if (mapped === null) return false;
++    if (level === "xhigh" || level === "max") return mapped !== undefined;
++    return true;
++  });
++}
++
++function thinkingLevelMapFromModel(model: unknown): Record<string, unknown> | undefined {
++  const value = recordField(model, "thinkingLevelMap");
++  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
++  return value as Record<string, unknown>;
++}
++
++function recordField(input: unknown, key: string): unknown {
++  return Predicate.isObject(input) ? input[key] : undefined;
++}
+diff --git a/apps/server/src/provider/PiCommands.ts b/apps/server/src/provider/PiCommands.ts
+new file mode 100644
+index 000000000..2ac8f42f2
+--- /dev/null
++++ b/apps/server/src/provider/PiCommands.ts
+@@ -0,0 +1,71 @@
++import { type ServerProviderSkill, type ServerProviderSlashCommand } from "@t3tools/contracts";
++import * as Predicate from "effect/Predicate";
++
++export interface PiDiscoveredCommands {
++  readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
++  readonly skills: ReadonlyArray<ServerProviderSkill>;
++}
++
++/** Maps Pi's `get_commands` payload to T3's shared command and skill surfaces. */
++export function parsePiDiscoveredCommands(data: unknown): PiDiscoveredCommands {
++  const commands = recordField(data, "commands");
++  if (!Array.isArray(commands)) return { slashCommands: [], skills: [] };
++  const slashCommands: Array<ServerProviderSlashCommand> = [];
++  const skills: Array<ServerProviderSkill> = [];
++  for (const command of commands) {
++    const commandName = recordString(command, "name");
++    if (commandName === undefined || commandName.length === 0) continue;
++    const description = recordString(command, "description");
++    if (recordString(command, "source") === "skill") {
++      const name = commandName.startsWith("skill:")
++        ? commandName.slice("skill:".length)
++        : commandName;
++      const sourceInfo = recordField(command, "sourceInfo");
++      const path = recordString(sourceInfo, "path") ?? recordString(command, "path");
++      if (name.length === 0 || path === undefined) continue;
++      const scope = recordString(sourceInfo, "scope") ?? recordString(command, "location");
++      skills.push({
++        name,
++        ...(description === undefined ? {} : { description }),
++        path,
++        ...(scope === undefined ? {} : { scope }),
++        enabled: true,
++      });
++      continue;
++    }
++    slashCommands.push({
++      name: commandName,
++      ...(description === undefined ? {} : { description }),
++    });
++  }
++  return { slashCommands, skills };
++}
++
++/**
++ * Pi expands skills only through a leading `/skill:name` command. T3 stores
++ * skill chips as `$name`, so move the first known skill reference to that
++ * native command position while preserving the rest of the user's prompt.
++ */
++export function expandPiSkillReference(text: string, skillNames: ReadonlySet<string>): string {
++  const references = /(^|\s)\$([^\s]+)(?=\s|$)/g;
++  for (const match of text.matchAll(references)) {
++    const name = match[2];
++    if (name === undefined || !skillNames.has(name) || match.index === undefined) continue;
++    const tokenStart = match.index + (match[1]?.length ?? 0);
++    const tokenEnd = tokenStart + name.length + 1;
++    const prompt = [text.slice(0, tokenStart).trimEnd(), text.slice(tokenEnd).trimStart()]
++      .filter((part) => part.length > 0)
++      .join(" ");
++    return prompt.length === 0 ? `/skill:${name}` : `/skill:${name} ${prompt}`;
++  }
++  return text;
++}
++
++function recordField(input: unknown, key: string): unknown {
++  return Predicate.isObject(input) ? input[key] : undefined;
++}
++
++function recordString(input: unknown, key: string): string | undefined {
++  const value = recordField(input, key);
++  return typeof value === "string" ? value : undefined;
++}
+diff --git a/apps/server/src/provider/PiRpc.ts b/apps/server/src/provider/PiRpc.ts
+new file mode 100644
+index 000000000..4c2a2382e
+--- /dev/null
++++ b/apps/server/src/provider/PiRpc.ts
+@@ -0,0 +1,396 @@
++/**
++ * PiRpc — stdio JSONL transport for the Pi coding agent's RPC mode.
++ *
++ * Spawns `pi --mode rpc` and speaks Pi's line-delimited JSON protocol:
++ * requests go to stdin as `{"type": "...", "id": "..."}` records, responses
++ * come back as `{"type": "response", "id": ..., "success": ...}` and are
++ * correlated by `id`; every other stdout record is a session event and is
++ * surfaced on the `events` queue in arrival order.
++ *
++ * Framing follows Pi's spec: LF-delimited only, with a trailing `\r`
++ * stripped. Lines are split manually (never with `readline`, which also
++ * splits on U+2028/U+2029 and would corrupt frames). Records that fail to
++ * parse as JSON are dropped with a debug log rather than failing the
++ * transport, so a chatty extension cannot take the session down.
++ *
++ * Used by `PiAdapterV2` for sessions and by `PiTextGeneration` /
++ * `PiProvider` for ephemeral one-shot processes.
++ */
++import * as Deferred from "effect/Deferred";
++import * as Duration from "effect/Duration";
++import * as Effect from "effect/Effect";
++import * as Predicate from "effect/Predicate";
++import * as Queue from "effect/Queue";
++import * as Scope from "effect/Scope";
++import * as Schema from "effect/Schema";
++import * as Stream from "effect/Stream";
++import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
++import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
++import { resolveSpawnCommand } from "@t3tools/shared/shell";
++
++export class PiRpcError extends Schema.TaggedErrorClass<PiRpcError>()("PiRpcError", {
++  operation: Schema.String,
++  detail: Schema.optional(Schema.String),
++  cause: Schema.optional(Schema.Defect()),
++}) {
++  override get message(): string {
++    return `Pi RPC ${this.operation} failed${this.detail === undefined ? "" : `: ${this.detail}`}.`;
++  }
++}
++
++export type PiRpcRecord = Record<string, unknown>;
++
++export function piRecordField(input: unknown, key: string): unknown {
++  return Predicate.isObject(input) ? input[key] : undefined;
++}
++
++export function piRecordString(input: unknown, key: string): string | undefined {
++  const value = piRecordField(input, key);
++  return Predicate.isString(value) ? value : undefined;
++}
++
++export function piRecordNumber(input: unknown, key: string): number | undefined {
++  const value = piRecordField(input, key);
++  return Predicate.isNumber(value) && Number.isFinite(value) ? value : undefined;
++}
++
++/**
++ * Splits a `provider/model` slug into the two fields `set_model` expects.
++ * Returns null for slugs without a usable separator so callers can reject the
++ * selection instead of silently leaving Pi on its configured default.
++ */
++export function parsePiModelSlug(slug: string): { provider: string; modelId: string } | null {
++  const separator = slug.indexOf("/");
++  if (separator <= 0 || separator === slug.length - 1) return null;
++  return { provider: slug.slice(0, separator), modelId: slug.slice(separator + 1) };
++}
++
++export interface PiRpcSpawnOptions {
++  readonly command: string;
++  readonly args: ReadonlyArray<string>;
++  readonly cwd: string | undefined;
++  readonly env: NodeJS.ProcessEnv;
++}
++
++export interface PiRpcConnection {
++  /** Fire-and-forget write (used for `extension_ui_response`). */
++  readonly send: (record: PiRpcRecord) => Effect.Effect<void, PiRpcError>;
++  /**
++   * Correlated request: assigns an `id`, waits for the matching response
++   * record, and returns its `data` (undefined when the command carries none).
++   * Fails on `success: false`, transport death, or timeout.
++   */
++  readonly request: (record: PiRpcRecord, timeoutMs?: number) => Effect.Effect<unknown, PiRpcError>;
++  /**
++   * Session events (every non-response stdout record) in arrival order. The
++   * full queue is exposed so consumers can append order-preserving synthetic
++   * records of their own (see PiAdapterV2's settle probe).
++   */
++  readonly events: Queue.Queue<PiRpcRecord, PiRpcError>;
++  /** Resolves when the process has exited, with its exit code. */
++  readonly exited: Effect.Effect<number, PiRpcError>;
++  /**
++   * Kill the pi process group immediately (SIGTERM, grace, SIGKILL). Used by
++   * Stop-with-restart when the process may be wedged and `abort` cannot be
++   * trusted to land. The transport fails and the session manager respawns a
++   * fresh process on the next turn.
++   */
++  readonly terminate: Effect.Effect<void>;
++}
++
++const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
++const TERMINATION_GRACE = Duration.seconds(1);
++
++interface PendingPiRequest {
++  readonly deferred: Deferred.Deferred<unknown, PiRpcError>;
++}
++
++function splitJsonlChunks(buffer: string, chunk: string): readonly [ReadonlyArray<string>, string] {
++  const combined = buffer + chunk;
++  const parts = combined.split("\n");
++  const remainder = parts.pop() ?? "";
++  const lines = parts
++    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
++    .filter((line) => line.length > 0);
++  return [lines, remainder];
++}
++
++const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
++const decodeJsonLine = Schema.decodeSync(UnknownFromJsonString);
++const encodeJsonLine = Schema.encodeSync(UnknownFromJsonString);
++
++const PI_ERROR_DETAIL_MAX_CHARS = 200;
++
++/**
++ * Bounded, human-readable summary of a failed response's `error` payload.
++ * The untruncated value stays on the error's `cause`, so `message` never
++ * carries unbounded remote text while logs keep something diagnostic.
++ */
++function summarizePiError(error: unknown): string {
++  const text = typeof error === "string" ? error : JSON.stringify(error);
++  if (text === undefined) return "unknown error";
++  return text.length > PI_ERROR_DETAIL_MAX_CHARS
++    ? `${text.slice(0, PI_ERROR_DETAIL_MAX_CHARS)}…`
++    : text;
++}
++
++function parsePiRecord(line: string): PiRpcRecord | undefined {
++  try {
++    const parsed: unknown = decodeJsonLine(line);
++    return Predicate.isObject(parsed) ? parsed : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/**
++ * Kill the pi process group: SIGTERM, short grace, then SIGKILL.
++ *
++ * `hasExited` is consulted before each signal. Once the original child is
++ * gone its pid/pgid can be recycled by the OS, so escalating blindly could
++ * deliver SIGKILL to an unrelated process.
++ */
++const terminatePiProcess = (kill: (signal: NodeJS.Signals) => boolean, hasExited: () => boolean) =>
++  Effect.gen(function* () {
++    if (hasExited()) return;
++    if (!kill("SIGTERM")) return;
++    yield* Effect.sleep(TERMINATION_GRACE);
++    if (hasExited()) return;
++    kill("SIGKILL");
++  });
++
++export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSpawnOptions) {
++  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
++  const platform = yield* HostProcessPlatform;
++  const scope = yield* Effect.scope;
++
++  const spawnCommand = yield* resolveSpawnCommand(options.command, [...options.args], {
++    env: options.env,
++  }).pipe(Effect.mapError((cause) => new PiRpcError({ operation: "spawn", cause })));
++  const child = yield* spawner
++    .spawn(
++      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
++        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
++        env: options.env,
++        extendEnv: false,
++        shell: spawnCommand.shell,
++        detached: platform !== "win32",
++      }),
++    )
++    .pipe(Effect.mapError((cause) => new PiRpcError({ operation: "spawn", cause })));
++
++  let childExited = false;
++
++  const killProcessGroup = (signal: NodeJS.Signals): boolean => {
++    try {
++      if (platform === "win32") {
++        process.kill(Number(child.pid), signal);
++      } else {
++        process.kill(-Number(child.pid), signal);
++      }
++      return true;
++    } catch {
++      return false;
++    }
++  };
++
++  /** Signal 0 probes liveness without delivering anything. */
++  const hasExited = (): boolean => {
++    if (childExited) return true;
++    try {
++      process.kill(platform === "win32" ? Number(child.pid) : -Number(child.pid), 0);
++      return false;
++    } catch {
++      return true;
++    }
++  };
++
++  /**
++   * Windows has no process groups, so `process.kill` reaches only pi itself
++   * and leaves extension subprocesses running with inherited stdio handles.
++   * `taskkill /T` reaps the whole tree.
++   */
++  const terminateWindowsTree = Effect.gen(function* () {
++    if (hasExited()) return;
++    const taskkill = yield* spawner.spawn(
++      ChildProcess.make("taskkill", ["/PID", String(child.pid), "/T", "/F"]),
++    );
++    yield* taskkill.exitCode;
++  }).pipe(Effect.scoped, Effect.ignore);
++
++  const terminateProcess =
++    platform === "win32" ? terminateWindowsTree : terminatePiProcess(killProcessGroup, hasExited);
++
++  // Registered before any further setup: an interrupt or failure between the
++  // spawn and the rest of this constructor would otherwise leak a detached
++  // pi process with no finalizer to reap it.
++  yield* Scope.addFinalizer(scope, terminateProcess.pipe(Effect.ignore, Effect.uninterruptible));
++
++  const pendingRequests = new Map<string, PendingPiRequest>();
++  const events = yield* Queue.unbounded<PiRpcRecord, PiRpcError>();
++  const outgoing = yield* Queue.unbounded<Uint8Array, PiRpcError>();
++  const transportDown = yield* Deferred.make<never, PiRpcError>();
++  const exitDeferred = yield* Deferred.make<number, PiRpcError>();
++  let nextRequestId = 0;
++
++  const failTransport = (error: PiRpcError) =>
++    Effect.gen(function* () {
++      yield* Deferred.fail(transportDown, error);
++      for (const [key, pending] of pendingRequests) {
++        pendingRequests.delete(key);
++        yield* Deferred.fail(pending.deferred, error);
++      }
++      // Closing `outgoing` is what makes `send` non-racy: once the writer is
++      // gone every later offer is refused rather than silently buffered.
++      yield* Queue.fail(outgoing, error);
++      yield* Queue.fail(events, error);
++    });
++
++  // Writer: drain the outgoing queue into the child's stdin. If the writer
++  // dies, the transport is failed so later sends surface the error instead of
++  // silently queueing into a dead pipe.
++  yield* Stream.fromQueue(outgoing).pipe(
++    Stream.run(child.stdin),
++    Effect.catchCause((cause) => failTransport(new PiRpcError({ operation: "write", cause }))),
++    Effect.forkIn(scope),
++  );
++
++  const routeRecord = (record: PiRpcRecord) =>
++    Effect.gen(function* () {
++      if (record["type"] === "response" && typeof record["id"] === "string") {
++        const pending = pendingRequests.get(record["id"]);
++        if (pending !== undefined) {
++          pendingRequests.delete(record["id"]);
++          if (record["success"] === true) {
++            yield* Deferred.succeed(pending.deferred, record["data"]);
++          } else {
++            yield* Deferred.fail(
++              pending.deferred,
++              new PiRpcError({
++                operation: String(record["command"] ?? "request"),
++                detail: summarizePiError(record["error"]),
++                ...(record["error"] === undefined ? {} : { cause: record["error"] }),
++              }),
++            );
++          }
++          return;
++        }
++      }
++      yield* Queue.offer(events, record);
++    });
++
++  // Reader: decode stdout into LF-delimited JSON records.
++  yield* Effect.gen(function* () {
++    let buffer = "";
++    yield* child.stdout.pipe(
++      Stream.decodeText(),
++      Stream.runForEach((chunk) =>
++        Effect.gen(function* () {
++          const [lines, remainder] = splitJsonlChunks(buffer, chunk);
++          buffer = remainder;
++          for (const line of lines) {
++            const record = parsePiRecord(line);
++            if (record === undefined) {
++              yield* Effect.logDebug("Dropping non-JSON pi stdout line.", {
++                lineLength: line.length,
++              });
++              continue;
++            }
++            yield* routeRecord(record);
++          }
++        }),
++      ),
++    );
++    const trailing = buffer.length > 0 ? parsePiRecord(buffer) : undefined;
++    if (trailing !== undefined) {
++      yield* routeRecord(trailing);
++    }
++  }).pipe(
++    Effect.matchCauseEffect({
++      onFailure: (cause) => failTransport(new PiRpcError({ operation: "read", cause })),
++      onSuccess: () =>
++        failTransport(new PiRpcError({ operation: "read", detail: "pi process closed stdout" })),
++    }),
++    Effect.forkIn(scope),
++  );
++
++  // Surface stderr as debug logs; pi reserves stdout for the protocol.
++  yield* child.stderr.pipe(
++    Stream.decodeText(),
++    Stream.runForEach((chunk) =>
++      chunk.trim().length === 0
++        ? Effect.void
++        : // Length only: pi's stderr is unbounded remote output and can carry
++          // credentials or prompt text, so it never enters a log annotation.
++          Effect.logDebug("pi stderr", { stderrLength: chunk.length }),
++    ),
++    Effect.ignore,
++    Effect.forkIn(scope),
++  );
++
++  yield* child.exitCode.pipe(
++    Effect.matchEffect({
++      onFailure: (cause) =>
++        Deferred.fail(exitDeferred, new PiRpcError({ operation: "exit", cause })),
++      onSuccess: (code) =>
++        Effect.suspend(() => {
++          childExited = true;
++          return Deferred.succeed(exitDeferred, Number(code));
++        }),
++    }),
++    Effect.forkIn(scope),
++  );
++
++  const send = (record: PiRpcRecord): Effect.Effect<void, PiRpcError> =>
++    Effect.gen(function* () {
++      const accepted = yield* Queue.offer(
++        outgoing,
++        new TextEncoder().encode(`${encodeJsonLine(record)}\n`),
++      );
++      // A refused offer means `failTransport` already closed the queue, so the
++      // write can never land; surface the transport error instead of
++      // reporting a success the caller cannot rely on.
++      if (!accepted) {
++        return yield* Deferred.await(transportDown);
++      }
++    });
++
++  const request = (
++    record: PiRpcRecord,
++    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
++  ): Effect.Effect<unknown, PiRpcError> =>
++    Effect.gen(function* () {
++      const id = `t3-${nextRequestId++}`;
++      const deferred = yield* Deferred.make<unknown, PiRpcError>();
++      pendingRequests.set(id, { deferred });
++      yield* send({ ...record, id }).pipe(
++        Effect.tapError(() => Effect.sync(() => pendingRequests.delete(id))),
++      );
++      // Raced against the transport: a death that lands after this request was
++      // registered (or between `send`'s check and its enqueue) would otherwise
++      // leave the caller waiting out the full timeout for a reply that is
++      // never coming.
++      return yield* Effect.raceFirst(Deferred.await(deferred), Deferred.await(transportDown)).pipe(
++        Effect.timeoutOrElse({
++          duration: Duration.millis(timeoutMs),
++          orElse: () =>
++            Effect.fail(
++              new PiRpcError({
++                operation: String(record["type"] ?? "request"),
++                detail: `timed out after ${timeoutMs}ms`,
++              }),
++            ),
++        }),
++        Effect.onInterrupt(() => Effect.sync(() => pendingRequests.delete(id))),
++        Effect.onError(() => Effect.sync(() => pendingRequests.delete(id))),
++      );
++    });
++
++  return {
++    send,
++    request,
++    events,
++    exited: Deferred.await(exitDeferred),
++    terminate: terminateProcess.pipe(Effect.ignore, Effect.uninterruptible),
++  } satisfies PiRpcConnection;
++});
+diff --git a/apps/server/src/provider/builtInDrivers.ts b/apps/server/src/provider/builtInDrivers.ts
+index 791a96e1d..02f95495d 100644
+--- a/apps/server/src/provider/builtInDrivers.ts
++++ b/apps/server/src/provider/builtInDrivers.ts
+@@ -25,6 +25,7 @@ import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
+ import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
+ import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
+ import { OpenCodeDriver, type OpenCodeDriverEnv } from "./Drivers/OpenCodeDriver.ts";
++import { PiDriver, type PiDriverEnv } from "./Drivers/PiDriver.ts";
+ import type { AnyProviderDriver } from "./ProviderDriver.ts";
+ 
+ /**
+@@ -37,7 +38,8 @@ export type BuiltInDriversEnv =
+   | CodexDriverEnv
+   | CursorDriverEnv
+   | GrokDriverEnv
+-  | OpenCodeDriverEnv;
++  | OpenCodeDriverEnv
++  | PiDriverEnv;
+ 
+ /**
+  * Ordered list of built-in drivers. Order matters only for tie-breaking in
+@@ -50,4 +52,5 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
+   CursorDriver,
+   GrokDriver,
+   OpenCodeDriver,
++  PiDriver,
+ ];
+diff --git a/apps/web/src/components/settings/providerDriverMeta.ts b/apps/web/src/components/settings/providerDriverMeta.ts
+index bfee6a8d6..b208ae99f 100644
+--- a/apps/web/src/components/settings/providerDriverMeta.ts
++++ b/apps/web/src/components/settings/providerDriverMeta.ts
+@@ -4,10 +4,19 @@ import {
+   CursorSettings,
+   GrokSettings,
+   OpenCodeSettings,
++  PiSettings,
+   ProviderDriverKind,
+ } from "@t3tools/contracts";
+ import type * as Schema from "effect/Schema";
+-import { ClaudeAI, CursorIcon, GrokIcon, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
++import {
++  ClaudeAI,
++  CursorIcon,
++  GrokIcon,
++  type Icon,
++  OpenAI,
++  OpenCodeIcon,
++  PiAgentIcon,
++} from "../Icons";
+ 
+ type ProviderSettingsSchema = {
+   readonly fields: Readonly<Record<string, Schema.Top>>;
+@@ -61,6 +70,13 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] =
+     badgeLabel: "Early Access",
+     settingsSchema: GrokSettings,
+   },
++  {
++    value: ProviderDriverKind.make("pi"),
++    label: "Pi",
++    icon: PiAgentIcon,
++    badgeLabel: "Early Access",
++    settingsSchema: PiSettings,
++  },
+   {
+     value: ProviderDriverKind.make("opencode"),
+     label: "OpenCode",
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index b6b09574b..a0b681ccd 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -512,6 +512,37 @@ export const GrokSettings = makeProviderSettingsSchema(
+ );
+ export type GrokSettings = typeof GrokSettings.Type;
+ 
++/** Settings for Pi's JSONL RPC runtime. Pi is opt-in while its provider adapter is early access. */
++export const PiSettings = makeProviderSettingsSchema(
++  {
++    enabled: Schema.Boolean.pipe(
++      Schema.withDecodingDefault(Effect.succeed(false)),
++      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
++    ),
++    binaryPath: makeBinaryPathSetting("pi").pipe(
++      Schema.annotateKey({
++        title: "Binary path",
++        description: "Path to the Pi coding agent binary.",
++        providerSettingsForm: { placeholder: "pi", clearWhenEmpty: "omit" },
++      }),
++    ),
++    launchArgs: TrimmedString.pipe(
++      Schema.withDecodingDefault(Effect.succeed("")),
++      Schema.annotateKey({
++        title: "Launch arguments",
++        description: "Additional arguments passed to Pi RPC sessions.",
++        providerSettingsForm: { clearWhenEmpty: "omit" },
++      }),
++    ),
++    customModels: Schema.Array(Schema.String).pipe(
++      Schema.withDecodingDefault(Effect.succeed([])),
++      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
++    ),
++  },
++  { order: ["binaryPath", "launchArgs"] },
++);
++export type PiSettings = typeof PiSettings.Type;
++
+ export const OpenCodeSettings = makeProviderSettingsSchema(
+   {
+     // Off by default (like Cursor and Grok): the binding is not yet stable
+@@ -716,6 +747,7 @@ export const ServerSettings = Schema.Struct({
+     claudeAgent: ClaudeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
++    pi: PiSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
+@@ -862,6 +894,13 @@ const GrokSettingsPatch = Schema.Struct({
+   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+ });
+ 
++const PiSettingsPatch = Schema.Struct({
++  enabled: Schema.optionalKey(Schema.Boolean),
++  binaryPath: Schema.optionalKey(TrimmedString),
++  launchArgs: Schema.optionalKey(TrimmedString),
++  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
++});
++
+ const OpenCodeSettingsPatch = Schema.Struct({
+   enabled: Schema.optionalKey(Schema.Boolean),
+   binaryPath: Schema.optionalKey(TrimmedString),
+@@ -910,6 +949,7 @@ export const ServerSettingsPatch = Schema.Struct({
+       claudeAgent: Schema.optionalKey(ClaudeSettingsPatch),
+       cursor: Schema.optionalKey(CursorSettingsPatch),
+       grok: Schema.optionalKey(GrokSettingsPatch),
++      pi: Schema.optionalKey(PiSettingsPatch),
+       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
+     }),
+   ),
