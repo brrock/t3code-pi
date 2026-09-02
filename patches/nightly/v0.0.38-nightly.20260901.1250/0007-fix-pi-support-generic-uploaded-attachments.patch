@@ -1,0 +1,81 @@
+From 9ef059ff58133b790c6a4185246eed062d226d6c Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Tue, 1 Sep 2026 06:49:11 +0100
+Subject: [PATCH] fix(pi): support generic uploaded attachments
+
+---
+ .../Layers/PiAdapter.attachments.test.ts      | 10 +++++++++
+ apps/server/src/provider/Layers/PiAdapter.ts  | 21 +++++++++++--------
+ 2 files changed, 22 insertions(+), 9 deletions(-)
+ create mode 100644 apps/server/src/provider/Layers/PiAdapter.attachments.test.ts
+
+diff --git a/apps/server/src/provider/Layers/PiAdapter.attachments.test.ts b/apps/server/src/provider/Layers/PiAdapter.attachments.test.ts
+new file mode 100644
+index 000000000..f54c68d52
+--- /dev/null
++++ b/apps/server/src/provider/Layers/PiAdapter.attachments.test.ts
+@@ -0,0 +1,10 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { shouldEmbedPiAttachment } from "./PiAdapter.ts";
++
++describe("shouldEmbedPiAttachment", () => {
++  it("embeds images natively and leaves generic files for the prompt path fallback", () => {
++    expect(shouldEmbedPiAttachment({ type: "image" })).toBe(true);
++    expect(shouldEmbedPiAttachment({ type: "file" })).toBe(false);
++  });
++});
+diff --git a/apps/server/src/provider/Layers/PiAdapter.ts b/apps/server/src/provider/Layers/PiAdapter.ts
+index f4d8799ef..95428ba64 100644
+--- a/apps/server/src/provider/Layers/PiAdapter.ts
++++ b/apps/server/src/provider/Layers/PiAdapter.ts
+@@ -50,6 +50,11 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+ 
+ const PROVIDER = ProviderDriverKind.make("pi");
+ 
++/** Pi RPC accepts images as native prompt parts; other uploads remain usable
++ * through ProviderService's attachment-path line. */
++export const shouldEmbedPiAttachment = (attachment: { readonly type: string }): boolean =>
++  attachment.type === "image";
++
+ interface PiSessionContext {
+   readonly scope: Scope.Closeable;
+   readonly connection: PiRpcConnection;
+@@ -598,14 +603,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
+         operation: "sendTurn",
+         issue: "Pi needs prompt text.",
+       });
+-    const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
++    const images = (yield* Effect.forEach(input.attachments ?? [], (attachment) =>
+       Effect.gen(function* () {
+-        if (attachment.type !== "image") {
+-          return yield* new ProviderAdapterValidationError({
+-            provider: PROVIDER,
+-            operation: "sendTurn",
+-            issue: `Pi does not support attachment type '${attachment.type}'.`,
+-          });
++        // Generic files are already represented by ProviderService's safe
++        // on-disk path line. Pi receives image uploads natively as base64.
++        if (!shouldEmbedPiAttachment(attachment)) {
++          return undefined;
+         }
+         const path = resolveAttachmentPath({
+           attachmentsDir: serverConfig.attachmentsDir,
+@@ -630,12 +633,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
+           ),
+         );
+         return {
+-          type: "image",
++          type: "image" as const,
+           data: Buffer.from(bytes).toString("base64"),
+           mimeType: attachment.mimeType,
+         };
+       }),
+-    );
++    )).filter((image): image is NonNullable<typeof image> => image !== undefined);
+     return yield* context.operationLock.withPermit(
+       Effect.gen(function* () {
+         if (context.activeTurnId !== undefined) {
+-- 
+2.47.3
+
