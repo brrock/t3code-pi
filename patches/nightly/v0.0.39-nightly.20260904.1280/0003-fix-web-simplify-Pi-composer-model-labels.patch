@@ -1,0 +1,77 @@
+From d7f57708fafeac0f2d63a59dcf993516223ce17f Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 16:21:50 +0100
+Subject: [PATCH] fix(web): simplify Pi composer model labels
+
+---
+ .../web/src/components/chat/ProviderModelPicker.tsx |  2 +-
+ .../src/components/chat/providerIconUtils.test.ts   | 13 ++++++++++++-
+ apps/web/src/components/chat/providerIconUtils.ts   | 12 ++++++++++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
+index 932754db1..ce6579055 100644
+--- a/apps/web/src/components/chat/ProviderModelPicker.tsx
++++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
+@@ -14,9 +14,9 @@ import { cn } from "~/lib/utils";
+ import { ModelPickerContent, resolveModelPickerSelectedModel } from "./ModelPickerContent";
+ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+ import {
+-  ModelEsque,
+   getTriggerDisplayModelLabel,
+   getTriggerDisplayModelName,
++  type ModelEsque,
+ } from "./providerIconUtils";
+ import { shouldShowInstanceBadge, type ProviderInstanceEntry } from "../../providerInstances";
+ import {
+diff --git a/apps/web/src/components/chat/providerIconUtils.test.ts b/apps/web/src/components/chat/providerIconUtils.test.ts
+index f62a06e07..a2371ee10 100644
+--- a/apps/web/src/components/chat/providerIconUtils.test.ts
++++ b/apps/web/src/components/chat/providerIconUtils.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { getDisplayModelName, getTriggerDisplayModelLabel } from "./providerIconUtils";
++import {
++  getComposerModelPresentation,
++  getDisplayModelName,
++  getTriggerDisplayModelLabel,
++} from "./providerIconUtils";
+ 
+ describe("Pi provider model labels", () => {
+   const model = {
+@@ -15,4 +19,11 @@ describe("Pi provider model labels", () => {
+   it("omits the provider name in composer triggers", () => {
+     expect(getTriggerDisplayModelLabel(model)).toBe("GPT-5.5");
+   });
++
++  it("keeps the Pi sub-provider out of composer chrome but available on hover", () => {
++    expect(getComposerModelPresentation(model)).toEqual({
++      label: "GPT-5.5",
++      tooltip: "[Codex] GPT-5.5",
++    });
++  });
+ });
+diff --git a/apps/web/src/components/chat/providerIconUtils.ts b/apps/web/src/components/chat/providerIconUtils.ts
+index 439f6ffb0..ce12b10d7 100644
+--- a/apps/web/src/components/chat/providerIconUtils.ts
++++ b/apps/web/src/components/chat/providerIconUtils.ts
+@@ -66,3 +66,15 @@ export function getTriggerDisplayModelLabel(model: ModelEsque): string {
+   const qualified = /^\[([^\]]+)\]\s+(.+)$/u.exec(displayName);
+   return qualified?.[2] ?? displayName;
+ }
++
++export function getComposerModelPresentation(model: ModelEsque): {
++  readonly label: string;
++  readonly tooltip: string;
++} {
++  return {
++    label: getTriggerDisplayModelLabel(model),
++    // Pi uses a provider-qualified picker name to disambiguate identical model
++    // slugs. Keep that detail available without making composer chrome noisy.
++    tooltip: getTriggerDisplayModelName(model),
++  };
++}
+-- 
+2.47.3
+

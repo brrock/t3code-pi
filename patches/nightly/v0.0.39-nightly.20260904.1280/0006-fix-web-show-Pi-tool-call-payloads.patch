@@ -1,0 +1,89 @@
+From a68461a2862f5202dfe12af6ccfdc617e3b29806 Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Sun, 30 Aug 2026 10:30:45 +0100
+Subject: [PATCH] fix(web): show Pi tool call payloads
+
+---
+ .../src/components/chat/MessagesTimeline.tsx  |  7 ++++--
+ apps/web/src/session-logic.test.ts            | 25 +++++++++++++++++++
+ apps/web/src/session-logic.ts                 |  9 +++++--
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/apps/web/src/components/chat/MessagesTimeline.tsx b/apps/web/src/components/chat/MessagesTimeline.tsx
+index 7874daa02..3c67b0f6d 100644
+--- a/apps/web/src/components/chat/MessagesTimeline.tsx
++++ b/apps/web/src/components/chat/MessagesTimeline.tsx
+@@ -2882,8 +2882,11 @@ function buildToolCallExpandedBody(
+     seen.add(text);
+     blocks.push(text);
+   };
+-  if (workEntry.itemType === "mcp_tool_call" && workEntry.toolData !== undefined) {
+-    addBlock(`MCP call\n${JSON.stringify(workEntry.toolData, null, 2)}`);
++  if (
++    (workEntry.itemType === "mcp_tool_call" || workEntry.itemType === "dynamic_tool_call") &&
++    workEntry.toolData !== undefined
++  ) {
++    addBlock(`Tool call\n${JSON.stringify(workEntry.toolData, null, 2)}`);
+   }
+   const command = workEntry.command?.trim();
+   const raw = workEntryRawCommand(workEntry);
+diff --git a/apps/web/src/session-logic.test.ts b/apps/web/src/session-logic.test.ts
+index b0d6797bf..854c33587 100644
+--- a/apps/web/src/session-logic.test.ts
++++ b/apps/web/src/session-logic.test.ts
+@@ -1374,6 +1374,31 @@ describe("deriveWorkLogEntries", () => {
+     },
+   );
+ 
++  it("preserves Pi dynamic tool payloads for expanded display", () => {
++    const item = {
++      type: "tool_execution_end",
++      toolCallId: "pi-tool-1",
++      toolName: "bash",
++      args: { command: "git status" },
++      result: "On branch main",
++    };
++    const activities: OrchestrationThreadActivity[] = [
++      makeActivity({
++        id: "pi-tool-done",
++        kind: "tool.completed",
++        summary: "bash",
++        payload: {
++          itemType: "dynamic_tool_call",
++          title: "bash",
++          data: item,
++        },
++      }),
++    ];
++
++    const [entry] = deriveWorkLogEntries(activities);
++    expect(entry?.toolData).toEqual(item);
++  });
++
+   it("keeps MCP payloads while collapsing lifecycle updates", () => {
+     const item = {
+       type: "mcpToolCall",
+diff --git a/apps/web/src/session-logic.ts b/apps/web/src/session-logic.ts
+index 1fb0391d9..a06b1fe57 100644
+--- a/apps/web/src/session-logic.ts
++++ b/apps/web/src/session-logic.ts
+@@ -987,9 +987,14 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
+   if (toolPresentation.toolSource) {
+     entry.toolSource = toolPresentation.toolSource;
+   }
+-  if (itemType === "mcp_tool_call") {
++  if (itemType === "mcp_tool_call" || itemType === "dynamic_tool_call") {
+     const data = asRecord(payload?.data);
+-    const toolData = typeof data?.toolName === "string" ? (data.item ?? data) : data?.item;
++    const toolData =
++      itemType === "dynamic_tool_call"
++        ? payload?.data
++        : typeof data?.toolName === "string"
++          ? (data.item ?? data)
++          : data?.item;
+     if (toolData !== undefined) {
+       entry.toolData = toolData;
+     }
+-- 
+2.47.3
+
