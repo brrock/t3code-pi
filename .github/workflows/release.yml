@@ -109,12 +109,26 @@ jobs:
           NPM_TAG: ${{ needs.prepare.outputs.npm_tag }}
           VERSION: ${{ inputs.version }}
         run: |
-          # A retried release must not attempt to republish an immutable npm version.
-          if npm view "@brrock/t3-pi@${VERSION#v}" version >/dev/null 2>&1; then
-            echo "@brrock/t3-pi@${VERSION#v} is already published; skipping publish."
-            exit 0
+          # Publish succeeds only when the immutable exact version is observable
+          # from npm. This keeps GitHub releases and service updates from
+          # getting ahead of the registry.
+          package="@brrock/t3-pi@${VERSION#v}"
+          if npm view "$package" version >/dev/null 2>&1; then
+            echo "$package is already published; skipping publish."
+          else
+            node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --app-version "${VERSION#v}" --provenance --verbose
           fi
-          node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --app-version "${VERSION#v}" --provenance --verbose
+          for attempt in $(seq 1 30); do
+            published="$(npm view "$package" version 2>/dev/null || true)"
+            if [[ "$published" == "${VERSION#v}" ]]; then
+              echo "Verified $package on npm."
+              exit 0
+            fi
+            echo "Waiting for npm to expose $package (attempt $attempt/30)..."
+            sleep 10
+          done
+          echo "npm did not expose immutable package $package after publishing." >&2
+          exit 1
 
   desktop:
     needs: prepare
