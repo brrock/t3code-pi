@@ -118,7 +118,10 @@ jobs:
           else
             node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --app-version "${VERSION#v}" --provenance --verbose
           fi
-          for attempt in $(seq 1 30); do
+          # npm's distributed metadata can lag a provenance publish by more
+          # than five minutes; wait up to 30 minutes rather than claiming a
+          # release that users cannot install.
+          for attempt in $(seq 1 180); do
             published="$(npm view "$package" version 2>/dev/null || true)"
             if [[ "$published" == "${VERSION#v}" ]]; then
               echo "Verified $package on npm."
