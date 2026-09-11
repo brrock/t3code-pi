@@ -22,8 +22,12 @@ export function missingReleases(releases, channelState) {
 
 export function maintenanceCandidates(releases, channelState, latestOnly = false) {
   // Latest-only maintenance intentionally revisits the newest immutable release
-  // even when it has a deferred/conflict manifest, so a user can retry it.
-  return latestOnly ? releases.slice(-1) : missingReleases(releases, channelState);
+  // when it has a deferred/conflict manifest, so a user can retry it. An applied
+  // manifest is durable completion history and must never be regenerated.
+  if (!latestOnly) return missingReleases(releases, channelState);
+  const latest = releases.at(-1);
+  if (!latest || channelState?.releases?.[latest.tag_name]?.status === "applied") return [];
+  return [latest];
 }
 
 export function run(command, args, cwd) {
@@ -65,6 +69,9 @@ export async function patchFiles(directory) {
 }
 
 export async function copyPatchSeries(source, destination) {
+  // A conflict retry deliberately uses its own preserved series as source.
+  // Do not clear that source before reading it.
+  if (source && resolve(source) === resolve(destination)) return patchFiles(destination);
   await rm(destination, { recursive: true, force: true });
   await mkdir(destination, { recursive: true });
   if (!source) return [];
