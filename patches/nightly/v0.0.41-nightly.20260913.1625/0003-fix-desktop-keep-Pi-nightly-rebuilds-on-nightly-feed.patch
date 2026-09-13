@@ -1,0 +1,26 @@
+From e09940d2d8c945ff45c97ac8e62de5a43c12c57d Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 17:06:00 +0100
+Subject: [PATCH] fix(desktop): keep Pi nightly rebuilds on nightly feed
+
+---
+ apps/desktop/src/updates/updateChannels.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/apps/desktop/src/updates/updateChannels.ts b/apps/desktop/src/updates/updateChannels.ts
+index 731910e44..89d23bdb6 100644
+--- a/apps/desktop/src/updates/updateChannels.ts
++++ b/apps/desktop/src/updates/updateChannels.ts
+@@ -1,6 +1,8 @@
+ import type { DesktopUpdateChannel } from "@t3tools/contracts";
+ 
+-const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
++// Fork rebuilds preserve the upstream nightly identity with an immutable
++// `-pi.N` suffix. They must continue using the nightly updater feed.
++const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+(?:-pi\.\d+)?$/;
+ 
+ export function isNightlyDesktopVersion(version: string): boolean {
+   return NIGHTLY_VERSION_PATTERN.test(version);
+-- 
+2.47.3
+
