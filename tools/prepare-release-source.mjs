@@ -33,39 +33,13 @@ serverPackage.name = config.npmPackage;
 serverPackage.repository.url = `https://github.com/${config.githubRepository}`;
 await writeFile(serverPackagePath, `${JSON.stringify(serverPackage, null, 2)}\n`);
 
-await replace(
-  join(source, "apps/server/scripts/cli.ts"),
-  '"--filter",\n    "t3",',
-  `"--filter",\n    "${config.npmPackage}",`,
-);
+// Upstream's current release CLI publishes prebuilt platform tarballs and no
+// longer embeds the server package name in a pnpm filter. Package identity is
+// set directly in apps/server/package.json above.
 
-const runtimePath = join(source, "apps/server/src/cloud/pinnedRuntime.ts");
-let runtime = await readFile(runtimePath, "utf8");
-if (!runtime.includes('"node_modules", "t3", "dist", "bin.mjs"') || !runtime.includes('`t3@${input.version}`')) {
-  throw new Error("Pinned runtime implementation changed; update prepare-release-source.mjs");
-}
-const packagePathSegments = config.npmPackage.split("/").map((segment) => `"${segment}"`).join(", ");
-runtime = runtime
-  .replaceAll('`t3@<version>`', `\`${config.npmPackage}@<version>\``)
-  .replaceAll('"node_modules", "t3", "dist", "bin.mjs"', `"node_modules", ${packagePathSegments}, "dist", "bin.mjs"`)
-  .replaceAll('`t3@${input.version}`', `\`${config.npmPackage}@\${input.version}\``);
-await writeFile(runtimePath, runtime);
-
-// service-launcher.mjs is bundled separately and kept at a stable path by the
-// service installer. Its own runtime lookup must use the same fork package as
-// pinnedRuntime.ts; otherwise the service installs @brrock/t3-pi but the
-// launcher looks for node_modules/t3 and crash-loops at boot.
-const serviceLauncherPath = join(source, "apps/server/src/serviceLauncher.ts");
-let serviceLauncher = await readFile(serviceLauncherPath, "utf8");
-const launcherRuntimeMarker = '"node_modules", "t3", "dist", "bin.mjs"';
-if (!serviceLauncher.includes(launcherRuntimeMarker)) {
-  throw new Error("Service launcher runtime implementation changed; update prepare-release-source.mjs");
-}
-serviceLauncher = serviceLauncher.replaceAll(
-  launcherRuntimeMarker,
-  `"node_modules", ${packagePathSegments}, "dist", "bin.mjs"`,
-);
-await writeFile(serviceLauncherPath, serviceLauncher);
+// The upstream service now installs self-contained release archives rather
+// than a Node package tree. It already takes the release repository/base URL
+// from release configuration, so no npm runtime-path rewrite is applicable.
 
 await replace(
   join(source, "scripts/build-desktop-artifact.ts"),
