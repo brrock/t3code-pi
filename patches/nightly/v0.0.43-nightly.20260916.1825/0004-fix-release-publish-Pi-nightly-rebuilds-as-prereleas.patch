@@ -1,0 +1,38 @@
+From b3f0a4ebaa180cdfdf4ad033388319b6bf794129 Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 17:26:29 +0100
+Subject: [PATCH] fix(release): publish Pi nightly rebuilds as prereleases
+
+---
+ scripts/build-desktop-artifact.test.ts | 1 +
+ scripts/build-desktop-artifact.ts      | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/build-desktop-artifact.test.ts b/scripts/build-desktop-artifact.test.ts
+index 08d7cf10e1..f94ba5a7da 100644
+--- a/scripts/build-desktop-artifact.test.ts
++++ b/scripts/build-desktop-artifact.test.ts
+@@ -250,6 +250,7 @@ const makeWindowsPayloadFixture = Effect.fn("test.makeWindowsPayloadFixture")(fu
+ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
+   it("resolves the dedicated nightly updater channel from nightly versions", () => {
+     assert.equal(resolveDesktopUpdateChannel("0.0.17-nightly.20260413.42"), "nightly");
++    assert.equal(resolveDesktopUpdateChannel("0.0.17-nightly.20260413.42-pi.2"), "nightly");
+     assert.equal(resolveDesktopUpdateChannel("0.0.17"), "latest");
+   });
+ 
+diff --git a/scripts/build-desktop-artifact.ts b/scripts/build-desktop-artifact.ts
+index cb47e40b8b..bbde30383f 100644
+--- a/scripts/build-desktop-artifact.ts
++++ b/scripts/build-desktop-artifact.ts
+@@ -2561,7 +2561,7 @@ export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig"
+ });
+ 
+ export function resolveDesktopUpdateChannel(version: string): "latest" | "nightly" {
+-  return /-nightly\.\d{8}\.\d+$/.test(version) ? "nightly" : "latest";
++  return /-nightly\.\d{8}\.\d+(?:-pi\.\d+)?$/.test(version) ? "nightly" : "latest";
+ }
+ 
+ // Pull request builds (`-pr.<n>.`) and the maintainers' preview train
+-- 
+2.47.3
+

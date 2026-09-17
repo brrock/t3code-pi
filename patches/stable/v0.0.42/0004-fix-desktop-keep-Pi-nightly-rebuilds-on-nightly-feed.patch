@@ -1,0 +1,60 @@
+From 0762f8e85597d30f75633e64fe978f6a8b465129 Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 17:06:00 +0100
+Subject: [PATCH] fix(desktop): keep Pi nightly rebuilds on nightly feed
+
+---
+ apps/desktop/src/updates/updateChannels.test.ts |  6 ++++--
+ apps/desktop/src/updates/updateChannels.ts      | 13 +++++--------
+ 2 files changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/apps/desktop/src/updates/updateChannels.test.ts b/apps/desktop/src/updates/updateChannels.test.ts
+index acf4155fab..a002e870c9 100644
+--- a/apps/desktop/src/updates/updateChannels.test.ts
++++ b/apps/desktop/src/updates/updateChannels.test.ts
+@@ -2,15 +2,17 @@ import { describe, expect, it } from "vite-plus/test";
+ 
+ import { isNightlyDesktopVersion, resolveDefaultDesktopUpdateChannel } from "./updateChannels.ts";
+ 
+-describe("updateChannels", () => {
+-  it("keeps preview builds branded as nightly but on the latest update channel", () => {
++describe("update channels", () => {
++  it("keeps preview builds on latest and Pi nightly rebuilds on nightly", () => {
+     expect(isNightlyDesktopVersion("0.0.41-preview.20260911.7")).toBe(true);
+     expect(resolveDefaultDesktopUpdateChannel("0.0.41-preview.20260911.7")).toBe("latest");
+     expect(resolveDefaultDesktopUpdateChannel("0.0.41-nightly.20260911.7")).toBe("nightly");
++    expect(resolveDefaultDesktopUpdateChannel("0.0.36-nightly.20260828.1210-pi.1")).toBe("nightly");
+   });
+ 
+   it("only matches the first prerelease identifier", () => {
+     expect(isNightlyDesktopVersion("1.2.3-foo-preview.20260911.1")).toBe(false);
+     expect(isNightlyDesktopVersion("1.2.3")).toBe(false);
++    expect(resolveDefaultDesktopUpdateChannel("0.0.36")).toBe("latest");
+   });
+ });
+diff --git a/apps/desktop/src/updates/updateChannels.ts b/apps/desktop/src/updates/updateChannels.ts
+index e7f9a2f854..0661dde743 100644
+--- a/apps/desktop/src/updates/updateChannels.ts
++++ b/apps/desktop/src/updates/updateChannels.ts
+@@ -1,13 +1,10 @@
+ import type { DesktopUpdateChannel } from "@t3tools/contracts";
+ 
+-const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+$/;
+-// Preview builds are the maintainers' test train, cut by hand from unreleased
+-// branches to exercise the release flow. They share nightly's branding but
+-// are packaged without an update feed (see
+-// isDesktopPreviewVersion in scripts/build-desktop-artifact.ts), so the
+-// channel a preview install reports is cosmetic: it never checks for updates
+-// and no updater feed ever lists a preview release.
+-const PRERELEASE_VERSION_PATTERN = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+$/;
++// Fork rebuilds preserve the upstream nightly identity with an immutable
++// `-pi.N` suffix. They must continue using the nightly updater feed.
++const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+(?:-pi\.\d+)?$/;
++// Preview builds share nightly branding but are deliberately not on its feed.
++const PRERELEASE_VERSION_PATTERN = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+(?:-pi\.\d+)?$/;
+ 
+ export function isNightlyDesktopVersion(version: string): boolean {
+   return PRERELEASE_VERSION_PATTERN.test(version);
+-- 
+2.47.3
+

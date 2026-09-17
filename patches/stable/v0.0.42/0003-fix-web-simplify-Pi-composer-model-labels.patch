@@ -1,0 +1,98 @@
+From 8be14c406287329fa0cb14bb3f8222ff30d9f29a Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 16:21:50 +0100
+Subject: [PATCH] fix(web): simplify Pi composer model labels
+
+---
+ .../components/chat/ProviderModelPicker.tsx   | 20 +++++++------------
+ .../components/chat/providerIconUtils.test.ts | 13 +++++++++++-
+ .../src/components/chat/providerIconUtils.ts  | 10 ++++++++++
+ 3 files changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
+index 05e8d2217f..5bc05a1d2a 100644
+--- a/apps/web/src/components/chat/ProviderModelPicker.tsx
++++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
+@@ -13,11 +13,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { cn } from "~/lib/utils";
+ import { ModelPickerContent, resolveModelPickerSelectedModel } from "./ModelPickerContent";
+ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+-import {
+-  ModelEsque,
+-  getTriggerDisplayModelLabel,
+-  getTriggerDisplayModelName,
+-} from "./providerIconUtils";
++import { getComposerModelPresentation, type ModelEsque } from "./providerIconUtils";
+ import { shouldShowInstanceBadge, type ProviderInstanceEntry } from "../../providerInstances";
+ import {
+   ComposerControl,
+@@ -83,14 +79,12 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+     (activeEntry?.driverKind === "opencode" || activeEntry?.driverKind === "antigravity"
+       ? undefined
+       : selectedInstanceOptions[0]);
+-  const triggerTitle = selectedModel
+-    ? getTriggerDisplayModelName(selectedModel)
+-    : props.model === ANTIGRAVITY_DEFAULT_MODEL
+-      ? "Choose model"
+-      : props.model || "Choose model";
+-  const triggerLabel = selectedModel
+-    ? `${getTriggerDisplayModelLabel(selectedModel)}${selectedModel.isUnavailable ? " (Unavailable)" : ""}`
+-    : triggerTitle;
++  const triggerPresentation = selectedModel
++    ? getComposerModelPresentation(selectedModel)
++    : {
++        label: props.model === ANTIGRAVITY_DEFAULT_MODEL ? "Choose model" : props.model || "Choose model",
++        tooltip: props.model === ANTIGRAVITY_DEFAULT_MODEL ? "Choose model" : props.model || "Choose model",
++      };
+   const showInstanceBadge =
+     activeEntry !== null && shouldShowInstanceBadge(activeEntry, props.instanceEntries);
+ 
+diff --git a/apps/web/src/components/chat/providerIconUtils.test.ts b/apps/web/src/components/chat/providerIconUtils.test.ts
+index f62a06e078..a2371ee105 100644
+--- a/apps/web/src/components/chat/providerIconUtils.test.ts
++++ b/apps/web/src/components/chat/providerIconUtils.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { getDisplayModelName, getTriggerDisplayModelLabel } from "./providerIconUtils";
++import {
++  getComposerModelPresentation,
++  getDisplayModelName,
++  getTriggerDisplayModelLabel,
++} from "./providerIconUtils";
+ 
+ describe("Pi provider model labels", () => {
+   const model = {
+@@ -15,4 +19,11 @@ describe("Pi provider model labels", () => {
+   it("omits the provider name in composer triggers", () => {
+     expect(getTriggerDisplayModelLabel(model)).toBe("GPT-5.5");
+   });
++
++  it("keeps the Pi sub-provider out of composer chrome but available on hover", () => {
++    expect(getComposerModelPresentation(model)).toEqual({
++      label: "GPT-5.5",
++      tooltip: "[Codex] GPT-5.5",
++    });
++  });
+ });
+diff --git a/apps/web/src/components/chat/providerIconUtils.ts b/apps/web/src/components/chat/providerIconUtils.ts
+index 439f6ffb0c..94f0e8cd2c 100644
+--- a/apps/web/src/components/chat/providerIconUtils.ts
++++ b/apps/web/src/components/chat/providerIconUtils.ts
+@@ -66,3 +66,13 @@ export function getTriggerDisplayModelLabel(model: ModelEsque): string {
+   const qualified = /^\[([^\]]+)\]\s+(.+)$/u.exec(displayName);
+   return qualified?.[2] ?? displayName;
+ }
++
++export function getComposerModelPresentation(model: ModelEsque): {
++  readonly label: string;
++  readonly tooltip: string;
++} {
++  return {
++    label: getTriggerDisplayModelLabel(model),
++    tooltip: getTriggerDisplayModelName(model),
++  };
++}
+-- 
+2.47.3
+

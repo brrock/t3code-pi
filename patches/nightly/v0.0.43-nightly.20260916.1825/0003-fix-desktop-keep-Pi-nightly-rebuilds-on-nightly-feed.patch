@@ -1,0 +1,35 @@
+From 63cfb281ff04f33ff061a0c48f9e8b34889691be Mon Sep 17 00:00:00 2001
+From: Brrock Agent <benjy@benjyross.xyz>
+Date: Fri, 28 Aug 2026 17:06:00 +0100
+Subject: [PATCH] fix(desktop): keep Pi nightly rebuilds on nightly feed
+
+---
+ apps/desktop/src/updates/updateChannels.ts | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/apps/desktop/src/updates/updateChannels.ts b/apps/desktop/src/updates/updateChannels.ts
+index e7f9a2f854..f6dfe63424 100644
+--- a/apps/desktop/src/updates/updateChannels.ts
++++ b/apps/desktop/src/updates/updateChannels.ts
+@@ -1,13 +1,16 @@
+ import type { DesktopUpdateChannel } from "@t3tools/contracts";
+ 
+-const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+$/;
++// Fork rebuilds preserve immutable upstream prerelease identities with a
++// `-pi.N` suffix. Actual nightly builds must remain on the nightly feed;
++// preview builds retain upstream's cosmetic prerelease channel behavior.
++const NIGHTLY_VERSION_PATTERN = /^[^-+]+-nightly\.\d{8}\.\d+(?:-pi\.\d+)?$/;
+ // Preview builds are the maintainers' test train, cut by hand from unreleased
+ // branches to exercise the release flow. They share nightly's branding but
+ // are packaged without an update feed (see
+ // isDesktopPreviewVersion in scripts/build-desktop-artifact.ts), so the
+ // channel a preview install reports is cosmetic: it never checks for updates
+ // and no updater feed ever lists a preview release.
+-const PRERELEASE_VERSION_PATTERN = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+$/;
++const PRERELEASE_VERSION_PATTERN = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+(?:-pi\.\d+)?$/;
+ 
+ export function isNightlyDesktopVersion(version: string): boolean {
+   return PRERELEASE_VERSION_PATTERN.test(version);
+-- 
+2.47.3
+
