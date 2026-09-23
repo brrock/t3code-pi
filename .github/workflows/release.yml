@@ -116,7 +116,10 @@ jobs:
           if npm view "$package" version >/dev/null 2>&1; then
             echo "$package is already published; skipping publish."
           else
-            node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --app-version "${VERSION#v}" --provenance --verbose
+            # scripts/update-release-package-versions.ts above has already set the
+            # fork package's immutable version; current upstream `cli publish`
+            # no longer accepts an --app-version flag.
+            node apps/server/scripts/cli.ts publish --tag "$NPM_TAG" --provenance --verbose
           fi
           # npm's distributed metadata can lag a provenance publish by more
           # than five minutes; wait up to 30 minutes rather than claiming a
