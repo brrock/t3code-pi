@@ -16,6 +16,7 @@
     "0004-fix-release-publish-Pi-nightly-rebuilds-as-prereleas.patch",
     "0005-fix-web-show-Pi-tool-call-payloads.patch",
     "0006-fix-pi-support-generic-uploaded-attachments.patch",
-    "0007-fix-providers-restore-Pi-runtime-prerequisites.patch"
+    "0007-fix-providers-restore-Pi-runtime-prerequisites.patch",
+    "0008-fix-providers-close-Pi-browser-options-interface.patch"
   ]
 }

@@ -1,0 +1,34 @@
+From f6f73763dcc97521f8b6736d30b3db83f1548535 Mon Sep 17 00:00:00 2001
+From: brrock-agent <321901387+brrock-agent@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 02:08:53 +0100
+Subject: [PATCH] fix(providers): close Pi browser options interface
+
+---
+ apps/server/src/provider/Layers/ProviderService.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/provider/Layers/ProviderService.ts b/apps/server/src/provider/Layers/ProviderService.ts
+index f14f680ad..7e7016132 100644
+--- a/apps/server/src/provider/Layers/ProviderService.ts
++++ b/apps/server/src/provider/Layers/ProviderService.ts
+@@ -262,6 +262,7 @@ export interface ProviderServiceLiveOptions {
+    * Production reads the broker's live host registry.
+    */
+   readonly isAgentBrowserAvailable?: () => boolean;
++}
+ 
+ interface TurnAnalyticsMetadata {
+   readonly requestId: number;
+@@ -489,7 +490,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
+   );
+   const issueMcpCredential =
+     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
+-  const isAgentBrowserAvailable = options?.isAgentBrowserAvailable ?? hasAvailablePreviewAutomationHost;
++  const isAgentBrowserAvailable =
++    options?.isAgentBrowserAvailable ?? hasAvailablePreviewAutomationHost;
+   const fileSystem = yield* FileSystem.FileSystem;
+   const pathService = yield* Path.Path;
+   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+-- 
+2.47.3
+
